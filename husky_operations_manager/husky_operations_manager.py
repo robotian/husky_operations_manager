@@ -17,6 +17,7 @@ from husky_operations_manager.action_clients.reverse_drive_client import Reverse
 from husky_operations_manager.action_clients.docking import DockingActionClient
 from husky_operations_manager.action_clients.navigation import NavigationActionClient
 from husky_operations_manager.action_clients.undocking import UndockingActionClient
+from husky_operations_manager.action_clients.manipulator import ManipulatorTaskActionClient, ArmCommand
 
 
 class HuskyOperationsManager(Node):
@@ -29,6 +30,7 @@ class HuskyOperationsManager(Node):
       - Execute HARVESTING, CHARGING, and UNLOADING tasks from the job publisher
       - Manage navigation, docking, undocking, harvesting, loading, and unloading subtasks
       - Recover from undocking failures via closed-loop reverse drive to staging pose
+      - Gate arm configuration (STOW/READY) around harvesting and undocking operations
       - Publish RobotStatus on /status/robot at 1Hz
     """
 
@@ -91,17 +93,17 @@ class HuskyOperationsManager(Node):
             f"dock_type='{self.active_dock.type}' | "
             f"staging_x_offset={self.active_plugin.staging_x_offset} | "
             f"v_linear_min={self.docking_config.controller_v_linear_min} | "
-            f"v_linear_max={self.docking_config.controller_v_linear_max} | "
             f"dock_backwards={self.docking_config.dock_backwards}"
         )
 
         # Initialise action clients now that DockingConfig is available
-        self.navigation             = NavigationActionClient(self)
-        self.docking_action_client  = DockingActionClient(self)
+        self.navigation              = NavigationActionClient(self)
+        self.docking_action_client   = DockingActionClient(self)
         self.undocking_action_client = UndockingActionClient(self)
+        self.manipulator_client      = ManipulatorTaskActionClient(self)
         # ReverseDriveClient is the fallback when undock_robot action fails.
         # It drives the robot in reverse using TF closed-loop feedback.
-        self.reverse_drive_client   = ReverseDriveClient(self, self.docking_config)
+        self.reverse_drive_client    = ReverseDriveClient(self, self.docking_config)
 
         # Delay the initial position check to allow the pose subscription to
         # receive its first message before comparing against the dock position.
@@ -168,7 +170,7 @@ class HuskyOperationsManager(Node):
         self.timing_initial_position_check_delay = float(self.get_parameter('timing.initial_position_check_delay').value)
         self.server_action_server_timeout        = float(self.get_parameter('server.action_server_timeout').value)
 
-        self.get_logger().debug( f"Parameters loaded | "
+        self.get_logger().debug(f"Parameters loaded | "
             f"nav_retries={self.navigation_max_retries} nav_delay={self.navigation_retry_delay}s | "
             f"dock_retries={self.docking_max_retries} dock_delay={self.docking_retry_delay}s "
             f"dock_threshold={self.docking_threshold}m | "
@@ -176,7 +178,7 @@ class HuskyOperationsManager(Node):
             f"load_increment={self.loading_increment}% | "
             f"timer={self.timing_timer_period}s"
         )
-       
+
     def _init_state_variables(self):
         """
         Initialise all state-tracking variables to their boot defaults.
@@ -189,6 +191,7 @@ class HuskyOperationsManager(Node):
           - Job simulation: timer used for placeholder harvesting/loading/unloading
           - Undocking: subtask stored for retry, task type that triggered undocking
           - Reverse drive: flag true while ReverseDriveClient is actively reversing
+          - Arm state: tracks confirmed arm configuration and pending goal flags
         """
         # --- Startup ---
         self.is_initialized          = False   # True after check_initial_position runs
@@ -224,9 +227,9 @@ class HuskyOperationsManager(Node):
         self.navigation_retry_count = 0   # Reset to 0 on success or after max reached
         self.docking_retry_count    = 0   # Reset to 0 on success or after max reached
 
-        # --- Job simulation (placeholder until real hardware interfaces) ---
+        # --- Job duration (used for unloading/charging timers) ---
         self.job_start_time = None   # rclpy clock time when current job phase started
-        self.job_duration   = 0.0    # Simulated duration in seconds for current phase
+        self.job_duration   = 0.0    # Duration in seconds for current phase
 
         # --- Undocking ---
         # Stores the charging or unloading SubTask so _subtask_undocking can send the
@@ -241,6 +244,19 @@ class HuskyOperationsManager(Node):
         # Set False in _handle_reverse_drive when DONE, ERROR, or CANCELED.
         # Used as the priority-4 check in _process_action_clients.
         self.reverse_drive_active: bool = False
+
+        # --- Arm state ---
+        # Tracks the last successfully confirmed arm command so STOW can be
+        # verified before undocking and READY before harvesting without issuing
+        # redundant goals when the arm is already in the correct configuration.
+        # Boot assumption: arm is in STOW at startup (safe default).
+        self.last_confirmed_arm_command: str = ArmCommand.GO_STOW
+        # True while waiting for a STOW goal to complete via _handle_manipulator.
+        # Gates _subtask_undocking from proceeding until arm is safe.
+        self.arm_stow_pending: bool  = False
+        # True while waiting for a READY goal to complete via _handle_manipulator.
+        # Gates _subtask_harvesting from advancing past DESTINATION_REACHED.
+        self.arm_ready_pending: bool = False
 
         self.get_logger().debug("State variables initialised")
 
@@ -307,8 +323,6 @@ class HuskyOperationsManager(Node):
         New subtask: reset subtask index; if currently JOB_DONE, transition to IDLE
                      so _handle_task_start can pick up the next subtask
         """
-        # Log full detail for CHARGING_TASK (type 0) only — it has an undocking
-        # goal embedded in the charging subtask that is useful to see at INFO level
         subtasks_summary = [(st.sub_task_id, st.type, st.description) for st in msg.sub_tasks]
         self.get_logger().debug(
             f"Received task | ID: {msg.task_id} | Type: {msg.task_type} | "
@@ -373,6 +387,9 @@ class HuskyOperationsManager(Node):
             f"Timer tick | status={self.current_status.name} | "
             f"startup_undock_complete={self.startup_undock_complete} | "
             f"reverse_drive_active={self.reverse_drive_active} | "
+            f"arm_stow_pending={self.arm_stow_pending} | "
+            f"arm_ready_pending={self.arm_ready_pending} | "
+            f"last_confirmed_arm='{self.last_confirmed_arm_command}' | "
             f"battery={self._normalize_battery(self.battery_status.percentage):.1f}%"
         )
 
@@ -435,7 +452,7 @@ class HuskyOperationsManager(Node):
             time.sleep(1.0)
             self.check_initial_position()
             return
-        
+
         #  # TODO: Implement this logic once new station is added for unloading.
         #  # Find nearest dock — use index 0 if only one dock, else find closest
         # dock_configs = self.docking_config.dock_configs
@@ -450,7 +467,7 @@ class HuskyOperationsManager(Node):
 
         charger_dock_pose = self.active_dock
         current_pos = self.pose_status.pose.pose.position
-        
+
         distance = self._calculate_distance(
             current_pos.x, current_pos.y,
             charger_dock_pose.dock_x, charger_dock_pose.dock_y)
@@ -459,15 +476,15 @@ class HuskyOperationsManager(Node):
             f"Initial Robot position: ({current_pos.x:.3f}, {current_pos.y:.3f}), "
             f"Dock Name: '{charger_dock_pose.instance_name}' | "
             f"Distance to dock: {distance:.3f}m")
-        
+
         self.get_logger().debug(
             f"Dock position: ({charger_dock_pose.dock_x:.3f}, {charger_dock_pose.dock_y:.3f}) | "
             f"docking_threshold={self.docking_threshold}m | "
             f"num_docks={len(self.docking_config.dock_configs)}"
         )
 
-        # TODO: validate the if condition so that undocking can occur when the robot 
-        # pose show robot is anywhere between dock pose and staging pose along x-axis
+        # TODO: validate the if condition so that undocking can occur when the robot
+        # pose shows robot is anywhere between dock pose and staging pose along x-axis
         # of robot.
         if distance <= self.docking_threshold:
             self.is_at_docking_station = True
@@ -485,11 +502,12 @@ class HuskyOperationsManager(Node):
 
         Called from timer_callback while startup_undock_complete is False.
 
-        Tick 1 (IDLE):          transition to START_UNDOCKING
+        Tick 1 (IDLE):            transition to START_UNDOCKING
         Tick 2 (START_UNDOCKING): compute UndockGoal from DockingConfig,
+                                  STOW check runs inside _subtask_undocking,
                                   send to UndockingActionClient, transition to UNDOCKING
-        Tick 3+ (else):         hand off to _handle_undocking or _handle_reverse_drive
-                                depending on reverse_drive_active flag
+        Tick 3+ (else):           hand off to _handle_undocking or _handle_reverse_drive
+                                  depending on reverse_drive_active flag
         """
         if not self.is_initialized or self.startup_undock_complete:
             return
@@ -509,7 +527,6 @@ class HuskyOperationsManager(Node):
             robot_status.task = "Startup: Preparing to undock"
 
         elif self.current_status == RobotStatusEnum.START_UNDOCKING:
-            self._transition_status(RobotStatusEnum.UNDOCKING)
             robot_status.task = "Startup: Undocking"
 
             # Compute max_undocking_time from docking config rather than hardcoding.
@@ -534,7 +551,10 @@ class HuskyOperationsManager(Node):
                 max_undocking_time=max_undocking_time
             )
 
-            self.undocking_action_client.send_undocking_goal(startup_subtask)
+            # Store so the STOW gate inside _subtask_undocking can reference it
+            self.last_undocking_subtask = startup_subtask
+            self._subtask_undocking()
+
         else:
             # Tick 3+: undock_robot goal has been sent. Route to the correct handler.
             # If ReverseDriveClient is active (fallback after undocking failure),
@@ -556,13 +576,14 @@ class HuskyOperationsManager(Node):
         Order of operations each tick:
           1. Validate task exists — go IDLE if not
           2. Check battery — go ERROR if low (except during CHARGING_TASK)
-          3. Process active action clients (navigation/docking/undocking/reverse drive)
+          3. Process active action clients (navigation/docking/undocking/reverse drive/arm)
           4. Refresh current_sub_task from the subtask list
           5. Route: IDLE/JOB_DONE → _handle_task_start, otherwise → _execute_current_subtask
         """
         # No task or empty schedule means JobPublisher has nothing for us
         if not self.task or not self.task.description or not self.task.job_schedule:
-            if self.current_status != RobotStatusEnum.IDLE: self._transition_status(RobotStatusEnum.IDLE)
+            if self.current_status != RobotStatusEnum.IDLE:
+                self._transition_status(RobotStatusEnum.IDLE)
             return
 
         self.current_task = self.task
@@ -571,16 +592,21 @@ class HuskyOperationsManager(Node):
             return
 
         # Action client handlers run before subtask handlers so that async results
-        # (navigation success, docking complete, etc.) are processed on the same
-        # tick they arrive, preventing a one-tick delay in state transitions
+        # (navigation success, docking complete, arm command complete, etc.) are
+        # processed on the same tick they arrive, preventing a one-tick delay in
+        # state transitions
         self._process_action_clients(robot_status)
         self._update_current_subtask()
-        
+
         robot_status.crop_type      = self.current_task.crop_type
         robot_status.target_node_id = self.current_task.target_node_id
-        robot_status.task = self.current_sub_task.description if self.current_sub_task else self.current_task.description
+        robot_status.task = (
+            self.current_sub_task.description if self.current_sub_task
+            else self.current_task.description
+        )
 
-        self.get_logger().debug(f"Task execution | status={self.current_status.name} | "
+        self.get_logger().debug(
+            f"Task execution | status={self.current_status.name} | "
             f"task_id={self.current_task.task_id} task_type={self.current_task.task_type} | "
             f"subtask_index={self.current_sub_task_index} | "
             f"subtask_type={self.current_sub_task.type if self.current_sub_task else 'None'}"
@@ -606,7 +632,8 @@ class HuskyOperationsManager(Node):
           - When in ERROR and a CHARGING_TASK arrives, transition back to IDLE
             so the task can be executed without waiting for _handle_error_recovery
         """
-        if not self.task or not self.current_task: return False
+        if not self.task or not self.current_task:
+            return False
 
         battery_pct = self._normalize_battery(self.battery_status.percentage)
 
@@ -645,14 +672,21 @@ class HuskyOperationsManager(Node):
         """
         Poll all action clients and route to the appropriate handler.
 
-        Priority order (only the first active client is handled per tick):
+        Priority order for motion clients (only the first active client is handled
+        per tick):
           1. NavigationActionClient   — NavigateThroughPoses
           2. DockingActionClient      — dock_robot
           3. UndockingActionClient    — undock_robot
           4. ReverseDriveClient       — TF closed-loop reverse (fallback for undocking)
 
-        This strict priority ensures that if two clients somehow become active
-        simultaneously, navigation always wins (it was likely started first).
+        The manipulator client is polled independently after the motion clients
+        because arm commands run in parallel and do not block robot motion, but
+        their completion does unblock state transitions in the subtask handlers.
+
+        The manipulator is polled when:
+          - arm_stow_pending is True  (STOW goal in flight)
+          - arm_ready_pending is True (READY goal in flight)
+          - status is HARVESTING with no pending flags (START_HARVEST goal in flight)
         """
         nav_status    = self.navigation.get_navigation_status()
         dock_status   = self.docking_action_client.get_status()
@@ -662,7 +696,9 @@ class HuskyOperationsManager(Node):
             f"Action clients | nav={nav_status.name} | "
             f"dock={dock_status.name} | "
             f"undock={undock_status.name} | "
-            f"reverse_drive_active={self.reverse_drive_active}"
+            f"reverse_drive_active={self.reverse_drive_active} | "
+            f"arm_stow_pending={self.arm_stow_pending} | "
+            f"arm_ready_pending={self.arm_ready_pending}"
         )
 
         if nav_status != NavigationStatus.IDLE:
@@ -674,6 +710,16 @@ class HuskyOperationsManager(Node):
         elif self.reverse_drive_active:
             self._handle_reverse_drive(robot_status)
 
+        # Arm is polled independently — it runs in parallel with the robot motion
+        # state machine and its completion unblocks harvesting and undocking flows.
+        arm_harvest_active = (
+            self.current_status == RobotStatusEnum.HARVESTING and
+            not self.arm_stow_pending and
+            not self.arm_ready_pending
+        )
+        if self.arm_stow_pending or self.arm_ready_pending or arm_harvest_active:
+            self._handle_manipulator(robot_status)
+
     def _update_current_subtask(self):
         """
         Refresh current_sub_task from the sub_tasks list using current_sub_task_index.
@@ -683,7 +729,8 @@ class HuskyOperationsManager(Node):
         it publishes — the node always reads index 0 of the incoming sub_tasks list
         and current_sub_task_index tracks locally which subtask we are on.
         """
-        if not self.current_task: return
+        if not self.current_task:
+            return
 
         if isinstance(self.current_task.sub_tasks, list):
             if self.current_sub_task_index < len(self.current_task.sub_tasks):
@@ -691,7 +738,9 @@ class HuskyOperationsManager(Node):
             else:
                 # Index out of range — all subtasks exhausted
                 self.current_sub_task = None
-        self.get_logger().debug(f"Current subtask | index={self.current_sub_task_index} | "
+
+        self.get_logger().debug(
+            f"Current subtask | index={self.current_sub_task_index} | "
             f"type={self.current_sub_task.type if self.current_sub_task else 'None'} | "
             f"desc='{self.current_sub_task.description if self.current_sub_task else 'None'}'"
         )
@@ -764,7 +813,6 @@ class HuskyOperationsManager(Node):
             SubTask.MOVING:     self._subtask_moving,
             SubTask.HARVESTING: self._subtask_harvesting,
             SubTask.DOCKING:    self._subtask_docking,
-            # SubTask.LOADING:    self._subtask_loading, # Merging into SubTask.Harvesting
             SubTask.CHARGING:   self._subtask_charging,
             SubTask.UNLOADING:  self._subtask_unloading,
         }
@@ -1106,12 +1154,14 @@ class HuskyOperationsManager(Node):
         """
         robot_status.task = "Reverse drive to staging pose"
         status = self.reverse_drive_client.get_status()
-        
-        self.get_logger().debug(f"Reverse drive handler | status={status.name} | "
+
+        self.get_logger().debug(
+            f"Reverse drive handler | status={status.name} | "
             f"startup_undock_complete={self.startup_undock_complete}"
         )
 
-        if status == ReverseDriveStatus.REVERSING: self._transition_status(RobotStatusEnum.UNDOCKING)
+        if status == ReverseDriveStatus.REVERSING:
+            self._transition_status(RobotStatusEnum.UNDOCKING)
 
         elif status == ReverseDriveStatus.DONE:
             self.get_logger().info("Reverse drive complete — undocking done")
@@ -1136,7 +1186,8 @@ class HuskyOperationsManager(Node):
                 self._transition_status(RobotStatusEnum.DONE_UNDOCKING)
 
         elif status == ReverseDriveStatus.ERROR:
-            self.get_logger().error(f"Reverse drive failed — transitioning to ERROR | "
+            self.get_logger().error(
+                f"Reverse drive failed — transitioning to ERROR | "
                 f"startup_undock_complete={self.startup_undock_complete}"
             )
             self.reverse_drive_active = False
@@ -1144,17 +1195,131 @@ class HuskyOperationsManager(Node):
             self._transition_status(RobotStatusEnum.ERROR)
 
         elif status == ReverseDriveStatus.CANCELED:
-            self.get_logger().warning(f"Reverse drive canceled — transitioning to IDLE | "
+            self.get_logger().warning(
+                f"Reverse drive canceled — transitioning to IDLE | "
                 f"startup_undock_complete={self.startup_undock_complete}"
             )
             self.reverse_drive_active = False
             self.reverse_drive_client.reset()
             self._transition_status(RobotStatusEnum.IDLE)
 
+    def _handle_manipulator(self, robot_status: RobotStatus):
+        """
+        Monitor ManipulatorTaskActionClient for pending STOW, READY, or START_HARVEST goals.
+
+        Called from _process_action_clients every tick while any arm operation is pending.
+
+        Context-aware completion handling:
+          STOW completion:
+            - START_UNDOCKING context → arm is safe, re-enter _subtask_undocking to proceed
+            - DONE_HARVESTING context → arm is safe, _subtask_harvesting will advance to
+                                        JOB_DONE on the next tick
+          READY completion:
+            - DESTINATION_REACHED context → arm is prepared, _subtask_harvesting will
+                                            advance to START_HARVESTING on the next tick
+          START_HARVEST completion (DONE_HARVESTING result from manipulator):
+            - HARVESTING context → harvest cycle complete, transition to DONE_HARVESTING
+                                   so _subtask_harvesting can begin STOW on next tick
+
+        ERROR in any arm command transitions the node to ERROR — proceeding with an
+        arm in an unknown configuration is unsafe regardless of context.
+        """
+        arm_status = self.manipulator_client.get_status()
+
+        self.get_logger().debug(
+            f"Manipulator handler | arm_status={arm_status.name} | "
+            f"current_status={self.current_status.name} | "
+            f"arm_stow_pending={self.arm_stow_pending} | "
+            f"arm_ready_pending={self.arm_ready_pending} | "
+            f"last_confirmed_arm='{self.last_confirmed_arm_command}'"
+        )
+
+        # ----------------------------------------------------------------
+        # STOW completion
+        # ----------------------------------------------------------------
+        if self.arm_stow_pending and arm_status == RobotStatusEnum.DONE_HARVESTING:
+            self.get_logger().info(
+                f"Arm STOW confirmed | context={self.current_status.name}"
+            )
+            self.arm_stow_pending = False
+            self.last_confirmed_arm_command = ArmCommand.GO_STOW
+            self.manipulator_client.reset()
+
+            if self.current_status == RobotStatusEnum.START_UNDOCKING:
+                # Undocking flow was gated on STOW — arm is now safe, proceed
+                self.get_logger().debug(
+                    "STOW confirmed in START_UNDOCKING context — re-entering _subtask_undocking"
+                )
+                self._subtask_undocking()
+            elif self.current_status == RobotStatusEnum.DONE_HARVESTING:
+                # Harvest flow was gated on STOW — _subtask_harvesting will see
+                # last_confirmed_arm_command == GO_STOW and advance to JOB_DONE
+                # on the next timer tick. Nothing to call here.
+                self.get_logger().debug(
+                    "STOW confirmed in DONE_HARVESTING context — "
+                    "_subtask_harvesting will advance to JOB_DONE on next tick"
+                )
+            else:
+                self.get_logger().warning(
+                    f"STOW confirmed in unexpected context={self.current_status.name} — "
+                    "no action taken"
+                )
+
+        # ----------------------------------------------------------------
+        # READY completion
+        # ----------------------------------------------------------------
+        elif self.arm_ready_pending and arm_status == RobotStatusEnum.DONE_HARVESTING:
+            self.get_logger().info(
+                f"Arm READY confirmed | context={self.current_status.name}"
+            )
+            self.arm_ready_pending = False
+            self.last_confirmed_arm_command = ArmCommand.GO_READY
+            self.manipulator_client.reset()
+
+            if self.current_status == RobotStatusEnum.DESTINATION_REACHED:
+                # Harvest flow was gated on READY — _subtask_harvesting will see
+                # last_confirmed_arm_command == GO_READY and advance to START_HARVESTING
+                # on the next timer tick. Nothing to call here.
+                self.get_logger().debug(
+                    "READY confirmed in DESTINATION_REACHED context — "
+                    "_subtask_harvesting will advance to START_HARVESTING on next tick"
+                )
+            else:
+                self.get_logger().warning(
+                    f"READY confirmed in unexpected context={self.current_status.name} — "
+                    "no action taken"
+                )
+
+        # ----------------------------------------------------------------
+        # START_HARVEST completion
+        # ----------------------------------------------------------------
+        elif (not self.arm_stow_pending and
+              not self.arm_ready_pending and
+              arm_status == RobotStatusEnum.DONE_HARVESTING and
+              self.current_status == RobotStatusEnum.HARVESTING):
+            self.get_logger().info("Harvest goal complete — transitioning to DONE_HARVESTING")
+            self.manipulator_client.reset()
+            self._transition_status(RobotStatusEnum.DONE_HARVESTING)
+
+        # ----------------------------------------------------------------
+        # ERROR — any arm command failure
+        # ----------------------------------------------------------------
+        elif arm_status == RobotStatusEnum.ERROR:
+            self.get_logger().error(
+                f"Arm command failed | context={self.current_status.name} | "
+                f"stow_pending={self.arm_stow_pending} | "
+                f"ready_pending={self.arm_ready_pending} | "
+                f"last_confirmed='{self.last_confirmed_arm_command}'"
+            )
+            self.arm_stow_pending  = False
+            self.arm_ready_pending = False
+            self.manipulator_client.reset()
+            self._transition_status(RobotStatusEnum.ERROR)
+
     # =========================================================================
     # ERROR HANDLING
     # =========================================================================
-    
+
     def _handle_error_recovery(self):
         """
         Attempt to recover from ERROR or ABNORMAL status.
@@ -1185,6 +1350,11 @@ class HuskyOperationsManager(Node):
                 time.sleep(self.navigation_retry_delay)
             except Exception as e:
                 self.get_logger().warning(f"Navigation cancel raised exception: {e}")
+
+        # Clear any pending arm flags so the next task starts with a clean slate
+        self.arm_stow_pending  = False
+        self.arm_ready_pending = False
+        self.manipulator_client.reset()
 
         # Reset subtask state so the next task starts clean
         self.current_sub_task       = None
@@ -1282,29 +1452,61 @@ class HuskyOperationsManager(Node):
           1. Directly by _subtask_charging and _subtask_unloading when their
              respective tasks complete — UNDOCKING is an internal trigger, not
              a received subtask for CHARGING_TASK or UNLOADING_TASK.
-          2. Via _execute_current_subtask if UNDOCKING appears as a standalone
+          2. Via _handle_startup_undocking during the startup sequence.
+          3. Via _execute_current_subtask if UNDOCKING appears as a standalone
              received subtask type (future use).
+
+        Arm safety gate:
+          Before sending the undocking goal the arm must be confirmed in STOW.
+          If not, a STOW goal is dispatched and this method returns early.
+          _handle_manipulator will call back into this method once STOW is confirmed.
 
         UndockGoal source:
           current_sub_task if available (standalone subtask case),
-          otherwise last_undocking_subtask (stored by _subtask_charging/unloading).
+          otherwise last_undocking_subtask (stored by _subtask_charging/unloading
+          or _handle_startup_undocking).
 
         State progression:
-          START_UNDOCKING → send undock_robot → UNDOCKING
+          START_UNDOCKING → (STOW gate) → send undock_robot → UNDOCKING
           DONE_UNDOCKING  → clear stored subtask → JOB_DONE
           (undocking result handled by _handle_undocking via _process_action_clients)
         """
         self.get_logger().debug(
             f"_subtask_undocking | status={self.current_status.name} | "
             f"last_undocking_subtask={'set' if self.last_undocking_subtask else 'None'} | "
-            f"undocking_after_task_type={self.undocking_after_task_type}"
+            f"undocking_after_task_type={self.undocking_after_task_type} | "
+            f"last_confirmed_arm='{self.last_confirmed_arm_command}' | "
+            f"arm_stow_pending={self.arm_stow_pending}"
         )
 
         if self.current_status == RobotStatusEnum.START_UNDOCKING:
-            self.get_logger().info("Starting undocking")
+            # ---- Arm safety gate ----
+            # Arm must be confirmed STOW before undocking begins.
+            # If not already stowed, dispatch STOW now and hold here.
+            # _handle_manipulator will re-enter this method once confirmed.
+            if self.last_confirmed_arm_command != ArmCommand.GO_STOW:
+                if not self.arm_stow_pending:
+                    self.get_logger().info(
+                        f"Arm not in STOW (last='{self.last_confirmed_arm_command}') — "
+                        "sending STOW before undocking"
+                    )
+                    undock_ref = self.current_sub_task or self.last_undocking_subtask
+                    if self.manipulator_client.send_stow_goal(undock_ref):
+                        self.arm_stow_pending = True
+                    else:
+                        self.get_logger().error(
+                            "Failed to send STOW goal before undocking — transitioning to ERROR"
+                        )
+                        self._transition_status(RobotStatusEnum.ERROR)
+                else:
+                    self.get_logger().debug(
+                        "Arm STOW already in progress — waiting before undocking"
+                    )
+                return  # Hold at START_UNDOCKING until arm_stow_pending clears
 
-            # Prefer current_sub_task (standalone subtask), fall back to stored subtask
-            # (internal trigger from charging/unloading)
+            # ---- Arm confirmed STOW — proceed with undocking ----
+            self.get_logger().info("Starting undocking — arm confirmed STOW")
+
             undock_subtask = self.current_sub_task if self.current_sub_task else self.last_undocking_subtask
             dock_type = (undock_subtask.undock_goal.dock_type
                          if undock_subtask and undock_subtask.undock_goal else 'None')
@@ -1334,6 +1536,109 @@ class HuskyOperationsManager(Node):
             self.last_undocking_subtask    = None
             self.undocking_after_task_type = None
             self._transition_status(RobotStatusEnum.JOB_DONE)
+
+    def _subtask_harvesting(self):
+        """
+        Handle the HARVESTING subtask.
+
+        State progression:
+          DESTINATION_REACHED → (READY gate) → DESTINATION_REACHED (arm confirmed)
+          → START_HARVESTING  → send START_HARVEST goal → HARVESTING
+          → (manipulator result via _handle_manipulator) → DONE_HARVESTING
+          → (STOW gate) → DONE_HARVESTING (arm confirmed) → JOB_DONE
+
+        Arm configuration gates:
+          - GO_READY must be confirmed before START_HARVESTING is entered.
+            Arm is brought to READY at DESTINATION_REACHED so it is prepared
+            on arrival without being extended during transit over uneven terrain.
+          - GO_STOW must be confirmed before JOB_DONE is entered.
+            Arm is always stowed after harvesting to keep it safe between tasks
+            and to satisfy the mandatory STOW requirement before any undocking.
+        """
+        self.get_logger().debug(
+            f"_subtask_harvesting | status={self.current_status.name} | "
+            f"arm_ready_pending={self.arm_ready_pending} | "
+            f"arm_stow_pending={self.arm_stow_pending} | "
+            f"last_confirmed_arm='{self.last_confirmed_arm_command}'"
+        )
+
+        if self.current_status == RobotStatusEnum.DESTINATION_REACHED:
+            # Ensure arm is in READY before harvesting begins.
+            # Hold here until _handle_manipulator confirms READY.
+            if self.last_confirmed_arm_command != ArmCommand.GO_READY:
+                if not self.arm_ready_pending:
+                    self.get_logger().info(
+                        f"Arm not in READY (last='{self.last_confirmed_arm_command}') — "
+                        "sending READY before harvesting"
+                    )
+                    if self.manipulator_client.send_ready_goal(self.current_sub_task):
+                        self.arm_ready_pending = True
+                    else:
+                        self.get_logger().error(
+                            "Failed to send READY goal before harvesting — transitioning to ERROR"
+                        )
+                        self._transition_status(RobotStatusEnum.ERROR)
+                else:
+                    self.get_logger().debug("Arm READY already in progress — waiting")
+                return  # Hold at DESTINATION_REACHED until arm_ready_pending clears
+
+            # Arm confirmed in READY — proceed to harvesting
+            self._transition_status(RobotStatusEnum.START_HARVESTING)
+
+        elif self.current_status == RobotStatusEnum.START_HARVESTING:
+            # Guard: do not send a second goal if manipulator is already active
+            if self.manipulator_client.get_status() == RobotStatusEnum.HARVESTING:
+                self.get_logger().warning(
+                    "Harvest goal send skipped — manipulator already active"
+                )
+                return
+            self.get_logger().info("Sending harvest goal to manipulator")
+            if self.manipulator_client.send_harvesting_goal(self.current_sub_task):
+                self._transition_status(RobotStatusEnum.HARVESTING)
+            else:
+                self.get_logger().error(
+                    "Failed to send harvest goal — transitioning to ERROR"
+                )
+                self._transition_status(RobotStatusEnum.ERROR)
+
+        elif self.current_status == RobotStatusEnum.HARVESTING:
+            # Manipulator result is handled by _handle_manipulator via _process_action_clients.
+            # When the goal succeeds, ManipulatorTaskActionClient sets its internal status to
+            # DONE_HARVESTING, which _handle_manipulator detects and transitions the node
+            # to DONE_HARVESTING. Nothing to do here — just wait.
+            self.get_logger().debug(
+                "Harvesting in progress — waiting for manipulator result"
+            )
+
+        elif self.current_status == RobotStatusEnum.DONE_HARVESTING:
+            # Update load before checking arm — load must be recorded regardless of
+            # whether STOW has been sent yet. Guard with arm_stow_pending to prevent
+            # re-incrementing on subsequent ticks while waiting for STOW confirmation.
+            if not self.arm_stow_pending and self.last_confirmed_arm_command != ArmCommand.GO_STOW:
+                new_load = min(self.current_load_status + self.loading_increment, 100.0)
+                self.get_logger().debug(
+                    f"Load update | {self.current_load_status:.1f}% → {new_load:.1f}% "
+                    f"(+{self.loading_increment:.1f}%)"
+                )
+                self.current_load_status = new_load
+                self.get_logger().info(f"Load status: {self.current_load_status:.1f}%")
+
+                # Always stow the arm after harvesting before transitioning to JOB_DONE.
+                # Hold here until _handle_manipulator confirms STOW.
+                self.get_logger().info("Harvesting done — sending arm to STOW")
+                if self.manipulator_client.send_stow_goal(self.current_sub_task):
+                    self.arm_stow_pending = True
+                else:
+                    self.get_logger().error(
+                        "Failed to send STOW goal after harvesting — transitioning to ERROR"
+                    )
+                    self._transition_status(RobotStatusEnum.ERROR)
+                return  # Hold until STOW confirmed
+
+            # STOW confirmed — advance to JOB_DONE
+            if self.last_confirmed_arm_command == ArmCommand.GO_STOW and not self.arm_stow_pending:
+                self.get_logger().info("Arm stowed after harvest — transitioning to JOB_DONE")
+                self._transition_status(RobotStatusEnum.JOB_DONE)
 
     def _subtask_charging(self):
         """
@@ -1365,13 +1670,15 @@ class HuskyOperationsManager(Node):
 
         elif self.current_status == RobotStatusEnum.CHARGING:
             # Throttled to avoid flooding logs at 1Hz during the charging wait
-            self.get_logger().info(f"Battery charging: {battery_pct:.1f}%", throttle_duration_sec=10.0)
+            self.get_logger().info(
+                f"Battery charging: {battery_pct:.1f}%", throttle_duration_sec=10.0)
             if battery_pct >= self.battery_full_threshold:
                 self.get_logger().info(f"Battery charged: {battery_pct:.1f}%")
                 self._transition_status(RobotStatusEnum.DONE_CHARGING)
 
         elif self.current_status == RobotStatusEnum.DONE_CHARGING:
-            # Store the charging subtask so _subtask_undocking can retrieve its UndockGoal
+            # Store the charging subtask so _subtask_undocking can retrieve its UndockGoal.
+            # The STOW gate inside _subtask_undocking will fire if arm is not already stowed.
             self.get_logger().debug(
                 "DONE_CHARGING — storing last_undocking_subtask and triggering undocking"
             )
@@ -1390,113 +1697,6 @@ class HuskyOperationsManager(Node):
             )
             self._subtask_undocking()
 
-    def _subtask_harvesting(self):
-        """
-        Handle the HARVESTING subtask.
-
-        State progression:
-          DESTINATION_REACHED → START_HARVESTING → HARVESTING → DONE_HARVESTING
-
-        TODO: Replace simulated timer with actual harvesting hardware integration:
-          - Connect to harvesting mechanism controller
-          - Monitor harvesting sensors (crop detection, bin status)
-          - Handle harvesting completion signal from hardware
-        """
-        elapsed_str = (
-            f"{(self.get_clock().now() - self.job_start_time).nanoseconds / 1e9:.1f}s"
-            f"/{self.job_duration:.1f}s"
-            if self.job_start_time else "N/A"
-        )
-        self.get_logger().debug(
-            f"_subtask_harvesting | status={self.current_status.name} | elapsed={elapsed_str}"
-        )
-
-        if self.current_status == RobotStatusEnum.DESTINATION_REACHED:
-            self._transition_status(RobotStatusEnum.START_HARVESTING)
-
-        elif self.current_status == RobotStatusEnum.START_HARVESTING:
-            self._transition_status(RobotStatusEnum.HARVESTING)
-            self.get_logger().info("Harvesting started")
-            # Start simulated harvest timer (replace with hardware signal)
-            self.job_start_time = self.get_clock().now()
-            self.job_duration   = 5.0  # seconds
-
-        elif self.current_status == RobotStatusEnum.HARVESTING:
-            if self.job_start_time:
-                elapsed = (self.get_clock().now() - self.job_start_time).nanoseconds / 1e9
-                if elapsed >= self.job_duration:
-                    self.get_logger().info("Harvesting complete (simulated)")
-                    self.get_logger().debug(
-                        f"Harvesting timer done | elapsed={elapsed:.2f}s duration={self.job_duration:.1f}s"
-                    )
-                    self._transition_status(RobotStatusEnum.DONE_HARVESTING)
-                    self.job_start_time = None
-        
-        elif self.current_status == RobotStatusEnum.DONE_HARVESTING:
-            new_load = min(self.current_load_status + self.loading_increment, 100.0)
-            self.get_logger().debug(
-                f"Load update | {self.current_load_status:.1f}% → {new_load:.1f}% "
-                f"(+{self.loading_increment:.1f}%)"
-            )
-            self.current_load_status = new_load
-            self.get_logger().info(f"Load status: {self.current_load_status:.1f}%")
-            self._transition_status(RobotStatusEnum.JOB_DONE)
-                    
-
-    # # TODO: Remove _subtask_loading method once the loading task is merged with harvesting task
-    # def _subtask_loading(self):
-    #     """
-    #     Handle the LOADING subtask.
-
-    #     State progression:
-    #       DONE_HARVESTING → START_LOADING → LOADING → DONE_LOADING → JOB_DONE
-
-    #     On DONE_LOADING, current_load_status is incremented by loading_increment
-    #     (capped at 100%). When load reaches 100%, JobPublisher will assign an
-    #     UNLOADING_TASK on the next cycle.
-
-    #     TODO: Replace simulated timer with actual loading hardware integration:
-    #       - Connect to conveyor/loading mechanism
-    #       - Monitor load sensors (weight, volume)
-    #       - Update current_load_status from actual sensor readings
-    #     """
-    #     self.get_logger().debug(
-    #         f"_subtask_loading | status={self.current_status.name} | "
-    #         f"current_load={self.current_load_status:.1f}% | "
-    #         f"load_increment={self.loading_increment}%"
-    #     )
-
-    #     if self.current_status == RobotStatusEnum.DONE_HARVESTING:
-    #         self._transition_status(RobotStatusEnum.START_LOADING)
-
-    #     elif self.current_status == RobotStatusEnum.START_LOADING:
-    #         self._transition_status(RobotStatusEnum.LOADING)
-    #         self.get_logger().info("Loading started")
-    #         # Start simulated load timer (replace with hardware signal)
-    #         self.job_start_time = self.get_clock().now()
-    #         self.job_duration   = 3.0  # seconds
-
-    #     elif self.current_status == RobotStatusEnum.LOADING:
-    #         if self.job_start_time:
-    #             elapsed = (self.get_clock().now() - self.job_start_time).nanoseconds / 1e9
-    #             if elapsed >= self.job_duration:
-    #                 self.get_logger().info("Loading complete (simulated)")
-    #                 self.get_logger().debug(
-    #                     f"Loading timer done | elapsed={elapsed:.2f}s duration={self.job_duration:.1f}s"
-    #                 )
-    #                 self._transition_status(RobotStatusEnum.DONE_LOADING)
-    #                 self.job_start_time = None
-
-    #     elif self.current_status == RobotStatusEnum.DONE_LOADING:
-    #         new_load = min(self.current_load_status + self.loading_increment, 100.0)
-    #         self.get_logger().debug(
-    #             f"Load update | {self.current_load_status:.1f}% → {new_load:.1f}% "
-    #             f"(+{self.loading_increment:.1f}%)"
-    #         )
-    #         self.current_load_status = new_load
-    #         self.get_logger().info(f"Load status: {self.current_load_status:.1f}%")
-    #         self._transition_status(RobotStatusEnum.JOB_DONE)
-
     def _subtask_unloading(self):
         """
         Handle the UNLOADING subtask.
@@ -1508,6 +1708,7 @@ class HuskyOperationsManager(Node):
 
         UNDOCKING is triggered internally here — same pattern as _subtask_charging.
         current_load_status is reset to 0.0 when unloading completes.
+        The STOW gate inside _subtask_undocking will fire if arm is not already stowed.
 
         TODO: Replace simulated timer with actual unloading hardware integration:
           - Connect to unloading mechanism
@@ -1541,7 +1742,8 @@ class HuskyOperationsManager(Node):
                     self.job_start_time = None
 
         elif self.current_status == RobotStatusEnum.DONE_UNLOADING:
-            # Reset load to 0 and store undocking subtask before triggering undocking
+            # Reset load to 0 and store undocking subtask before triggering undocking.
+            # The STOW gate inside _subtask_undocking will fire if arm is not already stowed.
             self.get_logger().debug(
                 "DONE_UNLOADING — storing last_undocking_subtask and triggering undocking"
             )
@@ -1573,7 +1775,7 @@ class HuskyOperationsManager(Node):
         """
         robot_status.battery_level = self.battery_status.percentage
         if self.battery_status.capacity > 0.0 and self.battery_status.current > 0.0:
-            battery_pct    = self._normalize_battery(self.battery_status.percentage)
+            battery_pct = self._normalize_battery(self.battery_status.percentage)
             # Remaining time (hours) = remaining capacity (Ah) / current draw (A)
             time_remaining = (self.battery_status.capacity * (battery_pct / 100.0) /
                               self.battery_status.current)
@@ -1648,7 +1850,7 @@ class HuskyOperationsManager(Node):
         Normalise battery percentage to the 0 - 100 range.
 
         BatteryState.percentage can be provided as 0.0 - 1.0 (ROS convention) or
-        0 -100 depending on the BMS driver. Multiplies by 100 if the value is <= 1.0.
+        0 - 100 depending on the BMS driver. Multiplies by 100 if the value is <= 1.0.
         """
         return percentage * 100.0 if percentage <= 1.0 else percentage
 
