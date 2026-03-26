@@ -1,0 +1,37 @@
+# reverse_navigation.yaml
+# Configuration for the ReverseNavigationNode.
+# All motion parameters are sourced from here — the launch file only
+# declares the 'namespace' parameter directly.
+ 
+/*/reverse_navigation_node:
+  ros__parameters:
+  
+    # ── Goal position ────────────────────────────────────────────────────────
+    goal_x: 0.5           # Target x coordinate in fixed_frame (m)
+    goal_y: 1.9           # Target y coordinate in fixed_frame (m)
+    goal_yaw: 1.571       # Goal yaw angle     (rad)
+ 
+    # ── Staging pose offsets (mirrors SimpleChargingDock) ────────────────────
+    staging_x_offset:   -1.5   # Offset along dock yaw direction (m, negative = behind dock)
+    staging_yaw_offset:  0.0   # Additional yaw applied to staging orientation (rad)
+ 
+    # ── TF Frames ────────────────────────────────────────────────────────────
+    fixed_frame: "map"        # Fixed reference frame
+    base_frame:  "base_link"  # Robot base frame
+ 
+    # ── Speed ────────────────────────────────────────────────────────────────
+    linear_speed:  0.15   # Reverse drive speed      (m/s — always applied as -v)
+    angular_speed: 0.30   # Max heading correction   (rad/s)
+ 
+    # ── Tolerances (mirrors getCommandToPose linear_tolerance / angular_tolerance) ──
+    linear_tolerance:  0.05   # Distance threshold to declare goal reached (m)
+    angular_tolerance: 0.05   # Yaw threshold to declare goal reached      (rad)
+ 
+    # ── Timeout ──────────────────────────────────────────────────────────────
+    timeout: 30.0             # Hard stop if goal not reached within N seconds (s)
+ 
+    # ── Topics ───────────────────────────────────────────────────────────────
+    cmd_vel_topic: "cmd_vel"  # Relative to the robot namespace
+ 
+    # ── Control ──────────────────────────────────────────────────────────────
+    control_frequency: 20.0   # Control loop rate (Hz)

@@ -1,0 +1,36 @@
+/*/husky_operations_manager:
+  ros__parameters:
+    # Navigation settings
+    navigation:
+      max_retries: 3
+      retry_delay: 5.0  # seconds
+
+    # Docking settings
+    docking:
+      max_retries: 2
+      retry_delay: 3.0  # seconds
+      threshold: 0.25  # meters - distance to consider "at dock"
+
+    # Undocking settings
+    undocking:
+      max_retries: 2
+      retry_delay: 3.0  # seconds
+      staging_threshold: 0.05  # meters - staging area crossing threshold
+
+    # Battery settings
+    battery:
+      low_threshold: 50.0  # percent
+      full_threshold: 99.0  # percent
+
+    # Loading settings
+    loading:
+      increment: 20.0  # percent per load operation
+
+    # Timing
+    timing:
+      timer_period: 1.0  # seconds - main loop frequency
+      initial_position_check_delay: 2.0  # seconds
+
+    # Server timeout
+    server:
+      action_server_timeout: 5.0  # seconds
