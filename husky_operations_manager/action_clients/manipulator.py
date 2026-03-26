@@ -24,6 +24,7 @@ class ArmCommand:
     GO_DROP       = "GO DROP"
     MOVE_EEF      = "MOVE EEF"
     START_HARVEST = "START HARVEST"
+    UNKNOWN       = "UNKNOWN"
 
 
 # Commands that require a target_eef_pose to be populated in the goal

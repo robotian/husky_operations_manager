@@ -250,7 +250,7 @@ class HuskyOperationsManager(Node):
         # verified before undocking and READY before harvesting without issuing
         # redundant goals when the arm is already in the correct configuration.
         # Boot assumption: arm is in STOW at startup (safe default).
-        self.last_confirmed_arm_command: str = ArmCommand.GO_STOW
+        self.last_confirmed_arm_command: str = ArmCommand.UNKNOWN
         # True while waiting for a STOW goal to complete via _handle_manipulator.
         # Gates _subtask_undocking from proceeding until arm is safe.
         self.arm_stow_pending: bool  = False
@@ -532,14 +532,14 @@ class HuskyOperationsManager(Node):
             # Compute max_undocking_time from docking config rather than hardcoding.
             # Formula: distance to staging pose / minimum speed * safety factor of 2
             dock_type          = self.active_dock.type
-            staging_x_offset   = self.active_plugin.staging_x_offset or 0.7
-            v_linear_min       = self.docking_config.controller_v_linear_min or 0.01
-            max_undocking_time = (abs(staging_x_offset) / max(v_linear_min, 0.01)) * 2.0
+            staging_x_offset   = self.active_plugin.staging_x_offset
+            v_linear       = self.docking_config.controller_v_linear_max
+            max_undocking_time = (abs(staging_x_offset) / max(v_linear, 0.01)) * 1.25
 
             self.get_logger().debug(
                 f"Startup UndockGoal | dock_type='{dock_type}' | "
                 f"staging_x_offset={staging_x_offset} | "
-                f"v_linear_min={v_linear_min} | "
+                f"v_linear_min={v_linear} | "
                 f"max_undocking_time={max_undocking_time:.1f}s"
             )
 
