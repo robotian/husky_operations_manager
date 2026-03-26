@@ -553,6 +553,10 @@ class HuskyOperationsManager(Node):
 
             # Store so the STOW gate inside _subtask_undocking can reference it
             self.last_undocking_subtask = startup_subtask
+
+            if self.arm_stow_pending:
+                self._handle_manipulator(robot_status)
+
             self._subtask_undocking()
 
         else:
@@ -717,6 +721,7 @@ class HuskyOperationsManager(Node):
             not self.arm_stow_pending and
             not self.arm_ready_pending
         )
+
         if self.arm_stow_pending or self.arm_ready_pending or arm_harvest_active:
             self._handle_manipulator(robot_status)
 

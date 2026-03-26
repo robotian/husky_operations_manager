@@ -32,10 +32,10 @@ setup(
         'console_scripts': [
             'husky_operations_manager = husky_operations_manager.husky_operations_manager:main',
             # Action client test nodes
-            'test_navigation_client = husky_operations_manager.action_client_test.test_navigation_client:main',
-            'test_docking_client = husky_operations_manager.action_client_test.test_docking_client:main',
-            'test_undocking_client = husky_operations_manager.action_client_test.test_undocking_client:main',
-            'test_harvest_client = husky_operations_manager.action_client_test.test_harvest_client:main',
+            'test_navigation_client = husky_operations_manager.unit_test.test_navigation_client:main',
+            'test_docking_client = husky_operations_manager.unit_test.test_docking_client:main',
+            'test_undocking_client = husky_operations_manager.unit_test.test_undocking_client:main',
+            'test_harvest_client = husky_operations_manager.unit_test.test_harvest_client:main',
             # Reverse Navigation Test
             'reverse_navigation_node = husky_operations_manager.reverse_navigation_node:main',
             'docking_param_fetcher = husky_operations_manager.test_docking_param_fetcher:main',
