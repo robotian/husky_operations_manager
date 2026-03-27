@@ -93,9 +93,31 @@ class RobotStatusEnum(Enum):
     OFFLINE = 97
     EMERGENCY_STOP = 98
     ABNORMAL = 99
-    
+
+
+class DriveStatus(Enum):
+    """ Status enum for DriveClient. """
+ 
+    IDLE               = 0
+ 
+    # --- Active ---
+    REVERSING          = 1   # drive_to_staging() in progress
+    FORWARDING         = 2   # drive_to_dock() in progress
+ 
+    # --- Done ---
+    DONE_REVERSING     = 3   # drive_to_staging() reached staging pose
+    DONE_FORWARDING    = 4   # drive_to_dock() reached dock pose
+ 
+    # --- Canceled ---
+    CANCELED_REVERSING  = 5  # drive_to_staging() was canceled mid-drive
+    CANCELED_FORWARDING = 6  # drive_to_dock() was canceled mid-drive
+ 
+    # --- Error ---
+    ERROR_REVERSING    = 7   # drive_to_staging() failed (timeout / TF)
+    ERROR_FORWARDING   = 8   # drive_to_dock() failed (timeout / TF)
 
 class ReverseDriveStatus(Enum):
+    """ Status enum for ReverseDriveClient. """
     IDLE      = 0
     REVERSING = 1
     DONE      = 2
@@ -104,6 +126,7 @@ class ReverseDriveStatus(Enum):
  
  
 class DockingParamFetcherStatus(Enum):
+    """ Status enum for DockingParamFetcher. """
     IDLE      = 0
     LISTING   = 1
     FETCHING  = 2
