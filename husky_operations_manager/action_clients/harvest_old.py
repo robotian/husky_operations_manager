@@ -1,4 +1,7 @@
 """
+NOTE: This is the working action client used to run MTC Harvest Action Server
+implemented as a part of mtc_tutorial packages.
+
 Harvest Action Client for robot harvesting operations.
 
 This module provides a client interface for sending harvest goals to the
