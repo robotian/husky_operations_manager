@@ -57,6 +57,7 @@ class HuskyOperationsManager(Node):
         self.active_dock:   DockInstanceConfig | None = None
         self.active_plugin: DockPluginConfig | None = None
         self.reverse_drive_client: ReverseDriveClient | None = None
+        self.docking_config_retry: int = 0
 
         # Fetch all params from docking_server asynchronously.
         # _poll_docking_config checks readiness every 0.5s and fires
@@ -135,7 +136,11 @@ class HuskyOperationsManager(Node):
 
         elif status == DockingParamFetcherStatus.ERROR:
             # Fatal — node cannot operate without docking config
-            self._config_poll_timer.cancel()
+            if self.docking_config_retry >= 3:
+                self._config_poll_timer.cancel()
+            else: 
+                self._poll_docking_config()
+            self.docking_config_retry += 1
             self.get_logger().error("DockingParamFetcher failed — node cannot start")
 
     # =========================================================================
