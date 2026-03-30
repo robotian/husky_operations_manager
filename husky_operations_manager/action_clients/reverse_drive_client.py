@@ -1,8 +1,18 @@
+import warnings
+
+warnings.filterwarnings("ignore", category=SyntaxWarning,module="angles.*")
+
 import math
 import time
 
 import tf2_ros
-from transforms3d import euler
+import tf2_geometry_msgs
+
+from tf_transformations import euler_from_quaternion, quaternion_from_euler
+
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=SyntaxWarning)
+    from angles import shortest_angular_distance
 
 from rclpy.node import Node
 from rclpy.time import Time
@@ -10,26 +20,14 @@ from rclpy.duration import Duration
 from rclpy.impl.rcutils_logger import RcutilsLogger
 
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Quaternion
-import tf2_geometry_msgs
 
 from husky_operations_manager.dataclass import DockingConfig
 from husky_operations_manager.enum import ReverseDriveStatus
 
 
 def _yaw_from_quaternion(q: Quaternion) -> float:
-    _, _, yaw = euler.quat2euler([q.w, q.x, q.y, q.z], 'sxyz')
-    return yaw
-
-
-def _quaternion_from_yaw(yaw: float) -> Quaternion:
-    w, x, y, z = euler.euler2quat(0.0, 0.0, yaw, 'sxyz')
-    q = Quaternion()
-    q.w, q.x, q.y, q.z = float(w), float(x), float(y), float(z)
-    return q
-
-
-def _shortest_angular_distance(from_yaw: float, to_yaw: float) -> float:
-    return math.atan2(math.sin(to_yaw - from_yaw), math.cos(to_yaw - from_yaw))
+    _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+    return yaw  
 
 
 class ReverseDriveClient:
@@ -137,12 +135,17 @@ class ReverseDriveClient:
         staging_y     = self._dock.dock_y + math.sin(self._dock.dock_theta) * self._plugin.staging_x_offset
         staging_theta = self._dock.dock_theta + self._plugin.staging_yaw_offset
 
+        # Converting euler angle to Quaternion
+        x, y, z, w = quaternion_from_euler(0.0, 0.0, staging_theta)
+        q = Quaternion()
+        q.w, q.x, q.y, q.z = float(w), float(x), float(y), float(z)
+
         pose = PoseStamped()
         pose.header.frame_id  = self._dock.frame
         pose.header.stamp     = self.node.get_clock().now().to_msg()
         pose.pose.position.x  = staging_x
         pose.pose.position.y  = staging_y
-        pose.pose.orientation = _quaternion_from_yaw(staging_theta)
+        pose.pose.orientation = q
 
         self._staging_pose_pub.publish(pose)
         self.logger.info(
@@ -215,7 +218,7 @@ class ReverseDriveClient:
             robot_pose.pose.position.x - target.pose.position.x,
             robot_pose.pose.position.y - target.pose.position.y,
         )
-        yaw_err = _shortest_angular_distance(
+        yaw_err = shortest_angular_distance(
             _yaw_from_quaternion(robot_pose.pose.orientation),
             _yaw_from_quaternion(target.pose.orientation),
         )
@@ -243,7 +246,7 @@ class ReverseDriveClient:
         lx = local_target.position.x
         ly = local_target.position.y
 
-        heading_error = _shortest_angular_distance(math.pi, math.atan2(ly, lx))
+        heading_error = shortest_angular_distance(math.pi, math.atan2(ly, lx))
 
         cmd.linear.x  = -self._lin_speed
         cmd.angular.z = max(-self._ang_speed,
