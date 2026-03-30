@@ -152,6 +152,17 @@ class DockingParamFetcher:
     def get_status(self) -> DockingParamFetcherStatus:
         return self._status
 
+    def reset(self) -> None:
+        """Reset fetcher to IDLE so fetch() can be safely called again on retry."""
+        self._status = DockingParamFetcherStatus.IDLE
+        self._raw_params.clear()
+        self._param_names = []
+        self._fetch_index = 0
+        self._config = None
+        self._dock_plugin_names = []
+        self._dock_instance_names = []
+        self.logger.info("DockingParamFetcher reset to IDLE")
+
     # ------------------------------------------------------------------
     # Step 1 — Parameter List
     # ------------------------------------------------------------------

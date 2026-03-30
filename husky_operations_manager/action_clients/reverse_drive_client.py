@@ -10,6 +10,7 @@ from rclpy.duration import Duration
 from rclpy.impl.rcutils_logger import RcutilsLogger
 
 from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Quaternion
+import tf2_geometry_msgs
 
 from husky_operations_manager.dataclass import DockingConfig
 from husky_operations_manager.enum import ReverseDriveStatus
@@ -55,7 +56,7 @@ class ReverseDriveClient:
         self._ang_tol   = config.undock_angular_tolerance
 
         # Timeout: abs(staging_x_offset) / v_linear_min * 2.0
-        self._timeout = (abs(self._plugin.staging_x_offset) / self._lin_speed) * 2.0
+        self._timeout = (abs(self._plugin.staging_x_offset) / self._lin_speed) * 1.25
 
         # TF
         self._tf_buffer   = tf2_ros.Buffer()
@@ -233,10 +234,14 @@ class ReverseDriveClient:
             self.logger.error(f"TF base_frame lookup failed: {e}")
             return False
 
-        tf_yaw = _yaw_from_quaternion(tf.transform.rotation)
-        t      = tf.transform.translation
-        lx     = math.cos(tf_yaw) * target.pose.position.x - math.sin(tf_yaw) * target.pose.position.y + t.x
-        ly     = math.sin(tf_yaw) * target.pose.position.x + math.cos(tf_yaw) * target.pose.position.y + t.y
+        # tf_yaw = _yaw_from_quaternion(tf.transform.rotation)
+        # t      = tf.transform.translation
+        # lx     = math.cos(tf_yaw) * target.pose.position.x - math.sin(tf_yaw) * target.pose.position.y + t.x
+        # ly     = math.sin(tf_yaw) * target.pose.position.x + math.cos(tf_yaw) * target.pose.position.y + t.y
+
+        local_target = tf2_geometry_msgs.do_transform_pose(target.pose, tf)
+        lx = local_target.position.x
+        ly = local_target.position.y
 
         heading_error = _shortest_angular_distance(math.pi, math.atan2(ly, lx))
 

@@ -10,7 +10,7 @@ from sensor_msgs.msg import BatteryState, NavSatFix, Imu
 from std_msgs.msg import Bool
 from status_interfaces.msg import RobotStatus, Task, SubTask, UndockGoal, WayPoint
 
-from husky_operations_manager.enum import OnlineFlagEnum, RobotStatusEnum, NavigationStatus, ReverseDriveStatus
+from husky_operations_manager.enum import OnlineFlagEnum, RobotStatusEnum, NavigationStatus, ReverseDriveStatus, DockingParamFetcherStatus
 from husky_operations_manager.dataclass import DockingConfig, DockInstanceConfig, DockPluginConfig
 from husky_operations_manager.docking_param_fetcher import DockingParamFetcher
 from husky_operations_manager.action_clients.reverse_drive_client import ReverseDriveClient
@@ -57,13 +57,16 @@ class HuskyOperationsManager(Node):
         self.active_dock:   DockInstanceConfig | None = None
         self.active_plugin: DockPluginConfig | None = None
         self.reverse_drive_client: ReverseDriveClient | None = None
-        self.docking_config_retry: int = 0
+
+        # 30s window for docking_server to become available before clean shutdown
+        self._CONFIG_POLL_TIMEOUT_SEC: float = 30.0
 
         # Fetch all params from docking_server asynchronously.
         # _poll_docking_config checks readiness every 0.5s and fires
         # _on_docking_config_ready once the config is built.
         self._param_fetcher = DockingParamFetcher(self)
         self._param_fetcher.fetch()
+        self._config_poll_start_time: float = self.get_clock().now().nanoseconds / 1e9
         self._config_poll_timer = self.create_timer(0.5, self._poll_docking_config)
 
     def _on_docking_config_ready(self):
@@ -120,28 +123,43 @@ class HuskyOperationsManager(Node):
         """
         Polls DockingParamFetcher every 0.5s.
 
-        Cancels itself on DONE or ERROR. On DONE, fires _on_docking_config_ready
-        which initialises all clients and starts the main timers.
+        Cancels itself on DONE or when the 30s timeout window is exceeded.
+        On DONE, fires _on_docking_config_ready which initialises all clients
+        and starts the main timers.
 
-        TODO: Need a better mechanism to handle on ERROR status as this node needs to run
-        independent of docking config
+        On ERROR, resets the fetcher and retries fetch() on the next timer tick
+        until the 30s deadline is reached, at which point the node shuts down
+        cleanly — it cannot operate without docking config.
         """
-        from husky_operations_manager.enum import DockingParamFetcherStatus
         status = self._param_fetcher.get_status()
         self.get_logger().debug(f"DockingParamFetcher poll | status={status.name}")
 
         if status == DockingParamFetcherStatus.DONE:
             self._config_poll_timer.cancel()
             self._on_docking_config_ready()
+            return
 
-        elif status == DockingParamFetcherStatus.ERROR:
-            # Fatal — node cannot operate without docking config
-            if self.docking_config_retry >= 3:
+        if status == DockingParamFetcherStatus.ERROR:
+            elapsed = self.get_clock().now().nanoseconds / 1e9 - self._config_poll_start_time
+
+            if elapsed >= self._CONFIG_POLL_TIMEOUT_SEC:
+                self.get_logger().error(
+                    f"DockingParamFetcher failed — "
+                    f"docking_server unavailable after {self._CONFIG_POLL_TIMEOUT_SEC:.0f}s | "
+                    f"elapsed={elapsed:.1f}s — shutting down"
+                )
                 self._config_poll_timer.cancel()
-            else: 
-                self._poll_docking_config()
-            self.docking_config_retry += 1
-            self.get_logger().error("DockingParamFetcher failed — node cannot start")
+                self.destroy_node()
+                rclpy.shutdown()
+                return
+
+            # Within timeout window — reset and retry on next timer tick
+            self.get_logger().warning(
+                f"DockingParamFetcher ERROR — retrying | "
+                f"elapsed={elapsed:.1f}s / {self._CONFIG_POLL_TIMEOUT_SEC:.0f}s"
+            )
+            self._param_fetcher.reset()
+            self._param_fetcher.fetch()
 
     # =========================================================================
     # PARAMS AND VARIABLES INITIALIZATION
@@ -358,7 +376,7 @@ class HuskyOperationsManager(Node):
             self.current_sub_task_index    = 0
             self.last_handled_subtask_type = None
         elif is_new_subtask:
-            self.get_logger().info(f"New Subtask for task ID: {msg.task_id}")
+            self.get_logger().info(f"New Subtask for task ID: {msg.task_id}", once=True)
             self.current_sub_task_index = 0
             # If the node completed the previous subtask and is waiting at JOB_DONE,
             # receiving a new subtask means the job publisher wants us to continue
@@ -1103,6 +1121,7 @@ class HuskyOperationsManager(Node):
                 self.last_handled_task_id   = None
                 self.last_handled_task_type = None
                 self._transition_status(RobotStatusEnum.IDLE)
+                self.get_logger().info("Robot ready for tasks")
             else:
                 # Task context: stay at DONE_UNDOCKING — _subtask_undocking
                 # will pick this up on the next tick and transition to JOB_DONE

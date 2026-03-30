@@ -25,7 +25,7 @@
  
     # ── Tolerances (mirrors getCommandToPose linear_tolerance / angular_tolerance) ──
     linear_tolerance:  0.05   # Distance threshold to declare goal reached (m)
-    angular_tolerance: 0.05   # Yaw threshold to declare goal reached      (rad)
+    angular_tolerance: 0.1   # Yaw threshold to declare goal reached      (rad)
  
     # ── Timeout ──────────────────────────────────────────────────────────────
     timeout: 30.0             # Hard stop if goal not reached within N seconds (s)
