@@ -375,13 +375,18 @@ class HuskyOperationsManager(Node):
             self.get_logger().info(f"New Task: {msg.description} (ID: {msg.task_id})")
             self.current_sub_task_index    = 0
             self.last_handled_subtask_type = None
+            # self.current_load_status = msg.crop_load
         elif is_new_subtask:
-            self.get_logger().info(f"New Subtask for task ID: {msg.task_id}", once=True)
+            self.get_logger().info(f"New Subtask for task ID: {msg.task_id}")
             self.current_sub_task_index = 0
             # If the node completed the previous subtask and is waiting at JOB_DONE,
             # receiving a new subtask means the job publisher wants us to continue
             if self.current_status == RobotStatusEnum.JOB_DONE:
                 self._transition_status(RobotStatusEnum.IDLE)
+        
+        # On Node start verify the load with server
+        if self.last_handled_task_id is None:
+            self.current_load_status = self.task.crop_load
 
         self.task = msg
 
@@ -1207,6 +1212,8 @@ class HuskyOperationsManager(Node):
                 self.last_handled_task_type = None
                 self._transition_status(RobotStatusEnum.DONE_UNDOCKING)
                 self._transition_status(RobotStatusEnum.IDLE)
+
+                self.get_logger().info("Robot ready for tasks")
             else:
                 # Task context: stay at DONE_UNDOCKING for _subtask_undocking
                 self.get_logger().debug(
