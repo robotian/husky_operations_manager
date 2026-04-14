@@ -185,7 +185,7 @@ class ReverseDriveClient:
             elapsed = time.monotonic() - self._start_time
             self._shutdown(success=True, msg=f"Staging pose reached in {elapsed:.2f}s")
             return
-
+        
         self._publish_cmd_vel(cmd)
 
     # ------------------------------------------------------------------
@@ -259,6 +259,7 @@ class ReverseDriveClient:
         msg.header.stamp    = self.node.get_clock().now().to_msg()
         msg.header.frame_id = self.config.base_frame
         msg.twist           = twist
+        self.logger.info(f"Sending msg: {msg}", throttle_duration_sec=1.0)
         self._cmd_vel_pub.publish(msg)
 
     # ------------------------------------------------------------------
