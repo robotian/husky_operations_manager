@@ -10,7 +10,13 @@ from sensor_msgs.msg import BatteryState, NavSatFix, Imu
 from std_msgs.msg import Bool
 from status_interfaces.msg import RobotStatus, Task, SubTask, UndockGoal, WayPoint
 
-from husky_operations_manager.enum import OnlineFlagEnum, RobotStatusEnum, NavigationStatus, ReverseDriveStatus, DockingParamFetcherStatus
+from husky_operations_manager.enum import ( 
+    OnlineFlagEnum, 
+    RobotStatusEnum, 
+    NavigationStatus, 
+    ReverseDriveStatus, 
+    DockingParamFetcherStatus 
+)
 from husky_operations_manager.dataclass import DockingConfig, DockInstanceConfig, DockPluginConfig
 from husky_operations_manager.docking_param_fetcher import DockingParamFetcher
 from husky_operations_manager.action_clients.reverse_drive_client import ReverseDriveClient

@@ -40,6 +40,7 @@ setup(
             'test_docking_client = husky_operations_manager.unit_test.test_docking_client:main',
             'test_undocking_client = husky_operations_manager.unit_test.test_undocking_client:main',
             'test_harvest_client = husky_operations_manager.unit_test.test_harvest_client:main',
+            'test_drive_client = husky_operations_manager.unit_test.test_drive_client:main',
 
             'test_lavender_detection = husky_operations_manager.lavender_detection_test:main',
         ],

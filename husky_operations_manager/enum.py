@@ -97,25 +97,13 @@ class RobotStatusEnum(Enum):
 
 class DriveStatus(Enum):
     """ Status enum for DriveClient. """
- 
-    IDLE               = 0
- 
-    # --- Active ---
-    REVERSING          = 1   # drive_to_staging() in progress
-    FORWARDING         = 2   # drive_to_dock() in progress
- 
-    # --- Done ---
-    DONE_REVERSING     = 3   # drive_to_staging() reached staging pose
-    DONE_FORWARDING    = 4   # drive_to_dock() reached dock pose
- 
-    # --- Canceled ---
-    CANCELED_REVERSING  = 5  # drive_to_staging() was canceled mid-drive
-    CANCELED_FORWARDING = 6  # drive_to_dock() was canceled mid-drive
- 
-    # --- Error ---
-    ERROR_REVERSING    = 7   # drive_to_staging() failed (timeout / TF)
-    ERROR_FORWARDING   = 8   # drive_to_dock() failed (timeout / TF)
-
+    IDLE      = 0
+    FORWARD   = 1
+    REVERSE   = 2
+    DONE      = 3
+    CANCELED  = 4
+    ERROR     = 5
+    
 class ReverseDriveStatus(Enum):
     """ Status enum for ReverseDriveClient. """
     IDLE      = 0

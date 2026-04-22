@@ -15,7 +15,7 @@ Deprecated-method notes
 """
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import time
 from typing import Optional, Tuple
 
@@ -70,8 +70,8 @@ class Config:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # ── Timer ────────────────────────────────────────────────────────────────
-    # Inference runs at this rate (Hz). Increase if your hardware allows.
-    timer_hz: float = 2.0
+    # Inference runs at this rate (sec). Increase if your hardware allows.
+    timer_period_sec: float = 0.5
 
     # ── Topics (relative to namespace) ───────────────────────────────────────
     color_image_topic: str    = "manipulators/arm_0_color_camera/image_raw"
@@ -143,7 +143,6 @@ class Intrinsics:
             width=int(msg.width),
             height=int(msg.height),
         )
-
 
 class DepthUtils_Base:
     """
@@ -358,45 +357,39 @@ class DepthUtils_Base:
 
 class DepthUtils:
     """
-    3D geometry helpers — stateful, initialized once per camera.
+    Stateful 3D geometry helpers — initialized once per camera session.
 
     Converts from pure-static to instance-based to enable:
       - Pre-built full-image coordinate grids (U_full, V_full)
       - Cached depth scale to avoid per-call multiply
-      - Pre-allocated working buffers reused every frame
+      - Pre-allocated working buffer reused every frame
 
     Usage:
-        # Initialize once when CameraInfo arrives
-        self._depth_utils = DepthUtils(intrinsics, (480, 640), depth_scale=0.001)
+        # Initialize once when depth CameraInfo arrives
+        self._depth_utils = DepthUtils.from_camera_info_and_shape(
+            msg, depth_scale=0.001, logger=self.get_logger()
+        )
 
-        # Call every frame — no pre-processing needed in _timer_callback
-        pts3d   = self._depth_utils.bbox_keypoints_3d_camera(bbox, depth_np, ...)
-        extents = self._depth_utils.bbox_3d_extents(box, depth_np, ...)
+        # Call every frame
+        pts3d   = self._depth_utils.bbox_keypoints_3d_camera(bbox, depth_np)
+        extents = self._depth_utils.bbox_3d_extents(box, depth_np)
     """
 
     def __init__(
         self,
         intr: 'Intrinsics',
-        image_shape: Tuple[int, int],   # (height, width)
         depth_scale: float = 0.001,
+        logger=None,
     ) -> None:
         """
-        Pre-build coordinate grids and cache all constants.
-
         Args:
-            intr:        Camera intrinsics from CameraInfo
-            image_shape: (height, width) of the depth image
+            intr:        Camera intrinsics from depth CameraInfo
             depth_scale: metres per raw uint16 unit (default 0.001 = mm→m)
+            logger:      optional ROS2 logger instance
         """
+        self._logger      = logger
         self._intr        = intr
         self._depth_scale = np.float32(depth_scale)
-        self._h, self._w  = image_shape
-
-        # --- Pre-build full-image coordinate grids ---
-        # Built once at init, sliced every frame — zero per-frame allocation
-        cols = np.arange(self._w, dtype=np.float32)
-        rows = np.arange(self._h, dtype=np.float32)
-        self._U_full, self._V_full = np.meshgrid(cols, rows)
 
         # Cache intrinsic constants as float32 scalars for broadcasting
         self._cx = np.float32(intr.cx)
@@ -404,30 +397,66 @@ class DepthUtils:
         self._fx = np.float32(intr.fx)
         self._fy = np.float32(intr.fy)
 
-        # Pre-allocate a reusable float32 buffer for depth conversion
-        # Avoids repeated allocation of (H, W) float32 arrays each frame
-        self._depth_f32_buf = np.empty(
-            (self._h, self._w), dtype=np.float32)
+        # All buffers and grids initialized to None
+        # Populated eagerly via from_camera_info_and_shape
+        # or lazily on first call as safety fallback
+        self._depth_f32_buf: Optional[np.ndarray] = None
+        self._U_full:        Optional[np.ndarray] = None
+        self._V_full:        Optional[np.ndarray] = None
+        self._h: int = 0
+        self._w: int = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _to_depth_f32(self, depth_image: np.ndarray) -> np.ndarray:
+    def _ensure_grids(self, shape: Tuple[int, int]) -> None:
         """
-        Convert raw uint16 depth to scaled float32 in-place into
-        the pre-allocated buffer — zero new allocation per frame.
+        Ensure coordinate grids and depth buffer match the given shape.
+        Rebuilds only when shape changes — typically once per session.
 
         Args:
-            depth_image: uint16 numpy array (H x W)
+            shape: (height, width) of the depth image
+        """
+        h, w = shape
+        if self._U_full is not None and self._U_full.shape == (h, w):
+            return  # Already correct — no-op
+
+        cols = np.arange(w, dtype=np.float32)
+        rows = np.arange(h, dtype=np.float32)
+        self._U_full, self._V_full = np.meshgrid(cols, rows)
+        self._depth_f32_buf = np.empty((h, w), dtype=np.float32)
+        self._h, self._w = h, w
+
+        self._log(
+            f"DepthUtils grids initialized | "
+            f"shape=({h}, {w}) | "
+            f"depth_scale={float(self._depth_scale):.4f}"
+        )
+
+    def _to_depth_f32(self, depth_image: np.ndarray) -> np.ndarray:
+        """
+        Convert raw uint16 depth to scaled float32 in-place into the
+        pre-allocated buffer — zero new allocation per frame.
+
+        Calls _ensure_grids as safety fallback if shape changed or
+        buffer was never initialized.
+
+        Args:
+            depth_image: raw uint16 numpy array (H x W)
 
         Returns:
             float32 view of internal buffer with depth in metres
         """
+        if (self._depth_f32_buf is None or
+                self._depth_f32_buf.shape != depth_image.shape):
+            self._ensure_grids(depth_image.shape)
+
         np.multiply(
-            depth_image, self._depth_scale,
+            depth_image,
+            self._depth_scale,
             out=self._depth_f32_buf,
-            casting='unsafe'
+            casting='unsafe',
         )
         return self._depth_f32_buf
 
@@ -438,7 +467,7 @@ class DepthUtils:
         hi: float,
     ) -> Tuple[float, float]:
         """
-        Compute two percentiles using np.partition — O(N) vs O(N log N).
+        Compute two percentiles via np.partition — O(N) vs O(N log N).
 
         Args:
             arr: 1D numpy array
@@ -454,8 +483,15 @@ class DepthUtils:
         partitioned = np.partition(arr, [k_lo, k_hi])
         return float(partitioned[k_lo]), float(partitioned[k_hi])
 
+    def _log(self, msg: str) -> None:
+        """Use ROS2 logger if available, otherwise print."""
+        if self._logger:
+            self._logger.info(msg)
+        else:
+            print(f"[DepthUtils] {msg}")
+
     # ------------------------------------------------------------------
-    # Public interface — same signatures as original static methods
+    # Public interface
     # ------------------------------------------------------------------
 
     def deproject_pixel(
@@ -466,7 +502,13 @@ class DepthUtils:
     ) -> Tuple[float, float, float]:
         """
         Back-project a 2D pixel + depth into a 3D camera-frame point.
-        Unchanged — kept for API compatibility.
+
+        Args:
+            u, v:    pixel coordinates (column, row)
+            depth_m: depth in metres
+
+        Returns:
+            (X, Y, Z) in metres in the camera optical frame
         """
         X = (u - self._cx) * depth_m / self._fx
         Y = (v - self._cy) * depth_m / self._fy
@@ -484,13 +526,13 @@ class DepthUtils:
         """
         Return median depth (metres) in a win×win window around (u, v).
 
-        Accepts pre-scaled float32 depth — no internal scaling needed.
-        Meshgrid replaced with direct index arithmetic.
+        Accepts pre-scaled float32 depth — no internal scaling.
+        Meshgrid replaced with direct index arithmetic for zero allocation.
 
         Args:
             depth_f32: pre-scaled float32 depth array (metres)
             u, v:      pixel coordinates
-            box:       optional bbox to clip window against
+            box:       optional (x1,y1,x2,y2) to clip window against
             win:       window diameter in pixels
             min_valid: minimum valid pixels required
 
@@ -505,13 +547,14 @@ class DepthUtils:
         if box is not None:
             x1, y1, x2, y2 = map(int, box)
             # Clip window to bbox — direct arithmetic, no meshgrid
-            u0 = max(u0, x1);  u1 = min(u1, x2)
-            v0 = max(v0, y1);  v1 = min(v1, y2)
+            u0 = max(u0, x1)
+            u1 = min(u1, x2)
+            v0 = max(v0, y1)
+            v1 = min(v1, y2)
 
         if u1 <= u0 or v1 <= v0:
             return None
 
-        # Flatten and filter in one step — no intermediate boolean array
         valid = depth_f32[v0:v1, u0:u1].ravel()
         valid = valid[valid > 0]
 
@@ -530,10 +573,7 @@ class DepthUtils:
         """
         Compute 3D camera-frame points for centre + 4 corners of a bbox.
 
-        Optimization:
-          - depth_image converted once internally via pre-allocated buffer
-          - meshgrid replaced with direct index clipping per keypoint
-          - min_valid relaxed to 5 (small windows rarely hit 20 valid pixels)
+        depth_image converted once into pre-allocated buffer internally.
 
         Args:
             box:         (x1, y1, x2, y2) bounding box in pixels
@@ -542,7 +582,8 @@ class DepthUtils:
             inset_px:    corner inset in pixels
 
         Returns:
-            dict with keys center/tl/tr/bl/br, each (X,Y,Z,depth_m) or None
+            dict with keys center/tl/tr/bl/br,
+            each (X, Y, Z, depth_m) in metres or None
         """
         x1, y1, x2, y2 = map(int, box)
 
@@ -565,15 +606,17 @@ class DepthUtils:
         result = {}
         for name, (u, v) in keypoints.items():
             depth_m = self.robust_depth_at_pixel(
-                depth_f32, u, v, box=(x1, y1, x2, y2), win=win
+                depth_f32, u, v,
+                box=(x1, y1, x2, y2),
+                win=win,
             )
             if depth_m is None:
                 result[name] = None
                 continue
 
-            X = (u - self._cx) * depth_m / self._fx
-            Y = (v - self._cy) * depth_m / self._fy
-            result[name] = (float(X), float(Y), float(depth_m), float(depth_m))
+            X = float((u - self._cx) * depth_m / self._fx)
+            Y = float((v - self._cy) * depth_m / self._fy)
+            result[name] = (X, Y, float(depth_m), float(depth_m))
 
         return result
 
@@ -587,15 +630,15 @@ class DepthUtils:
         pct_high: float = 95.0,
     ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """
-        Estimate 3D physical extents (width, height, depth) of the object
+        Estimate 3D physical extents (width, height, depth) of object
         inside a bounding box.
 
-        Optimizations applied:
+        Optimizations:
           - depth converted once into pre-allocated float32 buffer
           - Python double loop replaced with single array slice
           - Coordinate grids sliced from pre-built full-image grids
           - Deprojection via numpy broadcasting — zero Python loop
-          - Percentile via np.partition O(N) instead of np.percentile O(NlogN)
+          - Percentile via np.partition O(N) vs np.percentile O(NlogN)
 
         Args:
             box:        (x1, y1, x2, y2) bounding box
@@ -610,6 +653,9 @@ class DepthUtils:
         """
         x1, y1, x2, y2 = map(int, box)
 
+        # Safety: ensure grids exist for this depth image shape
+        self._ensure_grids(depth_image.shape)
+
         # Clamp to image bounds
         x1 = max(0, min(x1, self._w - 1))
         x2 = max(0, min(x2, self._w - 1))
@@ -619,32 +665,32 @@ class DepthUtils:
         if x2 <= x1 or y2 <= y1:
             return None, None, None
 
-        # Convert raw depth into pre-allocated float32 buffer — no new alloc
+        # Convert raw depth into pre-allocated float32 buffer
         depth_f32 = self._to_depth_f32(depth_image)
 
-        # Single strided slice — equivalent to double loop, O(1) Python
+        # Single strided slice — zero Python loop
         Z = depth_f32[y1:y2:step, x1:x2:step]
 
         # Slice pre-built grids — zero allocation
         U = self._U_full[y1:y2:step, x1:x2:step]
         V = self._V_full[y1:y2:step, x1:x2:step]
 
-        # Valid pixel mask — single vectorized comparison
+        # Valid pixel mask
         valid_mask = Z > 0
 
         if valid_mask.sum() < min_points:
             return None, None, None
 
-        # Boolean indexing — extract valid pixels only
+        # Extract valid pixels
         Z_v = Z[valid_mask]
         U_v = U[valid_mask]
         V_v = V[valid_mask]
 
-        # Deproject all valid pixels simultaneously — numpy broadcasting
+        # Deproject all valid pixels simultaneously
         X_v = (U_v - self._cx) * Z_v / self._fx
         Y_v = (V_v - self._cy) * Z_v / self._fy
 
-        # Fast percentile via partition — avoids full sort
+        # Fast percentile via partition
         x_lo, x_hi = self._fast_percentile(X_v, pct_low, pct_high)
         y_lo, y_hi = self._fast_percentile(Y_v, pct_low, pct_high)
         z_lo, z_hi = self._fast_percentile(Z_v, pct_low, pct_high)
@@ -652,34 +698,37 @@ class DepthUtils:
         return (x_hi - x_lo), (y_hi - y_lo), (z_hi - z_lo)
 
     # ------------------------------------------------------------------
-    # Static helpers retained for backward compatibility
+    # Constructor helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def from_camera_info_and_shape(
         msg: 'CameraInfo',
         depth_scale: float = 0.001,
+        logger=None,
     ) -> 'DepthUtils':
         """
-        Convenience constructor — builds DepthUtils directly from CameraInfo.
+        Construct DepthUtils from depth camera CameraInfo.
+
+        Grids and buffer initialized eagerly using the correct depth
+        resolution from the message — lazy init is safety fallback only.
 
         Args:
-            msg:         sensor_msgs/CameraInfo message
-            depth_scale: metres per raw depth unit
+            msg:         sensor_msgs/CameraInfo from depth camera topic
+            depth_scale: metres per raw depth unit (default 0.001 = mm→m)
+            logger:      optional ROS2 logger
 
         Returns:
-            Initialized DepthUtils instance
-
-        Usage in LavenderDetection:
-            def _color_camera_info_callback(self, msg):
-                if self._depth_utils is None:
-                    self._depth_utils = DepthUtils.from_camera_info_and_shape(
-                        msg, LavenderDetection.DEPTH_SCALE
-                    )
+            Fully initialized DepthUtils instance
         """
-        intr = Intrinsics.from_camera_info(msg)
-        return DepthUtils(intr, (msg.height, msg.width), depth_scale)
+        intr     = Intrinsics.from_camera_info(msg)
+        instance = DepthUtils(intr, depth_scale, logger)
 
+        # Eager initialization with known depth resolution
+        instance._ensure_grids((msg.height, msg.width))
+
+        return instance
+    
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. DetectionModel
 #    Loads the Faster R-CNN checkpoint and wraps inference.
@@ -823,6 +872,16 @@ class DetectionModel_FP16:
         )
 
         self._model = model
+
+        self._model.roi_heads.detections_per_img = 10   # default 100
+        self._model.roi_heads.score_thresh       = 0.05  # default 0.05
+        self._model.roi_heads.nms_thresh         = 0.5  # default 0.5
+        self._log(
+            "ROI head thresholds tightened | "
+            f"detections_per_img={self._model.roi_heads.detections_per_img} "
+            f"score_thresh={self._model.roi_heads.score_thresh} "
+            f"nms_thresh={self._model.roi_heads.nms_thresh}"
+        )
 
         # --- Optimization 2: Pinned memory flag ---
         # Pinned (page-locked) memory reduces PCIe transfer time CPU → GPU.
@@ -1020,7 +1079,7 @@ class LavenderDetection(Node):
             CameraInfo, camera_info_topic, self._color_camera_info_callback, qos
         )
         self.create_subscription(
-            CameraInfo, camera_info_topic, self._depth_camera_info_callback, qos
+            CameraInfo, depth_info_topic, self._depth_camera_info_callback, qos
         )
         self.create_subscription(
             Image, color_topic, self._color_image_callback, qos
@@ -1034,12 +1093,11 @@ class LavenderDetection(Node):
         self._annotated_pub_compressed = self.create_publisher(CompressedImage, f'{output_topic}/compressed', 10)
 
         # ── Timer ─────────────────────────────────────────────────────────
-        timer_period = 1.0 / cfg.timer_hz
-        self.create_timer(timer_period, self._timer_callback)
+        self.create_timer(cfg.timer_period_sec, self._timer_callback)
 
         self.get_logger().info(
             f"LavenderDetection started | namespace='{self._namespace}' | "
-            f"timer={cfg.timer_hz} Hz"
+            f"timer={1/cfg.timer_period_sec} Hz"
         )
         self.get_logger().info(f"  colour  → {color_topic}")
         self.get_logger().info(f"  depth   → {depth_topic}")
@@ -1064,7 +1122,15 @@ class LavenderDetection(Node):
         self._depth_camera_info = msg
         # Build intrinsics once; CameraInfo is static for a fixed camera
         if self._depth_utils is None:
-            self._depth_utils = DepthUtils.from_camera_info_and_shape(msg, self.DEPTH_SCALE)
+            self._depth_utils = DepthUtils.from_camera_info_and_shape(
+                msg, self.DEPTH_SCALE, logger=self.get_logger()
+            )
+            self.get_logger().info(
+                f"Depth intrinsics received | "
+                f"fx={msg.k[0]:.2f} fy={msg.k[4]:.2f} "
+                f"cx={msg.k[2]:.2f} cy={msg.k[5]:.2f} | "
+                f"resolution={msg.width}x{msg.height}"
+            )
 
     def _color_image_callback(self, msg: Image) -> None:
         self._color_image = msg
@@ -1111,20 +1177,6 @@ class LavenderDetection(Node):
             x1, y1, x2, y2 = map(int, box.tolist())
             bbox_tuple = (x1, y1, x2, y2)
 
-            # DepthUtils.bbox_keypoints_3d_camera(
-            #     bbox_tuple, depth_np, self._intrinsics,
-            #     self.DEPTH_SCALE,
-            #     win=self._cfg.depth_window,
-            #     inset_px=self._cfg.corner_inset_px,
-            # )
-            # DepthUtils.bbox_3d_extents(
-            #     box.numpy(), depth_np, self._intrinsics,
-            #     self.DEPTH_SCALE,
-            #     step=self._cfg.bbox_scan_step,
-            #     min_points=self._cfg.bbox_min_points,
-            #     pct_low=self._cfg.extent_percentile_low,
-            #     pct_high=self._cfg.extent_percentile_high,
-            # )
             self._depth_utils.bbox_keypoints_3d_camera(
                 bbox_tuple, depth_np,
                 win=self._cfg.depth_window, inset_px=self._cfg.corner_inset_px,

@@ -1,29 +1,26 @@
 import warnings
 
-warnings.filterwarnings("ignore", category=SyntaxWarning,module="angles.*")
-
 import math
 import time
 
-import tf2_ros
 import tf2_geometry_msgs
-
+import tf2_ros
 from tf_transformations import euler_from_quaternion, quaternion_from_euler
 
-with warnings.catch_warnings():
-    warnings.filterwarnings("ignore", category=SyntaxWarning)
-    from angles import shortest_angular_distance
-
-from rclpy.node import Node
-from rclpy.time import Time
+from geometry_msgs.msg import PoseStamped, Quaternion, Twist, TwistStamped
 from rclpy.duration import Duration
 from rclpy.impl.rcutils_logger import RcutilsLogger
-
-from geometry_msgs.msg import Twist, TwistStamped, PoseStamped, Quaternion
+from rclpy.node import Node
+from rclpy.time import Time
 
 from husky_operations_manager.dataclass import DockingConfig
 from husky_operations_manager.enum import ReverseDriveStatus
 
+warnings.filterwarnings("ignore", category=SyntaxWarning,module="angles.*")
+
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=SyntaxWarning)
+    from angles import shortest_angular_distance
 
 def _yaw_from_quaternion(q: Quaternion) -> float:
     _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])

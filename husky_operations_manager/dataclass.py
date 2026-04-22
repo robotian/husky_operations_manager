@@ -138,3 +138,10 @@ class ManipulatorTaskFeedback:
     feedback_message: str = ""
     execution_time: float = 0.0
     num_retries: int = 0
+
+@dataclass
+class DriveConfig:
+    base_frame: str = "base_link"
+    fixed_frame: str = "map"
+    v_linear: float = 0.5
+    v_angular: float = 0.5
