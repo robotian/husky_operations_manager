@@ -317,7 +317,7 @@ class HuskyOperationsManager(Node):
         # IMU — stored but not currently used in state machine logic
         self.imu_sub = self.create_subscription(
             Imu,
-            f'{self.namespace}/ssensors/gps_0/imu',
+            f'{self.namespace}/sensors/gps_0/imu',
             lambda msg: setattr(self, 'imu_status', msg),
             qos_profile_sensor_data)
 
