@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from geometry_msgs.msg import PoseStamped
 
+
 @dataclass
 class WPFStatus:
     """
@@ -35,11 +36,13 @@ class DockingFeedback:
     docking_time: float
     num_retries: int
 
+
 @dataclass
 class DockPose:
     x: float
     y: float
     theta: float
+
 
 @dataclass
 class Docks:
@@ -73,31 +76,31 @@ class DockPluginConfig:
     stall_effort_threshold: float
     charging_threshold: float
     rotate_to_dock: bool
-    dock_direction: str                        
+    dock_direction: str
 
- 
+
 @dataclass
 class DockInstanceConfig:
     instance_name: str
     type: str
     frame: str
     pose: list
-    id: str        
-    dock_x: float  
-    dock_y: float  
-    dock_theta: float 
- 
- 
+    id: str
+    dock_x: float
+    dock_y: float
+    dock_theta: float
+
+
 @dataclass
 class DockingConfig:
     # Raw lists from docking_server
     dock_plugins: list
     docks: list
- 
+
     # Fetched configs keyed by name
-    plugin_configs: dict        # plugin_name → DockPluginConfig
-    dock_configs: dict          # dock_name   → DockInstanceConfig
- 
+    plugin_configs: dict  # plugin_name → DockPluginConfig
+    dock_configs: dict  # dock_name   → DockInstanceConfig
+
     # Top-level params
     base_frame: str
     fixed_frame: str
@@ -110,7 +113,7 @@ class DockingConfig:
     max_retries: int
     dock_backwards: bool
     dock_prestaging_tolerance: float
- 
+
     # Controller params
     controller_k_phi: float
     controller_k_delta: float
@@ -128,20 +131,28 @@ class DockingConfig:
     controller_rotate_to_heading_angular_vel: float
     controller_rotate_to_heading_max_angular_accel: float
 
+
 @dataclass
 class ManipulatorTaskFeedback:
     """Feedback data for a harvesting arm task."""
+
     status: int
     task: str
     arm_task: str
+    feedback_message: str
+    execution_time: float
+    num_retries: int
     arm_pose: PoseStamped = field(default_factory=PoseStamped)
-    feedback_message: str = ""
-    execution_time: float = 0.0
-    num_retries: int = 0
+
 
 @dataclass
 class DriveConfig:
-    base_frame: str = "base_link"
-    fixed_frame: str = "map"
-    v_linear: float = 0.5
-    v_angular: float = 0.5
+    base_frame: str
+    fixed_frame: str
+    v_linear: float
+    v_angular: float
+    tf_polling_rate: float
+    alignment_tolerance: float
+    tf_target_frame: str
+    tf_base_frame: str
+    tf_detection_frame: str
