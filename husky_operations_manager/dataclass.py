@@ -147,12 +147,12 @@ class ManipulatorTaskFeedback:
 
 @dataclass
 class DriveConfig:
+    timeout: float
     base_frame: str
-    fixed_frame: str
-    v_linear: float
-    v_angular: float
-    tf_polling_rate: float
-    alignment_tolerance: float
-    tf_target_frame: str
     tf_base_frame: str
     tf_detection_frame: str
+    v_linear: float
+    v_angular: float
+    tf_polling_rate: float    
+    tolerance: float
+

@@ -2,13 +2,10 @@ ros__parameters:
 
   # --- Existing parameters (unchanged) ---
   base_frame:  "base_link"
-  fixed_frame: "odom"
   v_linear:    0.5
   v_angular:   0.5
-
-  # --- Alignment detection parameters (NEW) ---
   tf_polling_rate:     10.0               # Hz — tune based on robot speed and terrain
-  alignment_tolerance: 0.05               # metres — tolerance along X axis in target frame
-  tf_target_frame:     "map"              # common reference frame for TF lookups
-  tf_base_frame:       "arm_0_base_link"  # robot base frame
-  tf_detection_frame:  "arm_0_detections" # detection child frame from LavenderDetectionNode
+  timeout:             30.0
+  tolerance: 0.05               # metres — tolerance along X axis in target frame
+  tf_base_frame:       "arm_0_base_link"  # frame for alignment check with lavender bush center
+  tf_detection_frame:  "arm_0_detections" # detection child frame for lavender bush center
