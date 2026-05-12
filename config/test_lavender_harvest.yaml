@@ -1,0 +1,51 @@
+lavender_harvest_test_node:
+  ros__parameters:
+
+    # ── General ────────────────────────────────────────────────────────────────
+    num_rows:              1      # Number of rows to harvest (configurable for multi-row farms)
+    no_detection_timeout:  10.0   # Seconds without detection before assuming row end
+    harvest_duration:      5.0    # Simulated harvest duration per bush (seconds)
+    unload_duration:       5.0    # Simulated unload duration (seconds)
+    loading:
+      increment:     20.0   # Load % added per harvest cycle
+
+    # ── Row 0 waypoints [x, y, theta] ─────────────────────────────────────────
+    # Side A: robot travels South → North (forward direction)
+    # Side B: robot travels North → South (opposite direction, other side of row)
+    # Add row_1_*, row_2_* etc. for additional rows (must match num_rows)
+    row_0_side_a_start:   [0.0,  1.86, -1.57]
+    row_0_side_a_end:     [0.0,  -1.86, -1.57]
+    row_0_side_b_start:   [-1.0,  -1.86, 1.57]
+    row_0_side_b_end:     [-1.0,  1.86, 1.57]
+
+    # ── DriveClient ────────────────────────────────────────────────────────────
+    drive_client:
+      tf_polling_rate:      10.0               # TF alignment check rate (Hz)      
+      tf_target_frame:      "map"              
+      tf_base_frame:        "arm_0_base_link"  
+      tf_detection_frame:   "arm_0_detections" 
+      tolerance:            0.05               # X axis alignment tolerance (m)
+      timeout:              30.0               # Max correction time before warning (s)
+      v_linear:             0.2                # Forward/reverse speed (m/s) — tune per terrain
+      v_angular:            0.5                # Angular speed (rad/s)
+
+    # ── Navigation ─────────────────────────────────────────────────────────────
+    navigation:
+      max_retries:  3
+      retry_delay:  5.0    # Seconds between retries
+
+    # ── Docking ────────────────────────────────────────────────────────────────
+    docking:
+      max_retries:  2
+      retry_delay:  3.0
+      threshold:    0.25     # Distance (m) to consider robot at dock
+
+    # ── Battery ────────────────────────────────────────────────────────────────
+    battery:
+      low_threshold:   50.0  # % — below this triggers ERROR
+      full_threshold:  99.0  # % — used for charging completion check
+
+    # ── Timing ─────────────────────────────────────────────────────────────────
+    timing:
+      timer_period:                  1.0   # Main control loop period (s)
+      initial_position_check_delay:  2.0   # Delay before initial dock check (s)

@@ -1,10 +1,9 @@
 import rclpy
 from rclpy.node import Node
 
-from husky_operations_manager.action_clients.drive_client import DriveClient
+from husky_operations_manager.action_clients.drive_client_new import DriveClient
 from husky_operations_manager.dataclass import DriveConfig
 from husky_operations_manager.enum import DriveStatus
-
 from status_interfaces.msg import ImageDetectionPose
 
 
@@ -25,7 +24,9 @@ class TestDriveNode(Node):
             tf_base_frame="arm_0_base_link",
             tf_detection_frame="arm_0_detections",
         )
-
+        self._drive_client = DriveClient(self, drive_config)
+ 
+        # --- Subscription to ImageDetectionPose ---
         self.sub = self.create_subscription(
             ImageDetectionPose,
             f"{self.namespace}/manipulators/arm_0_detection/image_annotated/detection_pose",
@@ -33,26 +34,39 @@ class TestDriveNode(Node):
             10
         )
 
-        self.drive_client = DriveClient(self, drive_config)
-        self.create_timer(0.2, self._control_loop)
-
-    def detection_callback(self, msg):
-        self.detection_msg = msg
-
-    def _control_loop(self):
-        status = self.drive_client.get_status()
-        self.get_logger().info(f"Current Status: {status}")
-
-        if status in [DriveStatus.ERROR, DriveStatus.CANCELED]:
+        self.get_logger().info(
+            f"Subscribed to detection topic: {self.sub.topic_name}")
+ 
+        # --- Start moving ---
+        self._drive_client.forward()
+        self.get_logger().info("DriveClient started — moving forward.")
+ 
+    def _detection_callback(self, msg: ImageDetectionPose) -> None:
+        """
+        Callback for ImageDetectionPose messages.
+ 
+        Mirrors HuskyOpsManager behaviour:
+          - Ignores messages where detection_valid=False
+          - Calls drive_client.stop() on detection_valid=True
+          - DriveClient internally validates pose via TF polling
+            before publishing zero velocity
+        """
+        if not msg.detection_valid:
             return
-        
-        if self.detection_msg is None:
-            self.get_logger().info(f"Please check if Image Detection is publishing on topic {self.sub.topic_name}")
-        
-        if self.detection_msg.detection_valid:
-            self.drive_client.stop()
-        else:
-            self.drive_client.forward()
+ 
+        status = self._drive_client.get_status()
+ 
+        self.get_logger().info(
+            f"Valid detection received | "
+            f"center=({msg.center.x:.3f}, {msg.center.y:.3f}, {msg.center.z:.3f}) | "
+            f"drive_status={status}")
+ 
+        if status == DriveStatus.IDLE:
+            self.get_logger().info(
+                "Robot already stopped. Ignoring detection.")
+            return
+ 
+        self._drive_client.stop()
 
 
 def main():

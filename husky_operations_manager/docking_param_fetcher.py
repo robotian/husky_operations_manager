@@ -112,24 +112,6 @@ class DockingParamFetcher:
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
-
-    def fetch(self, on_complete: Callable[[DockingConfig], None]) -> None:
-        """Start async fetch. Delivers DockingConfig via on_complete callback."""
-        self._t_fetch_start = time.perf_counter()
-
-        if self._status not in (DockingParamFetcherStatus.IDLE, DockingParamFetcherStatus.ERROR):
-            self.logger.warning(f"fetch() ignored — already {self._status.name}")
-            return
-        
-        self._on_complete = on_complete
-        self._raw_params.clear()
-        self._param_names = []
-        self._fetch_index = 0
-        self._config = None
-        self._dock_plugin_names = []
-        self._dock_instance_names = []
-        self._list_parameters()
-
     def fetch(self) -> None:
         """Start async fetch. Delivers DockingConfig via on_complete callback."""
         self._t_fetch_start = time.perf_counter()

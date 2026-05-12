@@ -33,7 +33,7 @@ setup(
             'husky_operations_manager = husky_operations_manager.husky_operations_manager:main',
 
             # Unit Test nodes
-            'reverse_navigation_node = husky_operations_manager.unit_test.reverse_navigation_node:main',
+            'reverse_navigation_node = husky_operations_manager.unit_test.test_reverse_navigation:main',
             'docking_param_fetcher = husky_operations_manager.unit_test.test_docking_param_fetcher:main',
             'test_harvest_ops = husky_operations_manager.unit_test.test_husky_ops_navigation:main',
             'test_navigation_client = husky_operations_manager.unit_test.test_navigation_client:main',
@@ -41,6 +41,8 @@ setup(
             'test_undocking_client = husky_operations_manager.unit_test.test_undocking_client:main',
             'test_harvest_client = husky_operations_manager.unit_test.test_harvest_client:main',
             'test_drive_client = husky_operations_manager.unit_test.test_drive_client:main',
+            'test_drive_client_new = husky_operations_manager.unit_test.test_drive_client_new:main',
+            'test_lavender_harvest = husky_operations_manager.unit_test.test_lavender_harvest:main',
 
             'test_lavender_detection = husky_operations_manager.lavender_detection_test:main',
         ],

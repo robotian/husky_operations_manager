@@ -24,7 +24,7 @@ def generate_launch_description():
     )
 
     # Create HuskyOperationsManager node
-    node = Node(
+    husky_operations_manager_node = Node(
         package='husky_operations_manager',
         executable='test_lavender_harvest',
         name='test_lavender_harvest',
@@ -40,5 +40,5 @@ def generate_launch_description():
     # Create launch description
     return LaunchDescription([
         namespace_arg,
-        node,
+        husky_operations_manager_node,
     ])

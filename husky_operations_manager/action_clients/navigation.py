@@ -408,7 +408,7 @@ class NavigationActionClient:
                 pose.pose.orientation.w = float(w)
 
                 self.logger.info(
-                    f"Start pose: ({pose.pose.position.x:.3f}, "
+                    f"First waypoint: ({pose.pose.position.x:.3f}, "
                     f"{pose.pose.position.y:.3f}) theta: {current_wp.theta:.3f}"
                 )
             else:
