@@ -707,7 +707,6 @@ class HuskyOperationsManager(Node):
         elif self.reverse_drive_active:
             self._handle_reverse_drive(robot_status)
 
-
     def _update_current_subtask(self):
         """
         Refresh current_sub_task from the sub_tasks list using current_sub_task_index.

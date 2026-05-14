@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class TaskEnum(Enum):
     """Tasks types in the system."""
 
@@ -31,6 +32,7 @@ class OnlineFlagEnum(Enum):
 
 class NavigationStatus(Enum):
     """Navigation status enumeration."""
+
     IDLE = 0
     SENDING = 1
     ACCEPTED = 2
@@ -44,11 +46,13 @@ class NavigationStatus(Enum):
 
 
 class ManipulatorStatus(Enum):
-    IDLE             = 0
-    PLANNING         = 1
-    MOVING           = 2
-    MOVING_COMPLETE  = 3
-    FAILED           = 99
+    """Manipulator status enumeration."""
+
+    IDLE = 0
+    PLANNING = 1
+    MOVING = 2
+    MOVING_COMPLETE = 3
+    FAILED = 99
 
 
 class RobotStatusEnum(Enum):
@@ -96,29 +100,33 @@ class RobotStatusEnum(Enum):
 
 
 class DriveStatus(Enum):
-    """ Status enum for DriveClient. """
-    IDLE      = 0
-    FORWARD   = 1
-    REVERSE   = 2
-    DONE      = 3
-    CANCELED  = 4
-    ERROR     = 5
-    
+    """Status enum for DriveClient."""
+
+    IDLE = 0
+    FORWARD = 1
+    REVERSE = 2
+    DONE = 3
+    CANCELED = 4
+    ERROR = 5
+
+
 class ReverseDriveStatus(Enum):
-    """ Status enum for ReverseDriveClient. """
-    IDLE      = 0
+    """Status enum for ReverseDriveClient."""
+
+    IDLE = 0
     REVERSING = 1
-    DONE      = 2
-    CANCELED  = 3
-    ERROR     = 4
- 
- 
+    DONE = 2
+    CANCELED = 3
+    ERROR = 4
+
+
 class DockingParamFetcherStatus(Enum):
-    """ Status enum for DockingParamFetcher. """
-    IDLE      = 0
-    LISTING   = 1
-    FETCHING  = 2
+    """Status enum for DockingParamFetcher."""
+
+    IDLE = 0
+    LISTING = 1
+    FETCHING = 2
     RESOLVING = 3
     COMPUTING = 4
-    DONE      = 5
-    ERROR     = 6
+    DONE = 5
+    ERROR = 6
