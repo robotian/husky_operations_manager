@@ -1,16 +1,16 @@
+"""Launch file for docking parameter fetcher test node."""
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
+
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-
+    """Generate launch description for the docking parameter fetcher test node."""
     namespace_arg = DeclareLaunchArgument(
-        'namespace',
-        default_value='/a300_00036',
-        description='Robot namespace (e.g. /a300_00036)'
+        'namespace', default_value='/a300_00036', description='Robot namespace (e.g. /a300_00036)'
     )
 
     namespace = LaunchConfiguration('namespace')
@@ -23,12 +23,14 @@ def generate_launch_description():
         parameters=[{'namespace': namespace}],
         output='screen',
         remappings=[
-            ('/tf','tf'),
-            ('/tf_static','tf_static'),
-        ]
+            ('/tf', 'tf'),
+            ('/tf_static', 'tf_static'),
+        ],
     )
 
-    return LaunchDescription([
-        namespace_arg,
-        docking_param_fetcher_node,
-    ])
+    return LaunchDescription(
+        [
+            namespace_arg,
+            docking_param_fetcher_node,
+        ]
+    )

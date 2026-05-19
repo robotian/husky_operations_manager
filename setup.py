@@ -43,6 +43,7 @@ setup(
             'test_drive_client = husky_operations_manager.unit_test.test_drive_client:main',
             'test_drive_client_new = husky_operations_manager.unit_test.test_drive_client_new:main',
             'test_lavender_harvest = husky_operations_manager.unit_test.test_lavender_harvest:main',
+            'test_husky_ops_parameter_fetch = husky_operations_manager.unit_test.test_husky_ops_parameter_fetch:main',
 
             'test_lavender_detection = husky_operations_manager.lavender_detection_test:main',
         ],
