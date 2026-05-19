@@ -398,8 +398,10 @@ def main(args=None):
     except KeyboardInterrupt:
         node.get_logger().info("Interrupted by user — shutting down")
         node.cancel_active_goals()
+    finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

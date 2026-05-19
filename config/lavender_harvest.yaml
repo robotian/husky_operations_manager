@@ -1,4 +1,4 @@
-test_husky_ops_parameter_fetch:
+test_lavender_harvest:
   ros__parameters:
     # ── General ────────────────────────────────────────────────────────────────
     num_rows: 1 # Number of rows to harvest (configurable for multi-row farms)

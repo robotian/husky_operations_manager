@@ -218,11 +218,12 @@ def main(args=None):
     node = TestHarvestNode()
     try:
         rclpy.spin(node)
-    except SystemExit:
+    except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

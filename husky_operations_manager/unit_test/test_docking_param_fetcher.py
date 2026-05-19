@@ -11,7 +11,7 @@ from husky_operations_manager.enum import DockingParamFetcherStatus, ReverseDriv
 class TestReverseDriveNode(Node):
 
     def __init__(self):
-        super().__init__('test_reverse_drive')
+        super().__init__('docking_param_fetcher')
 
         self.declare_parameter('namespace', '')
         namespace = (
@@ -93,7 +93,8 @@ def main(args=None):
             node._reverse_client.cancel()
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

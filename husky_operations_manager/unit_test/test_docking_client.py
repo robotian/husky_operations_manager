@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple test node for DockingActionClient
+Simple test node for DockingActionClient.
 
 This node provides a minimal test harness to verify the docking action client
 works correctly. It simulates the role of status.py for testing purposes.
@@ -26,9 +26,10 @@ TERMINAL_STATES = {
 
 
 class TestDockingNode(Node):
-    """Simple test node for DockingActionClient"""
+    """Simple test node for DockingActionClient."""
 
     def __init__(self):
+        """Initialize the node, declare parameters, and start the timer."""
         super().__init__('test_docking_client')
 
         self.get_logger().info('Test Docking Client Node Started')
@@ -51,18 +52,18 @@ class TestDockingNode(Node):
 
     def _send_docking_goal(self):
         """Send a test docking goal."""
-        self.get_logger().info('START DOCKING REQUEST RECEIVED')        
+        self.get_logger().info('START DOCKING REQUEST RECEIVED')
 
         # Build DockGoal
         dock_goal = DockGoal()
         dock_goal.use_dock_id = True
-        dock_goal.dock_id = "husky_charger"
+        dock_goal.dock_id = 'husky_charger'
         dock_goal.navigate_to_staging_pose = True
 
         # Build SubTask
         sub_task = SubTask()
         sub_task.type = SubTask.DOCKING
-        sub_task.description = "Test Docking Operation"
+        sub_task.description = 'Test Docking Operation'
         sub_task.dock_goal = dock_goal
 
         self.get_logger().info('Sending docking goal...')
@@ -101,9 +102,7 @@ class TestDockingNode(Node):
 
         # Only shut down on terminal state after the goal has been accepted
         if status in TERMINAL_STATES and status != RobotStatusEnum.IDLE:
-            self.get_logger().info(
-                f'Docking reached terminal state: {status.name} — shutting down'
-            )
+            self.get_logger().info(f'Docking reached terminal state: {status.name} — shutting down')
             self._shutdown()
 
     # ------------------------------------------------------------------
@@ -120,7 +119,7 @@ class TestDockingNode(Node):
 
 
 def main(args=None):
-    """Main entry point"""
+    """Entry point: spin the parameter fetch debug node."""
     rclpy.init(args=args)
 
     node = TestDockingNode()
@@ -132,7 +131,8 @@ def main(args=None):
     finally:
         node.get_logger().info('Test complete — shutting down')
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

@@ -72,8 +72,14 @@ class TestDriveNode(Node):
 def main():
     rclpy.init()
     test_node = TestDriveNode()
-    rclpy.spin(test_node)  # Keep alive if needed, or remove if not
-    rclpy.shutdown()
+    try:
+        rclpy.spin(test_node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        test_node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
