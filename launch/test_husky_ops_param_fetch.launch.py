@@ -17,7 +17,7 @@ def generate_launch_description():
     """Generate launch description for HuskyOperationsManager node."""
     config_path = os.path.join(
         get_package_share_directory('husky_operations_manager'),
-        'config', 'test_lavender_harvest.yaml'
+        'config', 'test_husky_ops_parameter_fetch.yaml'
     )
 
     namespace_arg = DeclareLaunchArgument(

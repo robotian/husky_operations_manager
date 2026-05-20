@@ -1,8 +1,10 @@
-lavender_harvest:
+test_husky_ops_parameter_fetch:
   ros__parameters:
     # ── General ────────────────────────────────────────────────────────────────
     num_rows: 1 # Number of rows to harvest (configurable for multi-row farms)
     no_detection_timeout: 10.0 # Seconds without detection before assuming row end
+    harvest_duration: 5.0 # Simulated harvest duration per bush (seconds)
+    unload_duration: 5.0 # Simulated unload duration (seconds)
     loading:
       increment: 20.0 # Load % added per harvest cycle
 
@@ -23,8 +25,8 @@ lavender_harvest:
       tf_detection_frame: "arm_0_detections"
       tolerance: 0.05 # X axis alignment tolerance (m)
       timeout: 30.0 # Max correction time before warning (s)
-      v_linear: 0.2 # Forward/reverse speed (m/s) — tune per terrain
-      v_angular: 0.5 # Angular speed (rad/s)
+      v_linear: 0.1 # Forward/reverse speed (m/s) — tune per terrain
+      v_angular: 0.2 # Angular speed (rad/s)
 
     # ── Navigation ─────────────────────────────────────────────────────────────
     navigation:

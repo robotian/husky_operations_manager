@@ -1,11 +1,9 @@
 ros__parameters:
-
-  # --- Existing parameters (unchanged) ---
-  base_frame:  "base_link"
-  v_linear:    0.5
-  v_angular:   0.5
-  tf_polling_rate:     10.0               # Hz — tune based on robot speed and terrain
-  timeout:             30.0
-  tolerance: 0.05               # metres — tolerance along X axis in target frame
-  tf_base_frame:       "arm_0_base_link"  # frame for alignment check with lavender bush center
-  tf_detection_frame:  "arm_0_detections" # detection child frame for lavender bush center
+  base_frame: "base_link"
+  tf_polling_rate: 10.0 # TF alignment check rate (Hz)
+  tf_base_frame: "arm_0_base_link"
+  tf_detection_frame: "arm_0_detections"
+  tolerance: 0.05 # X axis alignment tolerance (m)
+  timeout: 30.0 # Max correction time before warning (s)
+  v_linear: 0.2 # Forward/reverse speed (m/s) — tune per terrain
+  v_angular: 0.5 # Angular speed (rad/s)
