@@ -15,7 +15,7 @@ from rclpy.node import Node
 from status_interfaces.msg import SubTask, DockGoal
 
 from husky_operations_manager.action_clients.docking import DockingActionClient
-from husky_operations_manager.enum import RobotStatusEnum
+from husky_operations_manager.robot_enums import RobotStatusEnum
 
 # Terminal states that trigger node shutdown
 TERMINAL_STATES = {

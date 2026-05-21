@@ -1,6 +1,6 @@
 """Debug node for verifying Husky Operations Manager parameter fetch."""
 
-from husky_operations_manager.dataclass import DriveConfig
+from husky_operations_manager.types import DriveConfig
 
 import rclpy
 from rclpy.node import Node

@@ -13,8 +13,8 @@ from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.node import Node
 from rclpy.time import Time
 
-from husky_operations_manager.dataclass import DockingConfig
-from husky_operations_manager.enum import ReverseDriveStatus
+from husky_operations_manager.types import DockingConfig
+from husky_operations_manager.robot_enums import ReverseDriveStatus
 
 warnings.filterwarnings("ignore", category=SyntaxWarning,module="angles.*")
 

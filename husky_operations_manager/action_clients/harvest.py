@@ -18,7 +18,7 @@ from status_interfaces.action import Harvest
 from status_interfaces.msg import SubTask
 from geometry_msgs.msg import Point
 
-from husky_operations_manager.enum import RobotStatusEnum
+from husky_operations_manager.robot_enums import RobotStatusEnum
 
 
 class HarvestActionClient:

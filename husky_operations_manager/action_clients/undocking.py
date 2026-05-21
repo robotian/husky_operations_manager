@@ -10,8 +10,8 @@ from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
 from nav2_msgs.action._undock_robot import UndockRobot
 from status_interfaces.msg import SubTask, UndockGoal
 
-from husky_operations_manager.dataclass import DockingFeedback, Docks
-from husky_operations_manager.enum import RobotStatusEnum
+from husky_operations_manager.types import DockingFeedback, Docks
+from husky_operations_manager.robot_enums import RobotStatusEnum
 
 class UndockingActionClient:
     """Action client for handling robot undocking."""

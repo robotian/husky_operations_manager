@@ -3,9 +3,9 @@ import rclpy
 from rclpy.node import Node
 
 from husky_operations_manager.docking_param_fetcher import DockingParamFetcher
-from husky_operations_manager.action_clients.reverse_drive_client import ReverseDriveClient
-from husky_operations_manager.dataclass import DockingConfig
-from husky_operations_manager.enum import DockingParamFetcherStatus, ReverseDriveStatus
+from husky_operations_manager.action_clients.reverse_drive import ReverseDriveClient
+from husky_operations_manager.types import DockingConfig
+from husky_operations_manager.robot_enums import DockingParamFetcherStatus, ReverseDriveStatus
 
 
 class TestReverseDriveNode(Node):

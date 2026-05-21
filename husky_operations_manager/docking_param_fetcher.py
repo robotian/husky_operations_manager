@@ -6,8 +6,8 @@ from rclpy.impl.rcutils_logger import RcutilsLogger
 from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.parameter import parameter_value_to_python
 
-from husky_operations_manager.dataclass import DockingConfig, DockPluginConfig, DockInstanceConfig
-from husky_operations_manager.enum import DockingParamFetcherStatus
+from husky_operations_manager.types import DockingConfig, DockPluginConfig, DockInstanceConfig
+from husky_operations_manager.robot_enums import DockingParamFetcherStatus
 
 
 TOP_LEVEL_PARAM_MAP: dict[str, str] = {

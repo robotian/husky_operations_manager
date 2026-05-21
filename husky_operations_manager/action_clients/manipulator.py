@@ -14,8 +14,8 @@ from status_interfaces.action._manipulator_task import (
     ManipulatorTask_FeedbackMessage,
 )
 from status_interfaces.msg import SubTask
-from husky_operations_manager.dataclass import ManipulatorTaskFeedback
-from husky_operations_manager.enum import RobotStatusEnum, ManipulatorStatus
+from husky_operations_manager.types import ManipulatorTaskFeedback
+from husky_operations_manager.robot_enums import RobotStatusEnum, ManipulatorStatus
 
 
 class ArmCommand:

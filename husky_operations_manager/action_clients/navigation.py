@@ -18,8 +18,8 @@ from geometry_msgs.msg import PoseStamped, Pose
 from nav2_msgs.action import NavigateThroughPoses
 from status_interfaces.msg import Task, SubTask, WayPoint, RobotStatus
 
-from husky_operations_manager.enum import NavigationStatus
-from husky_operations_manager.dataclass import WPFStatus
+from husky_operations_manager.robot_enums import NavigationStatus
+from husky_operations_manager.types import WPFStatus
 
 
 class NavigationActionClient:

@@ -4,7 +4,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 
-from husky_operations_manager.substitutions import NamespacedYaml
+from husky_operations_manager.launch_utils import NamespacedYaml
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction
@@ -17,7 +17,7 @@ def generate_launch_description():
     """Generate launch description for HuskyOperationsManager node."""
     config_path = os.path.join(
         get_package_share_directory('husky_operations_manager'),
-        'config', 'test_husky_ops_parameter_fetch.yaml'
+        'config', 'test', 'test_husky_ops_parameter_fetch.yaml'
     )
 
     namespace_arg = DeclareLaunchArgument(

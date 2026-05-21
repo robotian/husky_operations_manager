@@ -32,18 +32,18 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 
 
 from husky_operations_manager.action_clients.docking import DockingActionClient
-from husky_operations_manager.action_clients.drive_client_new import DriveClient
+from husky_operations_manager.action_clients.drive import DriveClient
 from husky_operations_manager.action_clients.navigation import NavigationActionClient
-from husky_operations_manager.action_clients.reverse_drive_client import ReverseDriveClient
+from husky_operations_manager.action_clients.reverse_drive import ReverseDriveClient
 from husky_operations_manager.action_clients.undocking import UndockingActionClient
-from husky_operations_manager.dataclass import (
+from husky_operations_manager.types import (
     DockInstanceConfig,
     DockPluginConfig,
     DockingConfig,
     DriveConfig,
 )
 from husky_operations_manager.docking_param_fetcher import DockingParamFetcher
-from husky_operations_manager.enum import (
+from husky_operations_manager.robot_enums import (
     DockingParamFetcherStatus,
     DriveStatus,
     NavigationStatus,

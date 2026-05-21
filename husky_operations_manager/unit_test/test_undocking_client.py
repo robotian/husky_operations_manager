@@ -17,11 +17,11 @@ import rclpy
 from rclpy.node import Node
 from status_interfaces.msg import SubTask, UndockGoal
 
-from husky_operations_manager.enum import RobotStatusEnum, ReverseDriveStatus
-from husky_operations_manager.dataclass import DockingConfig, DockInstanceConfig, DockPluginConfig
+from husky_operations_manager.robot_enums import RobotStatusEnum, ReverseDriveStatus
+from husky_operations_manager.types import DockingConfig, DockInstanceConfig, DockPluginConfig
 from husky_operations_manager.docking_param_fetcher import DockingParamFetcher
 from husky_operations_manager.action_clients.undocking import UndockingActionClient
-from husky_operations_manager.action_clients.reverse_drive_client import ReverseDriveClient
+from husky_operations_manager.action_clients.reverse_drive import ReverseDriveClient
 
 
 class TestUndockingNode(Node):
@@ -105,7 +105,7 @@ class TestUndockingNode(Node):
         Cancels itself on DONE or ERROR. On DONE, fires _on_docking_config_ready
         which constructs the action clients and starts the main timer.
         """
-        from husky_operations_manager.enum import DockingParamFetcherStatus
+        from husky_operations_manager.robot_enums import DockingParamFetcherStatus
         status = self._param_fetcher.get_status()
         self.get_logger().debug(f"DockingParamFetcher poll | status={status.name}")
 

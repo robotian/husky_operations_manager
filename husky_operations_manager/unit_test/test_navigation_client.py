@@ -16,7 +16,7 @@ from rclpy.executors import SingleThreadedExecutor
 from status_interfaces.msg import Task, SubTask, WayPoint, RobotStatus
 
 from husky_operations_manager.action_clients.navigation import NavigationActionClient
-from husky_operations_manager.enum import NavigationStatus
+from husky_operations_manager.robot_enums import NavigationStatus
 
 # Terminal states that trigger node shutdown
 TERMINAL_STATES = {

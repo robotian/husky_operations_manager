@@ -12,7 +12,7 @@ def generate_launch_description():
     """Generate launch description for the lavender harvest test node."""
     # Get package share directory
     pkg_share = FindPackageShare('husky_operations_manager')
-    config_file = PathJoinSubstitution([pkg_share, 'config', 'test_lavender_harvest.yaml'])
+    config_file = PathJoinSubstitution([pkg_share, 'config', 'test', 'test_lavender_harvest.yaml'])
 
     # Declare launch arguments
     namespace_arg = DeclareLaunchArgument(

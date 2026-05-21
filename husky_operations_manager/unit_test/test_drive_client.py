@@ -1,9 +1,9 @@
 import rclpy
 from rclpy.node import Node
 
-from husky_operations_manager.action_clients.drive_client import DriveClient
-from husky_operations_manager.dataclass import DriveConfig
-from husky_operations_manager.enum import DriveStatus
+from husky_operations_manager.action_clients.drive import DriveClient
+from husky_operations_manager.types import DriveConfig
+from husky_operations_manager.robot_enums import DriveStatus
 from status_interfaces.msg import ImageDetectionPose
 
 

@@ -9,8 +9,8 @@ from action_msgs.msg import GoalStatus
 
 from nav2_msgs.action._dock_robot import DockRobot_FeedbackMessage, DockRobot
 from status_interfaces.msg import SubTask, DockGoal
-from husky_operations_manager.dataclass import DockingFeedback
-from husky_operations_manager.enum import RobotStatusEnum
+from husky_operations_manager.types import DockingFeedback
+from husky_operations_manager.robot_enums import RobotStatusEnum
 
 
 class DockingActionClient:

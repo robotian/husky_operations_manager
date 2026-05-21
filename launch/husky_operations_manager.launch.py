@@ -12,7 +12,7 @@ def generate_launch_description():
     """Generate launch description for HuskyOperationsManager node."""
     # Get package share directory
     pkg_share = FindPackageShare('husky_operations_manager')
-    config_file = PathJoinSubstitution([pkg_share, 'config', 'config.yaml'])
+    config_file = PathJoinSubstitution([pkg_share, 'config', 'husky_operations_manager.yaml'])
 
     # Declare launch arguments
     namespace_arg = DeclareLaunchArgument('namespace', default_value='/a300_00036', description='Robot namespace')

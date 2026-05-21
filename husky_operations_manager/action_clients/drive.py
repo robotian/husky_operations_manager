@@ -8,8 +8,8 @@ from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.node import Node
 from tf2_ros import TransformException
 
-from husky_operations_manager.enum import DriveStatus
-from husky_operations_manager.dataclass import DriveConfig
+from husky_operations_manager.robot_enums import DriveStatus
+from husky_operations_manager.types import DriveConfig
 
 # ---------------------------------------------------------------------------
 # DriveClient
