@@ -1,11 +1,56 @@
-/*/test_drive_node:
+/*/test_drive_client:
   ros__parameters:
-    image_detection_topic: "sensors/camera_1/detection/image_annotated/detection_pose"
-    base_frame: "base_link"
-    tf_polling_rate: 10.0 # TF alignment check rate (Hz)
-    tf_base_frame: "arm_0_base_link"
-    tf_detection_frame: "camera_1_detections"
-    tolerance: 0.05 # X axis alignment tolerance (m)
-    timeout: 30.0 # Max correction time before warning (s)
-    v_linear: 0.1 # Forward/reverse speed (m/s) — tune per terrain
-    v_angular: 0.1 # Angular speed (rad/s)
+    control_loop_period:   0.1    # s — poll rate for status + no-detection timeout
+    no_detection_timeout:  30.0   # s — stop if no valid detection for this long
+
+    # ── Simulation ─────────────────────────────────────────────────────────────
+    simulation:
+      # How long to pretend the robot is working on a bush before moving to the next.
+      # In production this is replaced by the actual arm action duration.
+      activity_duration: 5.0      # s
+
+    drive:
+      # ── Frame ──────────────────────────────────────────────────────────────
+      base_frame: "base_link"
+
+      # ── Detection topic (relative to namespace) ────────────────────────────
+      # a300_00036: manipulators/arm_0_detection/image_annotated/detection_pose
+      # j100_0921:  sensors/camera_1/detection/image_annotated/detection_pose
+      detection_topic: "sensors/camera_1/detection/image_annotated/detection_pose"
+
+      # ── Speed ──────────────────────────────────────────────────────────────
+      v_linear:   0.1    # m/s   — forward/backward speed (keep ≤ 0.1 at 5Hz detection)
+      v_angular:  0.2    # rad/s — lateral correction speed
+ 
+      # ── Stop condition ─────────────────────────────────────────────────────
+      # The robot stops when the bush is within this distance of centre on BOTH axes.
+      # Also determines arm positioning accuracy — arm_0_base_link X offset from
+      # camera is zero, so tolerance = arm positioning precision.
+      # Field-validated: 0.05m. Target after tuning: 0.005m.
+      tolerance: 0.05    # m — applies to both center_x and center_y
+ 
+      # ── Lateral correction direction ───────────────────────────────────────
+      # center_y drives the angular correction (left/right steering).
+      # If the robot turns AWAY from the bush on first test: change to 1.0
+      # If the robot turns TOWARD the bush on first test:    keep at -1.0
+      center_y_correction_sign: -1.0
+ 
+      # ── C3 mitigation — minimum tracker ───────────────────────────────────
+      # While approaching a bush, small measurement wobbles are normal.
+      # This value is the wobble budget: how much the distance reading
+      # is allowed to increase between ticks before the robot decides the
+      # detector has jumped to a different bush and ignores that reading.
+      # Normal sensor noise at stop position: ~0.014m.
+      # Increase if valid detections are being rejected in a noisy environment.
+      # Decrease if the robot is skipping bushes due to two-bush confusion.
+      noise_margin: 0.02  # m
+ 
+      # ── Departure clearance ────────────────────────────────────────────────
+      # After finishing a bush, the robot moves forward but the previous bush
+      # stays visible in the camera. This tells the robot how far past the
+      # finished bush to travel before it starts looking for the next one.
+      # At minimum lavender spacing (0.305m), 0.15m means the robot needs to
+      # clear roughly half the gap before scanning resumes.
+      # Increase if the robot keeps re-detecting the previous bush.
+      # Decrease if the robot is skipping bushes at close spacing.
+      departure_clearance: 0.15  # m

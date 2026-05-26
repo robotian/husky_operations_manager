@@ -1,297 +1,538 @@
 """
-Drive action client for Husky operations.
+Drive client for Husky operations.
 
-This module provides a client for managing drive alignment and velocity
-commands using ROS 2 tf transforms and cmd_vel publishing.
+Manages forward row traversal and sequential bush alignment using
+ImageDetectionPose as the sole error signal.
+
+Axis mapping (confirmed from ground truth image — top-down view):
+  base_link:           +X = robot forward, +Y = left, +Z = up
+  camera_1_detections: +X = opposite base_link +X, +Y = left, +Z = down
+
+  Bushes are arranged along the robot travel axis.
+  As robot moves forward, bush moves in camera_1_detections +X direction.
+  center_x is the TRAVEL axis. center_y is the LATERAL axis.
+
+  center_x < 0 → bush ahead  → drive forward  (+linear.x)
+  center_x > 0 → bush passed → drive backward (-linear.x)
+  center_x ≈ 0 → bush centred → STOP
+
+  center_y → angular.z correction (sign field-validated)
+
+Physical assumption:
+  arm_0_base_link X offset from camera along travel axis is ZERO.
+  center_x = 0 means arm is directly over bush.
+  tolerance directly determines arm positioning accuracy.
+
+Stop condition:
+  abs(center_x) <= tolerance AND abs(center_y) <= tolerance
+
+State machine (DriveStatus):
+  IDLE → SCANNING → CORRECTING → STOPPED → DEPARTING → SCANNING → ...
+  Any state → CANCELED (via cancel())
+  Any state → IDLE     (via stop() or reset())
+
+Caller interface:
+  start()               — begin SCANNING
+  resume()              — called after activity completes, begin DEPARTING
+  stop()                — external hard stop (e-stop, timeout)
+  cancel()              — abort
+  get_status()          — poll DriveStatus
+  is_active()           — True when robot is moving
+  last_detection_time() — for no-detection timeout in calling node
 """
 
 from geometry_msgs.msg import TwistStamped
+from status_interfaces.msg import ImageDetectionPose
 
-from husky_operations_manager.robot_enums import DriveStatus
-from husky_operations_manager.types import DriveConfig
-
-import rclpy
-import rclpy.duration
-import rclpy.time
 from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.node import Node
 from rclpy.timer import Timer
 
-import tf2_ros
-from tf2_ros import TransformException
+from dataclasses import dataclass
+from enum import IntEnum
+
+
+class DriveStatus(IntEnum):
+    """
+    Combined state enum for DriveClient — covers both external status
+    visible to callers and internal phase tracking.
+
+    Caller-relevant states:
+      IDLE       — not started, fully reset, or stopped externally
+      SCANNING   — moving forward, looking for next bush
+      CORRECTING — bush detected, homing in toward center_x=0
+      STOPPED    — stop condition met, waiting for resume()
+                   caller starts activity (simulation timer or arm action)
+                   then calls drive_client.resume()
+      DEPARTING  — activity complete, moving past current bush,
+                   ignoring detections until departure_clearance is met
+      CANCELED   — aborted by cancel()
+      ERROR      — unexpected state, caller should call reset()
+    """
+    IDLE       = 0
+    SCANNING   = 1
+    CORRECTING = 2
+    STOPPED    = 3
+    DEPARTING  = 4
+    CANCELED   = 5
+    ERROR      = 6
+
+
+@dataclass
+class DriveConfig:
+    """
+    Configuration for DriveClient.
+
+    Physical assumption recorded here:
+      arm_0_base_link X offset from camera along travel axis is ZERO.
+      When center_x = 0, both camera and arm are directly over the bush.
+      tolerance therefore directly determines arm positioning accuracy.
+      If arm pose changes, this assumption must be revalidated.
+
+    Removed:
+      tf_polling_rate, timeout, tf_base_frame, tf_detection_frame
+        — TF-based alignment removed; center.x/center.y are the sole error signals
+      proportional_zone, min_correction_scale
+        — speed scaling removed; robot drives at constant v_linear
+      max_plausible_delta
+        — delta threshold C3 replaced by minimum tracker (noise_margin)
+    """
+
+    # ── Frame ──────────────────────────────────────────────────────────────────
+    base_frame: str
+
+    # ── Speed ──────────────────────────────────────────────────────────────────
+    v_linear: float             # m/s   — constant forward/backward speed
+    v_angular: float            # rad/s — constant lateral correction speed
+
+    # ── Stop condition ─────────────────────────────────────────────────────────
+    tolerance: float            # m — stop when abs(center_x) <= tolerance
+                                #         AND abs(center_y) <= tolerance
+                                # Also determines arm positioning accuracy
+                                # (see physical assumption above)
+
+    # ── Angular correction sign ────────────────────────────────────────────────
+    center_y_correction_sign: float  # lateral axis → angular.z
+                                     # flip to 1.0 if robot turns wrong way
+
+    # ── C3 mitigation — minimum tracker ───────────────────────────────────────
+    noise_margin: float         # m — how much abs(center_x) is allowed to increase
+                                # between ticks before being rejected as a bush switch.
+                                # Normal sensor noise: ~0.014m. Recommended: 0.02m.
+                                # Increase if valid detections are being rejected.
+                                # Decrease if robot is skipping bushes.
+
+    # ── Departure clearance ────────────────────────────────────────────────────
+    departure_clearance: float  # m — after finishing a bush, how far past it to travel
+                                # before looking for the next one.
+                                # Prevents re-detecting the completed bush.
+                                # At min lavender spacing (0.305m): 0.15m recommended.
+
+    # ── Detection topic ────────────────────────────────────────────────────────
+    detection_topic: str        # relative to namespace
 
 
 class DriveClient:
-    """Client for managing drive alignment and velocity commands."""
+    """
+    Reactive sensor-driven drive client for sequential lavender row harvesting.
+
+    Owns the full detection-to-motion lifecycle:
+      - ImageDetectionPose subscription
+      - Sequential bush targeting (SCANNING → CORRECTING → STOPPED → DEPARTING)
+      - C3 mitigation via minimum tracker (noise_margin)
+      - Departure clearance to prevent re-detecting completed bushes
+      - 10Hz watchdog timer for Husky cmd_vel keepalive
+
+    Precondition for start(): arm must be in scan pose (caller's responsibility).
+    """
 
     def __init__(self, node: Node, config: DriveConfig) -> None:
-        """Initialize the DriveClient with the ROS node and drive configuration."""
-        self.node = node
+        self.node   = node
         self.logger = RcutilsLogger(self.__class__.__name__)
         self.namespace = self.node.get_namespace().rstrip('/')
 
         # --- Config ---
-        self.base_frame: str = config.base_frame
-        self.v_linear: float = config.v_linear
-        self.v_angular: float = config.v_angular
-
-        # --- Alignment config ---
-        self._tf_polling_rate: float = config.tf_polling_rate
-        self._alignment_tolerance: float = config.tolerance
-        self._alignment_timeout: float = config.timeout
-        self._tf_base_frame: str = config.tf_base_frame
-        self._tf_detection_frame: str = config.tf_detection_frame
+        self._base_frame                = config.base_frame
+        self._v_linear                  = config.v_linear
+        self._v_angular                 = config.v_angular
+        self._tolerance                 = config.tolerance
+        self._center_y_correction_sign  = config.center_y_correction_sign
+        self._noise_margin              = config.noise_margin
+        self._departure_clearance       = config.departure_clearance
 
         # --- Status ---
         self._status: DriveStatus = DriveStatus.IDLE
-        self._is_aligned: bool = False
 
-        # --- Correction state ---
-        self._correcting: bool = False
-        self._correction_start: float | None = None
+        # --- C3 minimum tracker ---
+        # Tracks the lowest abs(center_x) seen during current CORRECTING phase.
+        # Rejects detections where abs(center_x) rises above this by more than
+        # noise_margin — indicates detector switched to a different bush.
+        self._min_center_x_seen: float | None = None
 
-        # --- TF ---
-        self._tf_buffer = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self.node)
+        # --- Departure tracking ---
+        # Records center_x at the moment resume() is called.
+        # Departure is complete when center_x < _departure_start_x - departure_clearance.
+        self._departure_start_x: float | None = None
 
-        # --- Alignment polling timer ---
-        self._alignment_timer: Timer | None = None
+        # --- Detection timing ---
+        self._last_detection_time: float | None = None
 
-        # --- Publishers ---
-        self._cmd_vel_pub = self.node.create_publisher(TwistStamped, f'{self.namespace}/cmd_vel', 10)
+        # --- Last commanded velocity (watchdog republish) ---
+        self._last_linear_x:  float = 0.0
+        self._last_angular_z: float = 0.0
+
+        # --- Timers ---
+        self._watchdog_timer: Timer | None = None
+
+        # --- Publisher ---
+        self._cmd_vel_pub = self.node.create_publisher(
+            TwistStamped, f'{self.namespace}/cmd_vel', 10)
+
+        # --- Detection subscription ---
+        self._detection_sub = self.node.create_subscription(
+            ImageDetectionPose,
+            f'{self.namespace}/{config.detection_topic}',
+            self._on_detection,
+            10,
+        )
 
         self.logger.info(
             f'DriveClient initialized | '
-            f'linear={self.v_linear} angular={self.v_angular} | '
-            f'poll_rate={self._tf_polling_rate}Hz '
-            f'tolerance={self._alignment_tolerance}m '
-            f'timeout={self._alignment_timeout}s | '
-            f"base='{self._tf_base_frame}' "
-            f"detection='{self._tf_detection_frame}' "
+            f'v_linear={self._v_linear} v_angular={self._v_angular} | '
+            f'tolerance={self._tolerance}m | '
+            f'center_y_correction_sign={self._center_y_correction_sign} | '
+            f'noise_margin={self._noise_margin}m | '
+            f'departure_clearance={self._departure_clearance}m | '
+            f'detection_topic={self.namespace}/{config.detection_topic}'
         )
 
     # ------------------------------------------------------------------
-    # Public entry points
+    # Public interface
     # ------------------------------------------------------------------
 
-    def cancel(self) -> None:
-        """Cancel an active drive and publish zero velocity."""
-        if self._status not in (DriveStatus.FORWARD, DriveStatus.REVERSE):
+    def start(self) -> None:
+        """
+        Begin forward row traversal — transition to SCANNING.
+
+        Precondition: arm must be in scan pose (caller's responsibility).
+        Clears all tracking state from any previous traversal.
+        """
+        self.logger.info(f'DriveClient start | v_linear={self._v_linear}')
+        self._clear_tracking_state()
+        self._last_detection_time = self.node.get_clock().now().nanoseconds / 1e9
+        self._transition(DriveStatus.SCANNING)
+        self._start_watchdog_timer()
+        self.__publish_cmd_vel(linear_x=self._v_linear, angular_z=0.0)
+
+    def resume(self) -> None:
+        """
+        Resume after activity completion — transition to DEPARTING.
+
+        Called by TestDriveNode (simulation timer) or MotionManager (arm action)
+        after the bush activity is complete. DriveClient moves forward and ignores
+        detections until departure_clearance is met, then transitions to SCANNING
+        to look for the next bush.
+
+        No-op if not in STOPPED state.
+        """
+        if self._status != DriveStatus.STOPPED:
+            self.logger.warning(
+                f'resume() called in unexpected state {self._status.name} — ignoring'
+            )
             return
-        self._stop_alignment_timer()
-        self._reset_correction_state()
-        self._status = DriveStatus.CANCELED
+
+        self.logger.info('DriveClient resume — beginning departure')
+        self._min_center_x_seen   = None
+        self._departure_start_x   = None
+        self._transition(DriveStatus.DEPARTING)
+        self._start_watchdog_timer()
+        self.__publish_cmd_vel(linear_x=self._v_linear, angular_z=0.0)
+
+    def stop(self) -> None:
+        """
+        External hard stop — e-stop, no-detection timeout, task cancel.
+
+        Transitions to IDLE regardless of current state.
+        """
+        self.logger.info('DriveClient stop() — external hard stop')
+        self._stop_watchdog_timer()
+        self._clear_tracking_state()
+        self._transition(DriveStatus.IDLE)
         self.__publish_cmd_vel(linear_x=0.0, angular_z=0.0)
-        self.logger.info(f'Drive canceled, status: {self._status}')
+
+    def cancel(self) -> None:
+        """Abort active drive — transition to CANCELED."""
+        if self._status in (DriveStatus.IDLE, DriveStatus.CANCELED):
+            return
+        self.logger.info('DriveClient cancel()')
+        self._stop_watchdog_timer()
+        self._clear_tracking_state()
+        self._transition(DriveStatus.CANCELED)
+        self.__publish_cmd_vel(linear_x=0.0, angular_z=0.0)
+
+    def reset(self) -> None:
+        """Reset to IDLE, clearing all active drive state."""
+        self._stop_watchdog_timer()
+        self._clear_tracking_state()
+        self._transition(DriveStatus.IDLE)
+        self.logger.info('DriveClient reset to IDLE')
 
     def get_status(self) -> DriveStatus:
         """Return the current DriveStatus."""
         return self._status
 
     def is_active(self) -> bool:
-        """Return True if a drive is currently in progress."""
-        return self._status in (DriveStatus.FORWARD, DriveStatus.REVERSE)
-
-    def reset(self) -> None:
-        """Reset to IDLE, clearing all active drive state."""
-        self._stop_alignment_timer()
-        self._reset_correction_state()
-        self._status = DriveStatus.IDLE
-        self.logger.info('DriveClient reset to IDLE')
-
-    # ------------------------------------------------------------------
-    # Navigation helpers
-    # ------------------------------------------------------------------
-
-    def forward(self) -> None:
-        """Move forward and start TF alignment polling."""
-        self.logger.info(f'Moving forward at speed {self.v_linear}')
-        self._status = DriveStatus.FORWARD
-        self._start_alignment_timer()
-        self.__publish_cmd_vel(linear_x=self.v_linear, angular_z=0.0)
-
-    def backward(self) -> None:
-        """Move backward and start TF alignment polling."""
-        self.logger.info(f'Moving backward at speed {self.v_linear}')
-        self._status = DriveStatus.REVERSE
-        self._start_alignment_timer()
-        self.__publish_cmd_vel(linear_x=-self.v_linear, angular_z=0.0)
-
-    def turn_right(self) -> None:
-        """Turn right."""
-        self.logger.info(f'Turning right at angular speed {self.v_angular}')
-        self._status = DriveStatus.FORWARD
-        self.__publish_cmd_vel(linear_x=0.0, angular_z=-self.v_angular)
-
-    def turn_left(self) -> None:
-        """Turn left."""
-        self.logger.info(f'Turning left at angular speed {self.v_angular}')
-        self._status = DriveStatus.FORWARD
-        self.__publish_cmd_vel(linear_x=0.0, angular_z=self.v_angular)
-
-    def stop(self) -> None:
-        """
-        Event-driven stop — called externally on detection_valid=True.
-
-        Checks _is_aligned (updated continuously by TF polling):
-          - True  → robot is at correct pose → publish zero velocity + cancel timer.
-          - False → start corrective motion (forward or backward) until aligned.
-                    If correction exceeds alignment_timeout → log error + force stop.
-        """
-        if self._is_aligned:
-            self.logger.info('stop() called — pose validated. Stopping robot.')
-            self._stop_alignment_timer()
-            self._reset_correction_state()
-            self._status = DriveStatus.IDLE
-            self.__publish_cmd_vel(linear_x=0.0, angular_z=0.0)
-            return
-
-        # Not yet aligned — start corrective motion if not already correcting
-        if not self._correcting:
-            self.logger.info('stop() called — pose not yet validated. Starting corrective motion.')
-            self._correcting = True
-            self._correction_start = self.node.get_clock().now().nanoseconds / 1e9
-            self._apply_correction()
-
-    # ------------------------------------------------------------------
-    # TF alignment polling
-    # ------------------------------------------------------------------
-
-    def _start_alignment_timer(self) -> None:
-        """Cancel any existing timer and start a fresh alignment polling timer."""
-        self._stop_alignment_timer()
-        self._is_aligned = False
-        self._alignment_timer = self.node.create_timer(1.0 / self._tf_polling_rate, self._alignment_poll_callback)
-        self.logger.debug('Alignment polling timer started.')
-
-    def _stop_alignment_timer(self) -> None:
-        """Cancel the alignment polling timer if it is running."""
-        if self._alignment_timer is not None:
-            self._alignment_timer.cancel()
-            self._alignment_timer = None
-            self.logger.debug('Alignment polling timer stopped.')
-
-    def _alignment_poll_callback(self) -> None:
-        """
-        Timer callback — runs continuously while robot is moving.
-
-        Responsibilities:
-          1. Lookup arm_0_base_link and arm_0_detections in target frame.
-          2. Update _is_aligned flag based on X axis tolerance.
-          3. If correcting:
-             - Check alignment timeout.
-             - If aligned    → publish zero velocity and stop.
-             - If not aligned → apply corrective motion.
-        """
-        t = rclpy.time.Time()
-        timeout = rclpy.duration.Duration(seconds=0.1)
-
-        # --- Lookup base frame ---
-        try:
-            base_tf = self._tf_buffer.lookup_transform(self.base_frame, self._tf_base_frame, t, timeout=timeout)
-        except TransformException as e:
-            self.logger.error(f"TF lookup failed for '{self._tf_base_frame}' in '{self.base_frame}': {e}")
-            return
-
-        # --- Lookup detection frame ---
-        try:
-            detection_tf = self._tf_buffer.lookup_transform(
-                self.base_frame, self._tf_detection_frame, t, timeout=timeout
-            )
-        except TransformException as e:
-            self.logger.warn(
-                f"TF lookup failed for '{self._tf_detection_frame}' "
-                f"in '{self.base_frame}'. "
-                f'Robot cannot align — check if image detection node is running. '
-                f'Error: {e}'
-            )
-            return
-
-        # --- Compute signed X axis difference ---
-        # positive → base ahead of detection → need to move backward
-        # negative → base behind detection   → need to move forward
-        base_x = base_tf.transform.translation.x
-        detection_x = detection_tf.transform.translation.x
-        x_diff = base_x - detection_x
-
-        self._is_aligned = abs(x_diff) <= self._alignment_tolerance
-
-        self.logger.debug(
-            f'Alignment poll | '
-            f'base_x={base_x:.4f} '
-            f'detection_x={detection_x:.4f} '
-            f'x_diff={x_diff:.4f} '
-            f'aligned={self._is_aligned} '
-            f'correcting={self._correcting}'
+        """Return True when robot is moving (SCANNING, CORRECTING, DEPARTING)."""
+        return self._status in (
+            DriveStatus.SCANNING,
+            DriveStatus.CORRECTING,
+            DriveStatus.DEPARTING,
         )
 
-        # Only run correction logic if stop() was called
-        if not self._correcting:
+    def last_detection_time(self) -> float | None:
+        """
+        Timestamp (seconds) of the last valid detection.
+
+        Used by calling node for no-detection timeout logic.
+        Returns None if no detection has been received since start().
+        """
+        return self._last_detection_time
+
+    # ------------------------------------------------------------------
+    # Detection callback (private)
+    # ------------------------------------------------------------------
+
+    def _on_detection(self, msg: ImageDetectionPose) -> None:
+        """
+        Internal ImageDetectionPose callback.
+
+        Routes to handler based on current DriveStatus:
+
+          SCANNING   — accept first valid detection, transition to CORRECTING
+          CORRECTING — minimum tracker C3 mitigation, check stop condition
+          STOPPED    — ignore all detections (activity in progress)
+          DEPARTING  — ignore until departure_clearance met, then SCANNING
+          IDLE / CANCELED / ERROR — ignore
+        """
+        if not msg.detection_valid:
             return
 
-        # --- Check timeout ---
-        elapsed = self.node.get_clock().now().nanoseconds / 1e9 - self._correction_start
-        if elapsed >= self._alignment_timeout:
-            self.logger.error(
-                f'Alignment correction timed out after {elapsed:.1f}s '
-                f'(timeout={self._alignment_timeout}s). '
-                f'Forcing stop. Last x_diff={x_diff:.4f}m.'
-            )
-            self._stop_alignment_timer()
-            self._reset_correction_state()
-            self._status = DriveStatus.IDLE
-            self.__publish_cmd_vel(linear_x=0.0, angular_z=0.0)
-            return
+        center_x = msg.center.x
+        center_y = msg.center.y
+        self._last_detection_time = self.node.get_clock().now().nanoseconds / 1e9
 
-        # --- Aligned — stop ---
-        if self._is_aligned:
+        self.logger.debug(
+            f'Detection | center_x={center_x:.4f}m center_y={center_y:.4f}m | '
+            f'status={self._status.name}'
+        )
+
+        if self._status == DriveStatus.SCANNING:
+            self._handle_scanning(center_x, center_y)
+
+        elif self._status == DriveStatus.CORRECTING:
+            self._handle_correcting(center_x, center_y)
+
+        elif self._status == DriveStatus.STOPPED:
+            # Activity in progress — ignore all detections
+            self.logger.debug('Detection ignored — STOPPED, activity in progress')
+
+        elif self._status == DriveStatus.DEPARTING:
+            self._handle_departing(center_x, center_y)
+
+    # ------------------------------------------------------------------
+    # Detection phase handlers (private)
+    # ------------------------------------------------------------------
+
+    def _handle_scanning(self, center_x: float, center_y: float) -> None:
+        """
+        SCANNING phase — first valid detection locks onto current bush.
+
+        Initialises minimum tracker and transitions to CORRECTING.
+        """
+        self.logger.info(
+            f'Bush detected | center_x={center_x:.4f}m center_y={center_y:.4f}m | '
+            f'SCANNING → CORRECTING'
+        )
+        self._min_center_x_seen = abs(center_x)
+        self._transition(DriveStatus.CORRECTING)
+        self._correct(center_x, center_y)
+
+    def _handle_correcting(self, center_x: float, center_y: float) -> None:
+        """
+        CORRECTING phase — minimum tracker C3 mitigation.
+
+        Accepts detections where abs(center_x) is decreasing toward zero.
+        Rejects detections where abs(center_x) increases by more than noise_margin
+        — this indicates the detector has switched to a different bush (C3).
+
+        On stop condition met → STOPPED.
+        """
+        abs_cx = abs(center_x)
+
+        # --- C3 minimum tracker ---
+        if self._min_center_x_seen is not None:
+            if abs_cx > self._min_center_x_seen + self._noise_margin:
+                self.logger.warning(
+                    f'C3 rejected | center_x={center_x:.4f}m '
+                    f'abs={abs_cx:.4f}m > min={self._min_center_x_seen:.4f}m '
+                    f'+ margin={self._noise_margin:.4f}m — bush switch detected'
+                )
+                return
+
+        self._min_center_x_seen = min(
+            self._min_center_x_seen if self._min_center_x_seen is not None else abs_cx,
+            abs_cx
+        )
+
+        # --- Stop condition ---
+        if abs(center_x) <= self._tolerance and abs(center_y) <= self._tolerance:
             self.logger.info(
-                f'Correction complete | '
-                f'x_diff={abs(x_diff):.4f}m <= '
-                f'tolerance={self._alignment_tolerance:.4f}m. '
-                f'Stopping robot.'
+                f'Stop condition met | '
+                f'center_x={center_x:.4f}m center_y={center_y:.4f}m | '
+                f'tolerance={self._tolerance}m'
             )
-            self._stop_alignment_timer()
-            self._reset_correction_state()
-            self._status = DriveStatus.IDLE
-            self.__publish_cmd_vel(linear_x=0.0, angular_z=0.0)
+            self._stop_and_align(center_x)
             return
 
-        # --- Still not aligned — keep correcting ---
-        self._apply_correction(x_diff)
+        self._correct(center_x, center_y)
 
-    def _apply_correction(self, x_diff: float = 0.0) -> None:
+    def _handle_departing(self, center_x: float, center_y: float) -> None:
         """
-        Apply corrective motion based on signed X axis difference.
+        DEPARTING phase — ignore detections until departure_clearance is met.
 
-        x_diff = base_x - detection_x:
-          positive → base is ahead of detection → move backward
-          negative → base is behind detection   → move forward
+        Records center_x on first detection after resume() to establish
+        the departure reference point. Departure is complete when center_x
+        has moved departure_clearance metres more negative than the reference —
+        confirming the robot has cleared the completed bush.
+
+        On clearance met → SCANNING (processes this detection immediately).
         """
-        if x_diff > 0:
-            self.logger.info(f'Correcting | base {x_diff:.4f}m ahead → moving backward.')
-            self._status = DriveStatus.REVERSE
-            self.__publish_cmd_vel(linear_x=-self.v_linear, angular_z=0.0)
+        # Record departure reference on first detection after resume()
+        if self._departure_start_x is None:
+            self._departure_start_x = center_x
+            self.logger.debug(
+                f'Departure reference set | center_x={center_x:.4f}m'
+            )
+            return
+
+        clearance_reached = (
+            center_x < self._departure_start_x - self._departure_clearance
+        )
+
+        if clearance_reached:
+            self.logger.info(
+                f'Departure clearance met | '
+                f'center_x={center_x:.4f}m | '
+                f'start={self._departure_start_x:.4f}m '
+                f'clearance={self._departure_clearance:.4f}m | '
+                f'DEPARTING → SCANNING'
+            )
+            self._min_center_x_seen = None
+            self._departure_start_x = None
+            self._transition(DriveStatus.SCANNING)
+            self._handle_scanning(center_x, center_y)
         else:
-            self.logger.info(f'Correcting | base {abs(x_diff):.4f}m behind → moving forward.')
-            self._status = DriveStatus.FORWARD
-            self.__publish_cmd_vel(linear_x=self.v_linear, angular_z=0.0)
+            self.logger.debug(
+                f'Departing | center_x={center_x:.4f}m | '
+                f'need {self._departure_start_x - self._departure_clearance:.4f}m'
+            )
 
     # ------------------------------------------------------------------
-    # Private helpers
+    # Motion helpers (private)
     # ------------------------------------------------------------------
 
-    def _reset_correction_state(self) -> None:
-        """Reset correction and alignment flags."""
-        self._correcting = False
-        self._correction_start = None
-        self._is_aligned = False
+    def _correct(self, center_x: float, center_y: float) -> None:
+        """
+        Two-axis correction toward bush centre.
+
+        center_x → linear.x  (travel axis, negated: center_x < 0 = ahead = forward)
+        center_y → angular.z (lateral axis, sign field-validated)
+        Angular correction only applied when center_y is outside tolerance.
+        """
+        linear_x  = -(1.0 if center_x > 0 else -1.0) * self._v_linear
+
+        angular_z = (
+            self._center_y_correction_sign
+            * (1.0 if center_y > 0 else -1.0)
+            * self._v_angular
+            if abs(center_y) > self._tolerance
+            else 0.0
+        )
+
+        self.logger.debug(
+            f'_correct | '
+            f'center_x={center_x:.4f}m linear_x={linear_x:.4f} | '
+            f'center_y={center_y:.4f}m angular_z={angular_z:.4f}'
+        )
+
+        self.__publish_cmd_vel(linear_x=linear_x, angular_z=angular_z)
+
+    def _stop_and_align(self, center_x: float) -> None:
+        """
+        Called when stop condition is met.
+
+        Publishes zero velocity, stops watchdog, transitions to STOPPED.
+        Watchdog is stopped — robot is stationary. Caller is responsible
+        for feeding the Husky watchdog during the activity if required.
+        """
+        self._stop_watchdog_timer()
+        self._transition(DriveStatus.STOPPED)
+        self.__publish_cmd_vel(linear_x=0.0, angular_z=0.0)
+        self.logger.info(
+            f'Bush aligned | center_x={center_x:.4f}m | '
+            f'waiting for resume()'
+        )
+
+    # ------------------------------------------------------------------
+    # Watchdog timer
+    # ------------------------------------------------------------------
+
+    def _start_watchdog_timer(self) -> None:
+        """Start 10Hz timer republishing last commanded velocity."""
+        self._stop_watchdog_timer()
+        self._watchdog_timer = self.node.create_timer(0.1, self._watchdog_callback)
+        self.logger.debug('Watchdog timer started')
+
+    def _stop_watchdog_timer(self) -> None:
+        """Cancel watchdog timer if running."""
+        if self._watchdog_timer is not None:
+            self._watchdog_timer.cancel()
+            self._watchdog_timer = None
+            self.logger.debug('Watchdog timer stopped')
+
+    def _watchdog_callback(self) -> None:
+        """Republish last commanded velocity at 10Hz."""
+        if not self.is_active():
+            return
+        self.__publish_cmd_vel(
+            linear_x=self._last_linear_x,
+            angular_z=self._last_angular_z,
+        )
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
+
+    def _clear_tracking_state(self) -> None:
+        """Reset all per-traversal tracking variables."""
+        self._min_center_x_seen  = None
+        self._departure_start_x  = None
+
+    def _transition(self, new_status: DriveStatus) -> None:
+        """Log and apply a status transition."""
+        if self._status != new_status:
+            self.logger.info(
+                f'Status: {self._status.name} → {new_status.name}'
+            )
+            self._status = new_status
 
     def __publish_cmd_vel(self, linear_x: float, angular_z: float) -> None:
-        """Wrap a Twist in a stamped message and publish to cmd_vel."""
-        msg = TwistStamped()
-        msg.header.stamp = self.node.get_clock().now().to_msg()
-        msg.header.frame_id = self.base_frame
-        msg.twist.linear.x = linear_x
-        msg.twist.angular.z = angular_z
+        """Stamp and publish TwistStamped. Caches values for watchdog."""
+        self._last_linear_x  = linear_x
+        self._last_angular_z = angular_z
+        msg                  = TwistStamped()
+        msg.header.stamp     = self.node.get_clock().now().to_msg()
+        msg.header.frame_id  = self._base_frame
+        msg.twist.linear.x   = linear_x
+        msg.twist.angular.z  = angular_z
         self._cmd_vel_pub.publish(msg)
