@@ -41,6 +41,9 @@ Caller interface:
   last_detection_time() — for no-detection timeout in calling node
 """
 
+from dataclasses import dataclass
+from enum import IntEnum
+
 from geometry_msgs.msg import TwistStamped
 from status_interfaces.msg import ImageDetectionPose
 
@@ -48,34 +51,30 @@ from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.node import Node
 from rclpy.timer import Timer
 
-from dataclasses import dataclass
-from enum import IntEnum
-
 
 class DriveStatus(IntEnum):
     """
-    Combined state enum for DriveClient — covers both external status
-    visible to callers and internal phase tracking.
+    Combined state enum for DriveClient.
 
-    Caller-relevant states:
-      IDLE       — not started, fully reset, or stopped externally
-      SCANNING   — moving forward, looking for next bush
-      CORRECTING — bush detected, homing in toward center_x=0
-      STOPPED    — stop condition met, waiting for resume()
-                   caller starts activity (simulation timer or arm action)
-                   then calls drive_client.resume()
-      DEPARTING  — activity complete, moving past current bush,
-                   ignoring detections until departure_clearance is met
-      CANCELED   — aborted by cancel()
-      ERROR      — unexpected state, caller should call reset()
+    IDLE       — not started, fully reset, or stopped externally
+    SCANNING   — moving forward, looking for next bush
+    CORRECTING — bush detected, homing in toward center_x=0
+    STOPPED    — stop condition met, waiting for resume()
+                 caller starts activity (simulation timer or arm action)
+                 then calls drive_client.resume()
+    DEPARTING  — activity complete, moving past current bush,
+                 ignoring detections until departure_clearance is met
+    CANCELED   — aborted by cancel()
+    ERROR      — unexpected state, caller should call reset()
     """
-    IDLE       = 0
-    SCANNING   = 1
+
+    IDLE = 0
+    SCANNING = 1
     CORRECTING = 2
-    STOPPED    = 3
-    DEPARTING  = 4
-    CANCELED   = 5
-    ERROR      = 6
+    STOPPED = 3
+    DEPARTING = 4
+    CANCELED = 5
+    ERROR = 6
 
 
 @dataclass
@@ -83,53 +82,37 @@ class DriveConfig:
     """
     Configuration for DriveClient.
 
-    Physical assumption recorded here:
+    Physical assumption:
       arm_0_base_link X offset from camera along travel axis is ZERO.
       When center_x = 0, both camera and arm are directly over the bush.
       tolerance therefore directly determines arm positioning accuracy.
       If arm pose changes, this assumption must be revalidated.
-
-    Removed:
-      tf_polling_rate, timeout, tf_base_frame, tf_detection_frame
-        — TF-based alignment removed; center.x/center.y are the sole error signals
-      proportional_zone, min_correction_scale
-        — speed scaling removed; robot drives at constant v_linear
-      max_plausible_delta
-        — delta threshold C3 replaced by minimum tracker (noise_margin)
     """
 
     # ── Frame ──────────────────────────────────────────────────────────────────
     base_frame: str
 
     # ── Speed ──────────────────────────────────────────────────────────────────
-    v_linear: float             # m/s   — constant forward/backward speed
-    v_angular: float            # rad/s — constant lateral correction speed
+    v_linear: float  # m/s   — constant forward/backward speed
+    v_angular: float  # rad/s — constant lateral correction speed
 
     # ── Stop condition ─────────────────────────────────────────────────────────
-    tolerance: float            # m — stop when abs(center_x) <= tolerance
-                                #         AND abs(center_y) <= tolerance
-                                # Also determines arm positioning accuracy
-                                # (see physical assumption above)
+    tolerance: float  # m — stop when abs(center_x) <= tolerance
+    #         AND abs(center_y) <= tolerance
 
-    # ── Angular correction sign ────────────────────────────────────────────────
+    # ── Lateral correction direction ───────────────────────────────────────────
     center_y_correction_sign: float  # lateral axis → angular.z
-                                     # flip to 1.0 if robot turns wrong way
+    # flip to 1.0 if robot turns wrong way
 
     # ── C3 mitigation — minimum tracker ───────────────────────────────────────
-    noise_margin: float         # m — how much abs(center_x) is allowed to increase
-                                # between ticks before being rejected as a bush switch.
-                                # Normal sensor noise: ~0.014m. Recommended: 0.02m.
-                                # Increase if valid detections are being rejected.
-                                # Decrease if robot is skipping bushes.
+    noise_margin: float  # m — wobble budget: how much abs(center_x) can
+    # increase between ticks before rejecting as bush switch
 
     # ── Departure clearance ────────────────────────────────────────────────────
-    departure_clearance: float  # m — after finishing a bush, how far past it to travel
-                                # before looking for the next one.
-                                # Prevents re-detecting the completed bush.
-                                # At min lavender spacing (0.305m): 0.15m recommended.
+    departure_clearance: float  # m — distance past completed bush before scanning resumes
 
     # ── Detection topic ────────────────────────────────────────────────────────
-    detection_topic: str        # relative to namespace
+    detection_topic: str  # relative to namespace
 
 
 class DriveClient:
@@ -147,18 +130,18 @@ class DriveClient:
     """
 
     def __init__(self, node: Node, config: DriveConfig) -> None:
-        self.node   = node
+        self.node = node
         self.logger = RcutilsLogger(self.__class__.__name__)
         self.namespace = self.node.get_namespace().rstrip('/')
 
         # --- Config ---
-        self._base_frame                = config.base_frame
-        self._v_linear                  = config.v_linear
-        self._v_angular                 = config.v_angular
-        self._tolerance                 = config.tolerance
-        self._center_y_correction_sign  = config.center_y_correction_sign
-        self._noise_margin              = config.noise_margin
-        self._departure_clearance       = config.departure_clearance
+        self._base_frame = config.base_frame
+        self._v_linear = config.v_linear
+        self._v_angular = config.v_angular
+        self._tolerance = config.tolerance
+        self._center_y_correction_sign = config.center_y_correction_sign
+        self._noise_margin = config.noise_margin
+        self._departure_clearance = config.departure_clearance
 
         # --- Status ---
         self._status: DriveStatus = DriveStatus.IDLE
@@ -178,15 +161,14 @@ class DriveClient:
         self._last_detection_time: float | None = None
 
         # --- Last commanded velocity (watchdog republish) ---
-        self._last_linear_x:  float = 0.0
+        self._last_linear_x: float = 0.0
         self._last_angular_z: float = 0.0
 
         # --- Timers ---
         self._watchdog_timer: Timer | None = None
 
         # --- Publisher ---
-        self._cmd_vel_pub = self.node.create_publisher(
-            TwistStamped, f'{self.namespace}/cmd_vel', 10)
+        self._cmd_vel_pub = self.node.create_publisher(TwistStamped, f'{self.namespace}/cmd_vel', 10)
 
         # --- Detection subscription ---
         self._detection_sub = self.node.create_subscription(
@@ -236,14 +218,12 @@ class DriveClient:
         No-op if not in STOPPED state.
         """
         if self._status != DriveStatus.STOPPED:
-            self.logger.warning(
-                f'resume() called in unexpected state {self._status.name} — ignoring'
-            )
+            self.logger.warning(f'resume() called in unexpected state {self._status.name} — ignoring')
             return
 
         self.logger.info('DriveClient resume — beginning departure')
-        self._min_center_x_seen   = None
-        self._departure_start_x   = None
+        self._min_center_x_seen = None
+        self._departure_start_x = None
         self._transition(DriveStatus.DEPARTING)
         self._start_watchdog_timer()
         self.__publish_cmd_vel(linear_x=self._v_linear, angular_z=0.0)
@@ -321,10 +301,7 @@ class DriveClient:
         center_y = msg.center.y
         self._last_detection_time = self.node.get_clock().now().nanoseconds / 1e9
 
-        self.logger.debug(
-            f'Detection | center_x={center_x:.4f}m center_y={center_y:.4f}m | '
-            f'status={self._status.name}'
-        )
+        self.logger.debug(f'Detection | center_x={center_x:.4f}m center_y={center_y:.4f}m | status={self._status.name}')
 
         if self._status == DriveStatus.SCANNING:
             self._handle_scanning(center_x, center_y)
@@ -349,10 +326,7 @@ class DriveClient:
 
         Initialises minimum tracker and transitions to CORRECTING.
         """
-        self.logger.info(
-            f'Bush detected | center_x={center_x:.4f}m center_y={center_y:.4f}m | '
-            f'SCANNING → CORRECTING'
-        )
+        self.logger.info(f'Bush detected | center_x={center_x:.4f}m center_y={center_y:.4f}m | SCANNING → CORRECTING')
         self._min_center_x_seen = abs(center_x)
         self._transition(DriveStatus.CORRECTING)
         self._correct(center_x, center_y)
@@ -380,16 +354,13 @@ class DriveClient:
                 return
 
         self._min_center_x_seen = min(
-            self._min_center_x_seen if self._min_center_x_seen is not None else abs_cx,
-            abs_cx
+            self._min_center_x_seen if self._min_center_x_seen is not None else abs_cx, abs_cx
         )
 
         # --- Stop condition ---
         if abs(center_x) <= self._tolerance and abs(center_y) <= self._tolerance:
             self.logger.info(
-                f'Stop condition met | '
-                f'center_x={center_x:.4f}m center_y={center_y:.4f}m | '
-                f'tolerance={self._tolerance}m'
+                f'Stop condition met | center_x={center_x:.4f}m center_y={center_y:.4f}m | tolerance={self._tolerance}m'
             )
             self._stop_and_align(center_x)
             return
@@ -410,14 +381,10 @@ class DriveClient:
         # Record departure reference on first detection after resume()
         if self._departure_start_x is None:
             self._departure_start_x = center_x
-            self.logger.debug(
-                f'Departure reference set | center_x={center_x:.4f}m'
-            )
+            self.logger.debug(f'Departure reference set | center_x={center_x:.4f}m')
             return
 
-        clearance_reached = (
-            center_x < self._departure_start_x - self._departure_clearance
-        )
+        clearance_reached = center_x < self._departure_start_x - self._departure_clearance
 
         if clearance_reached:
             self.logger.info(
@@ -449,12 +416,10 @@ class DriveClient:
         center_y → angular.z (lateral axis, sign field-validated)
         Angular correction only applied when center_y is outside tolerance.
         """
-        linear_x  = -(1.0 if center_x > 0 else -1.0) * self._v_linear
+        linear_x = -(1.0 if center_x > 0 else -1.0) * self._v_linear
 
         angular_z = (
-            self._center_y_correction_sign
-            * (1.0 if center_y > 0 else -1.0)
-            * self._v_angular
+            self._center_y_correction_sign * (1.0 if center_y > 0 else -1.0) * self._v_angular
             if abs(center_y) > self._tolerance
             else 0.0
         )
@@ -478,10 +443,7 @@ class DriveClient:
         self._stop_watchdog_timer()
         self._transition(DriveStatus.STOPPED)
         self.__publish_cmd_vel(linear_x=0.0, angular_z=0.0)
-        self.logger.info(
-            f'Bush aligned | center_x={center_x:.4f}m | '
-            f'waiting for resume()'
-        )
+        self.logger.info(f'Bush aligned | center_x={center_x:.4f}m | waiting for resume()')
 
     # ------------------------------------------------------------------
     # Watchdog timer
@@ -515,24 +477,22 @@ class DriveClient:
 
     def _clear_tracking_state(self) -> None:
         """Reset all per-traversal tracking variables."""
-        self._min_center_x_seen  = None
-        self._departure_start_x  = None
+        self._min_center_x_seen = None
+        self._departure_start_x = None
 
     def _transition(self, new_status: DriveStatus) -> None:
         """Log and apply a status transition."""
         if self._status != new_status:
-            self.logger.info(
-                f'Status: {self._status.name} → {new_status.name}'
-            )
+            self.logger.info(f'Status: {self._status.name} → {new_status.name}')
             self._status = new_status
 
     def __publish_cmd_vel(self, linear_x: float, angular_z: float) -> None:
         """Stamp and publish TwistStamped. Caches values for watchdog."""
-        self._last_linear_x  = linear_x
+        self._last_linear_x = linear_x
         self._last_angular_z = angular_z
-        msg                  = TwistStamped()
-        msg.header.stamp     = self.node.get_clock().now().to_msg()
-        msg.header.frame_id  = self._base_frame
-        msg.twist.linear.x   = linear_x
-        msg.twist.angular.z  = angular_z
+        msg = TwistStamped()
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.header.frame_id = self._base_frame
+        msg.twist.linear.x = linear_x
+        msg.twist.angular.z = angular_z
         self._cmd_vel_pub.publish(msg)

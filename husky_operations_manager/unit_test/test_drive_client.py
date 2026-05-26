@@ -31,9 +31,7 @@ from rclpy.qos import qos_profile_sensor_data
 
 from std_msgs.msg import Bool
 
-from husky_operations_manager.action_clients.drive import DriveClient
-from husky_operations_manager.enum import DriveStatus
-from husky_operations_manager.types import DriveConfig
+from husky_operations_manager.action_clients.drive import DriveClient, DriveConfig, DriveStatus
 
 
 class TestDriveNode(Node):
@@ -52,12 +50,9 @@ class TestDriveNode(Node):
 
         # Step 1 + 2: declare and read all parameters
         self._declare_parameters()
-        self._no_detection_timeout: float = float(
-            self.get_parameter('no_detection_timeout').value)
-        self._control_loop_period: float = float(
-            self.get_parameter('control_loop_period').value)
-        self._activity_duration: float = float(
-            self.get_parameter('simulation.activity_duration').value)
+        self._no_detection_timeout: float = float(self.get_parameter('no_detection_timeout').value)
+        self._control_loop_period: float = float(self.get_parameter('control_loop_period').value)
+        self._activity_duration: float = float(self.get_parameter('simulation.activity_duration').value)
         drive_config = self._build_drive_config()
 
         # Step 3: construct DriveClient
@@ -75,10 +70,9 @@ class TestDriveNode(Node):
         self._activity_timer = None
 
         # Step 5: control loop timer
-        self._drive_started: bool  = False
-        self._start_time:    float = self.get_clock().now().nanoseconds / 1e9
-        self._control_timer = self.create_timer(
-            self._control_loop_period, self._control_loop)
+        self._drive_started: bool = False
+        self._start_time: float = self.get_clock().now().nanoseconds / 1e9
+        self._control_timer = self.create_timer(self._control_loop_period, self._control_loop)
 
         # Step 6: start traversal
         self._drive_started = True
@@ -96,30 +90,29 @@ class TestDriveNode(Node):
     # =========================================================================
 
     def _declare_parameters(self) -> None:
-        self.declare_parameter('control_loop_period',          0.1)
-        self.declare_parameter('no_detection_timeout',         30.0)
+        self.declare_parameter('control_loop_period', 0.1)
+        self.declare_parameter('no_detection_timeout', 30.0)
         self.declare_parameter('simulation.activity_duration', 5.0)
 
-        self.declare_parameter('drive.base_frame',               'base_link')
-        self.declare_parameter('drive.v_linear',                 0.1)
-        self.declare_parameter('drive.v_angular',                0.2)
-        self.declare_parameter('drive.tolerance',                0.05)
+        self.declare_parameter('drive.base_frame', 'base_link')
+        self.declare_parameter('drive.v_linear', 0.1)
+        self.declare_parameter('drive.v_angular', 0.2)
+        self.declare_parameter('drive.tolerance', 0.05)
         self.declare_parameter('drive.center_y_correction_sign', -1.0)
-        self.declare_parameter('drive.noise_margin',             0.02)
-        self.declare_parameter('drive.departure_clearance',      0.15)
-        self.declare_parameter('drive.detection_topic',
-            'manipulators/arm_0_detection/image_annotated/detection_pose')
+        self.declare_parameter('drive.noise_margin', 0.02)
+        self.declare_parameter('drive.departure_clearance', 0.15)
+        self.declare_parameter('drive.detection_topic', 'manipulators/arm_0_detection/image_annotated/detection_pose')
 
     def _build_drive_config(self) -> DriveConfig:
         config = DriveConfig(
-            base_frame               = str(self.get_parameter('drive.base_frame').value),
-            v_linear                 = float(self.get_parameter('drive.v_linear').value),
-            v_angular                = float(self.get_parameter('drive.v_angular').value),
-            tolerance                = float(self.get_parameter('drive.tolerance').value),
-            center_y_correction_sign = float(self.get_parameter('drive.center_y_correction_sign').value),
-            noise_margin             = float(self.get_parameter('drive.noise_margin').value),
-            departure_clearance      = float(self.get_parameter('drive.departure_clearance').value),
-            detection_topic          = str(self.get_parameter('drive.detection_topic').value),
+            base_frame=str(self.get_parameter('drive.base_frame').value),
+            v_linear=float(self.get_parameter('drive.v_linear').value),
+            v_angular=float(self.get_parameter('drive.v_angular').value),
+            tolerance=float(self.get_parameter('drive.tolerance').value),
+            center_y_correction_sign=float(self.get_parameter('drive.center_y_correction_sign').value),
+            noise_margin=float(self.get_parameter('drive.noise_margin').value),
+            departure_clearance=float(self.get_parameter('drive.departure_clearance').value),
+            detection_topic=str(self.get_parameter('drive.detection_topic').value),
         )
         self.get_logger().info(
             f'DriveConfig | '
@@ -166,11 +159,9 @@ class TestDriveNode(Node):
         if status == DriveStatus.STOPPED:
             if self._activity_timer is None:
                 self.get_logger().info(
-                    f'Bush aligned — starting activity timer '
-                    f'({self._activity_duration}s simulation)'
+                    f'Bush aligned — starting activity timer ({self._activity_duration}s simulation)'
                 )
-                self._activity_timer = self.create_timer(
-                    self._activity_duration, self._activity_complete)
+                self._activity_timer = self.create_timer(self._activity_duration, self._activity_complete)
             return
 
         if status == DriveStatus.IDLE and self._drive_started:
@@ -185,10 +176,9 @@ class TestDriveNode(Node):
             return
 
         # --- No-detection timeout ---
-        now            = self.get_clock().now().nanoseconds / 1e9
+        now = self.get_clock().now().nanoseconds / 1e9
         last_detection = self._drive_client.last_detection_time()
-        elapsed        = now - (last_detection if last_detection is not None
-                                else self._start_time)
+        elapsed = now - (last_detection if last_detection is not None else self._start_time)
 
         if elapsed >= self._no_detection_timeout:
             self.get_logger().warning(
