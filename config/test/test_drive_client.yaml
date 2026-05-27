@@ -12,6 +12,10 @@
     drive:
       # ── Frame ──────────────────────────────────────────────────────────────
       base_frame: "base_link"
+      tf_arm_frame:       "arm_0_base_link"
+      tf_camera_optical_frame: "camera_1_color_optical_frame" # parent frame to camera_1_detections frame
+      tf_detection_frame: "camera_1_detections" # camera_1_detections is only broadcast when detection_valid=True.
+
 
       # ── Detection topic (relative to namespace) ────────────────────────────
       # a300_00036: manipulators/arm_0_detection/image_annotated/detection_pose
@@ -28,12 +32,6 @@
       # camera is zero, so tolerance = arm positioning precision.
       # Field-validated: 0.05m. Target after tuning: 0.005m.
       tolerance: 0.05    # m — applies to both center_x and center_y
- 
-      # ── Lateral correction direction ───────────────────────────────────────
-      # center_y drives the angular correction (left/right steering).
-      # If the robot turns AWAY from the bush on first test: change to 1.0
-      # If the robot turns TOWARD the bush on first test:    keep at -1.0
-      center_y_correction_sign: -1.0
  
       # ── C3 mitigation — minimum tracker ───────────────────────────────────
       # While approaching a bush, small measurement wobbles are normal.

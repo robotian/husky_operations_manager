@@ -74,9 +74,8 @@ class TestDriveNode(Node):
         self._start_time: float = self.get_clock().now().nanoseconds / 1e9
         self._control_timer = self.create_timer(self._control_loop_period, self._control_loop)
 
-        # Step 6: start traversal
-        self._drive_started = True
-        self._drive_client.start()
+        # Step 6: retry start() until TF is available
+        self._startup_timer = self.create_timer(0.5, self._try_start)
 
         self.get_logger().info(
             f'TestDriveNode ready | '
@@ -95,10 +94,11 @@ class TestDriveNode(Node):
         self.declare_parameter('simulation.activity_duration', 5.0)
 
         self.declare_parameter('drive.base_frame', 'base_link')
+        self.declare_parameter('drive.tf_arm_frame', 'arm_0_base_link')
+        self.declare_parameter('drive.tf_detection_frame', 'camera_1_detections')
+        self.declare_parameter('drive.tf_camera_optical_frame', 'camera_1_color_optical_frame')
         self.declare_parameter('drive.v_linear', 0.1)
-        self.declare_parameter('drive.v_angular', 0.2)
         self.declare_parameter('drive.tolerance', 0.05)
-        self.declare_parameter('drive.center_y_correction_sign', -1.0)
         self.declare_parameter('drive.noise_margin', 0.02)
         self.declare_parameter('drive.departure_clearance', 0.15)
         self.declare_parameter('drive.detection_topic', 'manipulators/arm_0_detection/image_annotated/detection_pose')
@@ -106,24 +106,48 @@ class TestDriveNode(Node):
     def _build_drive_config(self) -> DriveConfig:
         config = DriveConfig(
             base_frame=str(self.get_parameter('drive.base_frame').value),
+            tf_arm_frame=str(self.get_parameter('drive.tf_arm_frame').value),
+            tf_detection_frame=str(self.get_parameter('drive.tf_detection_frame').value),
+            tf_camera_optical_frame=str(self.get_parameter('drive.tf_camera_optical_frame').value),
             v_linear=float(self.get_parameter('drive.v_linear').value),
-            v_angular=float(self.get_parameter('drive.v_angular').value),
             tolerance=float(self.get_parameter('drive.tolerance').value),
-            center_y_correction_sign=float(self.get_parameter('drive.center_y_correction_sign').value),
             noise_margin=float(self.get_parameter('drive.noise_margin').value),
             departure_clearance=float(self.get_parameter('drive.departure_clearance').value),
             detection_topic=str(self.get_parameter('drive.detection_topic').value),
         )
         self.get_logger().info(
             f'DriveConfig | '
-            f'v_linear={config.v_linear} v_angular={config.v_angular} | '
+            f'v_linear={config.v_linear} | '
             f'tolerance={config.tolerance}m | '
-            f'center_y_correction_sign={config.center_y_correction_sign} | '
             f'noise_margin={config.noise_margin}m | '
             f'departure_clearance={config.departure_clearance}m | '
+            f'tf_arm_frame={config.tf_arm_frame} | '
+            f'tf_detection_frame={config.tf_detection_frame} | '
+            f'tf_camera_optical_frame={config.tf_camera_optical_frame} | '
             f'detection_topic={config.detection_topic}'
         )
         return config
+
+    # =========================================================================
+    # STARTUP
+    # =========================================================================
+
+    def _try_start(self) -> None:
+        """
+        Retry drive_client.start() until TF is available.
+
+        start() fails if the TF buffer has not yet received transforms —
+        typically happens when called before the executor has spun.
+        Retries every 0.5s until successful then cancels itself.
+        """
+        if self._drive_client.start():
+            self._startup_timer.cancel()
+            self._startup_timer = None
+            self._drive_started = True
+            self._start_time = self.get_clock().now().nanoseconds / 1e9
+            self.get_logger().info('DriveClient started — traversal beginning')
+        else:
+            self.get_logger().warning('TF not yet available — retrying start() in 0.5s')
 
     # =========================================================================
     # E-STOP
