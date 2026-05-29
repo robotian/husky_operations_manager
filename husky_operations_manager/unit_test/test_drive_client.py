@@ -1,20 +1,18 @@
 """
 test_drive_client.py
-
+ 
 Standalone test node for the updated DriveClient.
-
+ 
 Exercises the full DriveClient state machine:
   IDLE → scan() → SCANNING → (detection) → STOPPED
        → resume() → DEPARTING → (clearance) → SCANNING → ...
-
+ 
 A 1Hz timer monitors DriveStatus and calls resume() when STOPPED,
 simulating a harvest activity completing instantly.
-
+ 
 The node does NOT subscribe to ImageDetectionPose directly —
 DriveClient owns that subscription internally.
 """
-
-# import time
 
 import rclpy
 from rclpy.duration import Duration
@@ -59,15 +57,12 @@ class TestDriveNode(Node):
         self.declare_parameter('drive.base_frame', 'base_link')
         self.declare_parameter('drive.v_linear', 0.1)
         self.declare_parameter('drive.v_angular', 0.2)
-        self.declare_parameter('drive.tf_base_frame', 'camera_1_color_optical_frame')
-        self.declare_parameter('drive.tf_detection_frame', 'camera_1_detections')
         self.declare_parameter('drive.ex_tolerance', 0.01)
         self.declare_parameter('drive.ey_tolerance', 0.01)
         self.declare_parameter('drive.ey_sign', -1.0)
-        self.declare_parameter('drive.departure_clearance', 0.3)
+        self.declare_parameter('drive.departure_clearance', 0.2)
+        self.declare_parameter('drive.no_detection_distance',  1.0)
         self.declare_parameter('drive.detection_topic', 'sensors/camera_1/detection/image_annotated/detection_pose')
-        self.declare_parameter('drive.tf_polling_rate', 10.0)
-        self.declare_parameter('drive.timeout', 30.0)
         self.declare_parameter('drive.cmd_vel_rate', 10.0)
 
     def _build_drive_config(self) -> DriveConfig:
@@ -75,25 +70,24 @@ class TestDriveNode(Node):
             base_frame=str(self.get_parameter('drive.base_frame').value),
             v_linear=float(self.get_parameter('drive.v_linear').value),
             v_angular=float(self.get_parameter('drive.v_angular').value),
-            tf_base_frame=str(self.get_parameter('drive.tf_base_frame').value),
-            tf_detection_frame=str(self.get_parameter('drive.tf_detection_frame').value),
             ex_tolerance=float(self.get_parameter('drive.ex_tolerance').value),
             ey_tolerance=float(self.get_parameter('drive.ey_tolerance').value),
             ey_sign=float(self.get_parameter('drive.ey_sign').value),
             departure_clearance=float(self.get_parameter('drive.departure_clearance').value),
+            no_detection_distance  = float(self.get_parameter('drive.no_detection_distance').value),
             detection_topic=str(self.get_parameter('drive.detection_topic').value),
-            tf_polling_rate=float(self.get_parameter('drive.tf_polling_rate').value),
-            timeout=float(self.get_parameter('drive.timeout').value),
             cmd_vel_rate=float(self.get_parameter('drive.cmd_vel_rate').value),
         )
+        
         self.get_logger().info(
             f'DriveConfig loaded | '
             f'v_linear={config.v_linear} v_angular={config.v_angular} | '
             f'ex_tolerance={config.ex_tolerance}m ey_tolerance={config.ey_tolerance}m | '
             f'ey_sign={config.ey_sign:+.1f} | '
             f'departure_clearance={config.departure_clearance}m | '
-            f'source="{config.tf_base_frame}" detection="{config.tf_detection_frame}"'
+            f'no_detection_distance={config.no_detection_distance}m'
         )
+
         return config
 
     # =========================================================================
@@ -115,7 +109,7 @@ class TestDriveNode(Node):
             self.get_logger().info('STOPPED — simulating harvest activity complete, calling resume() after 10sec')
             self.get_clock().sleep_for(Duration(seconds=10.0))           
             self.get_logger().info('Resumed — simulated harvest activity.')
-            # self._drive_client.resume()
+            self._drive_client.resume()
 
         elif status == DriveStatus.CANCELED:
             self.get_logger().warning('DriveClient CANCELED — stopping monitor')

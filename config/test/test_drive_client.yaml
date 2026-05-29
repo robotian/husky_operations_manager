@@ -1,54 +1,28 @@
-/*/test_drive_client:
+/*/test_drive_node:
   ros__parameters:
-    control_loop_period:   0.1    # s — poll rate for status + no-detection timeout
-    no_detection_timeout:  30.0   # s — stop if no valid detection for this long
-
-    # ── Simulation ─────────────────────────────────────────────────────────────
-    simulation:
-      # How long to pretend the robot is working on a bush before moving to the next.
-      # In production this is replaced by the actual arm action duration.
-      activity_duration: 5.0      # s
 
     drive:
-      # ── Frame ──────────────────────────────────────────────────────────────
-      base_frame: "base_link"
-      tf_arm_frame:       "arm_0_base_link"
-      tf_camera_optical_frame: "camera_1_color_optical_frame" # parent frame to camera_1_detections frame
-      tf_detection_frame: "camera_1_detections" # camera_1_detections is only broadcast when detection_valid=True.
+      # ── Velocity ─────────────────────────────────────────────────────────────
+      base_frame:   'base_link'
+      v_linear:     0.1      # m/s — forward/reverse speed
+      v_angular:    0.2      # rad/s — turning speed
 
+      # ── Detection ────────────────────────────────────────────────────────────
+      detection_topic: 'sensors/camera_1/detection/image_annotated/detection_pose'
 
-      # ── Detection topic (relative to namespace) ────────────────────────────
-      # a300_00036: manipulators/arm_0_detection/image_annotated/detection_pose
-      # j100_0921:  sensors/camera_1/detection/image_annotated/detection_pose
-      detection_topic: "sensors/camera_1/detection/image_annotated/detection_pose"
+      # ── Alignment ────────────────────────────────────────────────────────────
+      ex_tolerance:  0.01    # m — forward/backward stop tolerance
+      ey_tolerance:  0.02    # m — lateral stop tolerance
+      ey_sign:       -1.0    # confirmed: raw ey negative when bush is to the right
 
-      # ── Speed ──────────────────────────────────────────────────────────────
-      v_linear:   0.1    # m/s   — forward/backward speed (keep ≤ 0.1 at 5Hz detection)
-      v_angular:  0.2    # rad/s — lateral correction speed
- 
-      # ── Stop condition ─────────────────────────────────────────────────────
-      # The robot stops when the bush is within this distance of centre on BOTH axes.
-      # Also determines arm positioning accuracy — arm_0_base_link X offset from
-      # camera is zero, so tolerance = arm positioning precision.
-      # Field-validated: 0.05m. Target after tuning: 0.005m.
-      tolerance: 0.05    # m — applies to both center_x and center_y
- 
-      # ── C3 mitigation — minimum tracker ───────────────────────────────────
-      # While approaching a bush, small measurement wobbles are normal.
-      # This value is the wobble budget: how much the distance reading
-      # is allowed to increase between ticks before the robot decides the
-      # detector has jumped to a different bush and ignores that reading.
-      # Normal sensor noise at stop position: ~0.014m.
-      # Increase if valid detections are being rejected in a noisy environment.
-      # Decrease if the robot is skipping bushes due to two-bush confusion.
-      noise_margin: 0.02  # m
- 
-      # ── Departure clearance ────────────────────────────────────────────────
-      # After finishing a bush, the robot moves forward but the previous bush
-      # stays visible in the camera. This tells the robot how far past the
-      # finished bush to travel before it starts looking for the next one.
-      # At minimum lavender spacing (0.305m), 0.15m means the robot needs to
-      # clear roughly half the gap before scanning resumes.
-      # Increase if the robot keeps re-detecting the previous bush.
-      # Decrease if the robot is skipping bushes at close spacing.
-      departure_clearance: 0.15  # m
+      # ── Departure ────────────────────────────────────────────────────────────
+      departure_clearance:   0.2   # m — distance past bush before re-enabling detection
+
+      # ── No detection timeout ─────────────────────────────────────────────────
+      # Robot stops if no valid detection received after traveling this distance.
+      # Converted to time internally: timeout = no_detection_distance / v_linear
+      # e.g. 0.5m / 0.1m/s = 5.0s timeout
+      no_detection_distance: 0.2   # m
+
+      # ── cmd_vel ───────────────────────────────────────────────────────────────
+      cmd_vel_rate: 10.0     # Hz — republish velocity while active
