@@ -26,16 +26,13 @@ Confirmed convention (ey_sign=-1.0):
   ey < 0 → robot too close to bush   → move away   (left)
   |ey| <= ey_tolerance → at correct lateral harvesting distance
 
-  TODO: Implement lateral velocity correction publisher that adjusts
-        angular_z while SCANNING/CORRECTING to maintain safe harvesting
-        distance (ey within tolerance) as the robot approaches the bush.
-        Only implement after current approach is tested and robot reliably
-        stops when |ex| <= ex_tolerance.
+Yaw correction (proportional):
+  angular_z = clamp(ey * kp, -v_angular, +v_angular)
+  Applied during SCANNING when |ey| > ey_tolerance.
+  Zero when |ey| <= ey_tolerance (laterally aligned).
 """
 
-# from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.node import Node
-
 
 from dataclasses import dataclass
 from enum import IntEnum
@@ -72,13 +69,14 @@ class DriveConfig:
 
     # Detection
     detection_topic: str
-    no_detection_distance: str # distance (m) without detection before stopping
+    no_detection_distance: str  # distance (m) without detection before stopping
 
     # Velocity
     base_frame: str  # cmd_vel header frame_id
-    cmd_vel_rate: float # cmd_vel repeat rate (Hz) — republish velocity while active
+    cmd_vel_rate: float  # cmd_vel repeat rate (Hz) — republish velocity while active
     v_linear: float  # forward/reverse speed (m/s)
     v_angular: float  # turning speed (rad/s)
+    kp: float  # proportional gain for yaw correction
 
     # Alignment
     ex_tolerance: float  # forward/backward stop tolerance (m)
@@ -86,8 +84,7 @@ class DriveConfig:
     ey_sign: float  # +1.0 or -1.0, ey is negative when bush is to the right
 
     # Departure
-    departure_clearance: float # distance (m) past bush before re-enabling detection
-    
+    departure_clearance: float  # distance (m) past bush before re-enabling detection
 
 
 # =============================================================================
@@ -111,13 +108,14 @@ class DriveClient:
 
     def __init__(self, node: Node, config: DriveConfig) -> None:
         self.node = node
-        self.logger = self.node.get_logger() # RcutilsLogger(self.__class__.__name__)
+        self.logger = self.node.get_logger()  # RcutilsLogger(self.__class__.__name__)
         self.namespace = self.node.get_namespace().rstrip('/')
 
         # --- Velocity config ---
         self.base_frame: str = config.base_frame
         self.v_linear: float = config.v_linear
         self.v_angular: float = config.v_angular
+        self._kp: float = config.kp
 
         # --- Alignment config ---
         self._ex_tolerance: float = config.ex_tolerance
@@ -130,9 +128,8 @@ class DriveClient:
 
         # --- No detection timeout ---
         # Convert distance to time: timeout = distance / v_linear
-        self._no_detection_timeout: float = config.no_detection_distance /  max(config.v_linear, 0.01)
+        self._no_detection_timeout: float = config.no_detection_distance / max(config.v_linear, 0.01)
         self._no_detection_timer = None
-
 
         # --- Status ---
         self._status: DriveStatus = DriveStatus.IDLE
@@ -204,9 +201,10 @@ class DriveClient:
         if self._status in (DriveStatus.IDLE, DriveStatus.CANCELED):
             return
         self._status = DriveStatus.CANCELED
-        self._departure_start_time = None        
+        self._departure_start_time = None
         self._current_linear_x = 0.0
         self._current_angular_z = 0.0
+        self._cancel_no_detection_timer()
         self._publish_cmd_vel(linear_x=0.0, angular_z=0.0)
         self.logger.info('Drive CANCELED')
 
@@ -216,6 +214,7 @@ class DriveClient:
         self._departure_start_time = None
         self._current_linear_x = 0.0
         self._current_angular_z = 0.0
+        self._cancel_no_detection_timer()
         self.logger.info('DriveClient reset to IDLE')
 
     def get_status(self) -> DriveStatus:
@@ -237,33 +236,33 @@ class DriveClient:
     def _detection_callback(self, msg: ImageDetectionPose) -> None:
         """
         Fires on every ImageDetectionPose message.
- 
+
         SCANNING / CORRECTING:
           Valid detection → compute (ex, ey) from msg.center.
           Within tolerance → STOPPED, zero velocity.
           Outside tolerance → CORRECTING, keep driving.
- 
+
         DEPARTING:
           Ignore detections until departure_clearance time is met.
           Once met → back to SCANNING.
- 
+
         All other states: no-op.
         """
         self.logger.debug(f'Message received: {msg}')
         self.logger.debug(f'Valid Detection: {msg.detection_valid}')
- 
+
         if not msg.detection_valid:
             return
- 
+
         self.logger.debug(f'Detected Pose: {msg.center}')
- 
+
         if self._status == DriveStatus.DEPARTING:
             self._check_departure_clearance()
             return
- 
+
         if self._status not in (DriveStatus.SCANNING, DriveStatus.CORRECTING):
             return
- 
+
         self._reset_no_detection_timer()
         ex = msg.center.x
         ey = msg.center.y * self._ey_sign
@@ -280,19 +279,17 @@ class DriveClient:
         """
         if self._departure_start_time is None:
             return
- 
-        elapsed          = self.node.get_clock().now().nanoseconds / 1e9 - self._departure_start_time
+
+        elapsed = self.node.get_clock().now().nanoseconds / 1e9 - self._departure_start_time
         departure_duration = self._departure_clearance / max(self.v_linear, 0.01)
- 
-        self.logger.debug(
-            f'Departure check | elapsed={elapsed:.2f}s duration={departure_duration:.2f}s'
-        )
- 
+
+        self.logger.debug(f'Departure check | elapsed={elapsed:.2f}s duration={departure_duration:.2f}s')
+
         if elapsed >= departure_duration:
             self.logger.info(f'Departure clearance met ({elapsed:.2f}s) — resuming SCANNING')
             self._departure_start_time = None
             self.scan()
-    
+
     # ------------------------------------------------------------------
     # No detection timeout
     # ------------------------------------------------------------------
@@ -325,7 +322,6 @@ class DriveClient:
         self._current_angular_z = 0.0
         self._publish_cmd_vel(linear_x=0.0, angular_z=0.0)
 
-
     # ------------------------------------------------------------------
     # Alignment error
     # ------------------------------------------------------------------
@@ -333,40 +329,85 @@ class DriveClient:
     def _evaluate_alignment(self, ex: float, ey: float) -> None:
         """
         Evaluate alignment error and transition state accordingly.
- 
+
         ex: forward/backward alignment — stops the robot when within tolerance
         ey: lateral distance to bush — bush is always to the right
             ey > 0 → too far from bush   → needs to move closer (right)
             ey < 0 → too close to bush   → needs to move away   (left)
- 
-        TODO: Use ey to drive angular_z correction once ex-based stopping
-              is verified in testing. See module-level TODO for details.
+
+        Both axes are resolved in the same tick:
+            - linear_x is always v_linear until ex is satisfied
+            - angular_z is proportional to ey regardless of ex state
         """
         self.logger.debug(f'Pose | ex={ex:+.4f}m  ey={ey:+.4f}m')
- 
-        # --- X axis (forward/backward) ---
-        if abs(ex) <= self._ex_tolerance:
-            self.logger.info(f'X ALIGNED | ex={ex:+.4f}m within tolerance={self._ex_tolerance:.4f}m')
+
+        # ── X & Y axis: stop condition ────────────────────────────────────────────
+        x_aligned = abs(ex) <= self._ex_tolerance
+        y_aligned = abs(ey) <= self._ey_tolerance
+
+        # ── Proportional yaw correction (computed once, used in all moving phases) ──
+        if y_aligned:
+            angular_z = 0.0
+        else:
+            angular_z = max(-self.v_angular, min(self.v_angular, ey * self._kp))
+            direction = 'TOO FAR (move closer)' if ey > 0 else 'TOO CLOSE (move away)'
+            self.logger.debug(
+                f'{direction} | ey={ey:+.4f}m angular_z={angular_z:+.4f}rad/s'
+            )
+
+        # ── Publish simultaneous command ──────────────────────────────────────
+        if x_aligned and y_aligned:
+            # Phase 3: full stop
+            self.logger.info(
+                f'ALIGNED | ex={ex:+.4f}m ey={ey:+.4f}m — full stop'
+            )
             self._status            = DriveStatus.STOPPED
             self._current_linear_x  = 0.0
             self._current_angular_z = 0.0
             self._publish_cmd_vel(linear_x=0.0, angular_z=0.0)
+        elif x_aligned and not y_aligned:
+                # Phase 2: x done, rotate-in-place to finish yaw
+                self.logger.info(
+                    f'YAW CORRECTION | ex={ex:+.4f}m (done) ey={ey:+.4f}m '
+                    f'angular_z={angular_z:+.4f}rad/s'
+                )
+                self._status            = DriveStatus.CORRECTING
+                self._current_linear_x  = 0.0
+                self._current_angular_z = angular_z
+                self._publish_cmd_vel(linear_x=0.0, angular_z=angular_z)
         else:
-            self.logger.debug(f'Approaching | ex={ex:+.4f}m exceeds tolerance={self._ex_tolerance:.4f}m')
-            self._status = DriveStatus.CORRECTING
- 
-        # --- Y axis (lateral harvesting distance) ---
-        # TODO: drive angular_z correction based on ey once ex stopping is verified
-        if abs(ey) <= self._ey_tolerance:
-            self.logger.info(
-                f'Y ALIGNED | ey={ey:+.4f}m within tolerance={self._ey_tolerance:.4f}m '
-                f'— at correct harvesting distance'
+            # Phase 1: approach + simultaneous yaw correction
+            self.logger.debug(
+                f'Approaching | ex={ex:+.4f}m ey={ey:+.4f}m '
+                f'linear_x={self.v_linear:+.4f} angular_z={angular_z:+.4f}rad/s'
             )
-        elif ey > 0:
-            self.logger.info(f'TOO FAR   | ey={ey:+.4f}m — robot too far from bush, move closer (right)')
-        else:
-            self.logger.info(f'TOO CLOSE | ey={ey:+.4f}m — robot too close to bush, move away (left)')
+            self._status            = DriveStatus.CORRECTING
+            self._current_linear_x  = self.v_linear
+            self._current_angular_z = angular_z
+            self._publish_cmd_vel(linear_x=self.v_linear, angular_z=angular_z)
 
+
+        # # --- X axis (forward/backward) ---
+        # if abs(ex) <= self._ex_tolerance:
+        #     self.logger.info(f'X ALIGNED | ex={ex:+.4f}m within tolerance={self._ex_tolerance:.4f}m')
+        #     self._status = DriveStatus.STOPPED
+        #     self._current_linear_x = 0.0
+        #     self._current_angular_z = 0.0
+        #     self._publish_cmd_vel(linear_x=0.0, angular_z=0.0)
+        # else:
+        #     self.logger.debug(f'Approaching | ex={ex:+.4f}m exceeds tolerance={self._ex_tolerance:.4f}m')
+        #     self._status = DriveStatus.CORRECTING
+
+        # # --- Y axis (lateral harvesting distance) ---
+        # # TODO: drive angular_z correction based on ey once ex stopping is verified
+        # if abs(ey) <= self._ey_tolerance:
+        #     self.logger.info(
+        #         f'Y ALIGNED | ey={ey:+.4f}m within tolerance={self._ey_tolerance:.4f}m — at correct harvesting distance'
+        #     )
+        # elif ey > 0:
+        #     self.logger.info(f'TOO FAR   | ey={ey:+.4f}m — robot too far from bush, move closer (right)')
+        # else:
+        #     self.logger.info(f'TOO CLOSE | ey={ey:+.4f}m — robot too close to bush, move away (left)')
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -379,8 +420,9 @@ class DriveClient:
 
     def _publish_cmd_vel(self, linear_x: float, angular_z: float) -> None:
         """Wrap a Twist in a stamped message and publish to cmd_vel."""
-        self._current_linear_x  = linear_x
+        self._current_linear_x = linear_x
         self._current_angular_z = angular_z
+        
         msg = TwistStamped()
         msg.header.stamp = self.node.get_clock().now().to_msg()
         msg.header.frame_id = self.base_frame
