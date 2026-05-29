@@ -74,9 +74,9 @@ class DriveStatus(IntEnum):
 @dataclass
 class DriveConfig:
     """Configuration for DriveClient."""
-    
+
     # Detection
-    detection_topic:    str
+    detection_topic: str
 
     # Velocity
     base_frame: str  # cmd_vel header frame_id
@@ -148,9 +148,8 @@ class DriveClient:
         self._status: DriveStatus = DriveStatus.IDLE
 
         # --- cmd_vel repeat state ---
-        self._current_linear_x:  float = 0.0
+        self._current_linear_x: float = 0.0
         self._current_angular_z: float = 0.0
-
 
         # --- TF ---
         self._tf_buffer = tf2_ros.Buffer()
@@ -168,10 +167,7 @@ class DriveClient:
         self._cmd_vel_pub = self.node.create_publisher(TwistStamped, f'{self.namespace}/cmd_vel', 10)
 
         # --- cmd_vel repeat timer ---
-        self._cmd_vel_timer = self.node.create_timer(
-            1.0 / config.cmd_vel_rate,
-            self._cmd_vel_repeat_callback,
-        )
+        self._cmd_vel_timer = self.node.create_timer(1.0 / config.cmd_vel_rate, self._cmd_vel_repeat_callback)
 
         self.logger.info(
             f'DriveClient initialized | '
@@ -192,7 +188,7 @@ class DriveClient:
         """Start forward scanning drive. Detection callback handles STOPPED transition."""
         self.logger.info(f'SCANNING — moving forward at {self.v_linear}m/s')
         self._status = DriveStatus.SCANNING
-        self._current_linear_x=self.v_linear
+        self._current_linear_x = self.v_linear
         self._current_angular_z = 0.0
         self._publish_cmd_vel(linear_x=self.v_linear, angular_z=0.0)
 
@@ -217,7 +213,9 @@ class DriveClient:
         if self._status in (DriveStatus.IDLE, DriveStatus.CANCELED):
             return
         self._status = DriveStatus.CANCELED
-        self._departure_start_x = None
+        self._departure_start_x = None        
+        self._current_linear_x = 0.0
+        self._current_angular_z = 0.0
         self._publish_cmd_vel(linear_x=0.0, angular_z=0.0)
         self.logger.info('Drive CANCELED')
 
@@ -225,6 +223,8 @@ class DriveClient:
         """Reset to IDLE."""
         self._status = DriveStatus.IDLE
         self._departure_start_x = None
+        self._current_linear_x = 0.0
+        self._current_angular_z = 0.0
         self.logger.info('DriveClient reset to IDLE')
 
     def get_status(self) -> DriveStatus:
@@ -258,23 +258,31 @@ class DriveClient:
 
         All other states: no-op.
         """
+        self.logger.debug(f"Message received: {msg}")
+        self.logger.debug(f"Valid Detection: {msg.detection_valid}")
         if not msg.detection_valid:
             return
-        
+
+        self.logger.debug(f"Detected Pose: {msg.center}")
+
         if self._status == DriveStatus.DEPARTING:
             self._check_departure_clearance()
             return
 
         if self._status not in (DriveStatus.SCANNING, DriveStatus.CORRECTING):
             return
-
+        
         result = self._get_alignment_error()
         if result is None:
             return
-
         ex, ey = result
-        self._log_frame_poses()
         self._evaluate_alignment(ex, ey)
+
+        # Treating msg data as error data
+        # ex = msg.center.x
+        # ey = msg.center.y * self._ey_sign
+
+        # self._evaluate_alignment(ex, ey)
 
     # ------------------------------------------------------------------
     # Departure clearance
@@ -326,60 +334,56 @@ class DriveClient:
 
     def _get_alignment_error(self) -> tuple[float, float] | None:
         """
-        Single TF lookup: camera_1_detections in camera_1_color_optical_frame.
+        Compute ex and ey from the difference between camera_1_color_optical_frame
+        and camera_1_detections both expressed in map frame.
 
-        Equivalent to: tf2_echo camera_1_color_optical_frame camera_1_detections
-          → lookup_transform(
-                target_frame='camera_1_detections',
-                source_frame='camera_1_color_optical_frame',
-            )
+        ex = source_t.x - detection_t.x
+        ey = (source_t.y - detection_t.y) * ey_sign
 
         Returns (ex, ey) in metres, or None on TF failure.
         """
+        result = self._get_frame_poses_wrt_map()
+        if result is None:
+            return None
+
+        s, d = result
+        ex = s.x - d.x
+        ey = (s.y - d.y) * self._ey_sign
+        return ex, ey
+
+    def _get_frame_poses_wrt_map(self) -> tuple | None:
+        """
+        Look up camera_1_color_optical_frame and camera_1_detections both wrt map.
+        Returns (source_t, detection_t) as translation objects, or None on TF failure.
+        """
         try:
-            tf = self._tf_buffer.lookup_transform(
-                self._detection_frame,  # target_frame
-                self._source_frame,  # source_frame
+            source_tf = self._tf_buffer.lookup_transform(
+                self._source_frame,
+                'map',
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1),
             )
+            detection_tf = self._tf_buffer.lookup_transform(
+                self._detection_frame,
+                'map',
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.1),
+            )
+            s = source_tf.transform.translation
+            d = detection_tf.transform.translation
+            self.logger.debug(
+                f"Pose wrt map | '{self._source_frame}' | t=({s.x:+.4f}, {s.y:+.4f}, {s.z:+.4f})"
+            )
+            self.logger.debug(
+                f"Pose wrt map | '{self._detection_frame}' | t=({d.x:+.4f}, {d.y:+.4f}, {d.z:+.4f})"
+            )
+            return s, d
         except TransformException as e:
-            self.logger.warn(
-                f"TF lookup failed | '{self._detection_frame}' ← '{self._source_frame}': {e}",
+            self.logger.debug(
+                f"Pose lookup failed wrt 'map': {e}",
                 throttle_duration_sec=5.0,
             )
             return None
-
-        ex = tf.transform.translation.x
-        ey = tf.transform.translation.y * self._ey_sign
-        return ex, ey
-
-    def _log_frame_poses(self) -> None:
-        """
-        Debug — log pose of camera_1_color_optical_frame and camera_1_detections
-        both expressed in map frame. Used to validate early stop behaviour.
-        """
-        for frame in (self._source_frame, self._detection_frame):
-            try:
-                tf = self._tf_buffer.lookup_transform(
-                    frame,    # target_frame
-                    'map',    # source_frame
-                    rclpy.time.Time(),
-                    timeout=rclpy.duration.Duration(seconds=0.1),
-                )
-                t = tf.transform.translation
-                r = tf.transform.rotation
-                self.logger.debug(
-                    f"Pose wrt map | '{frame}' | "
-                    f"t=({t.x:+.4f}, {t.y:+.4f}, {t.z:+.4f}) | "
-                    f"q=({r.x:+.4f}, {r.y:+.4f}, {r.z:+.4f}, {r.w:+.4f})"
-                )
-            except TransformException as e:
-                self.logger.debug(
-                    f"Pose lookup failed | '{frame}' wrt 'map': {e}",
-                    throttle_duration_sec=5.0,
-                )
-
 
     def _evaluate_alignment(self, ex: float, ey: float) -> None:
         """
@@ -406,13 +410,12 @@ class DriveClient:
         else:
             self.logger.debug(f'Approaching | ex={ex:+.4f}m exceeds tolerance={self._ex_tolerance:.4f}m')
             self._status = DriveStatus.CORRECTING
- 
+
         # --- Y axis (lateral harvesting distance) ---
         # TODO: drive angular_z correction based on ey once ex stopping is verified
         if abs(ey) <= self._ey_tolerance:
             self.logger.info(
-                f'Y ALIGNED | ey={ey:+.4f}m within tolerance={self._ey_tolerance:.4f}m '
-                f'— at correct harvesting distance'
+                f'Y ALIGNED | ey={ey:+.4f}m within tolerance={self._ey_tolerance:.4f}m — at correct harvesting distance'
             )
         elif ey > 0:
             self.logger.info(f'TOO FAR   | ey={ey:+.4f}m — robot too far from bush, move closer (right)')
@@ -427,7 +430,6 @@ class DriveClient:
         """Republish current velocity at cmd_vel_rate while active."""
         if self.is_active():
             self._publish_cmd_vel(self._current_linear_x, self._current_angular_z)
-
 
     def _publish_cmd_vel(self, linear_x: float, angular_z: float) -> None:
         """Wrap a Twist in a stamped message and publish to cmd_vel."""

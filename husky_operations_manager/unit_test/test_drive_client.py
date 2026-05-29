@@ -14,9 +14,10 @@ The node does NOT subscribe to ImageDetectionPose directly —
 DriveClient owns that subscription internally.
 """
 
-import time
+# import time
 
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 
 from husky_operations_manager.action_clients.drive import DriveClient, DriveConfig, DriveStatus
@@ -44,7 +45,7 @@ class TestDriveNode(Node):
         self._drive_client = DriveClient(self, drive_config)
 
         # Monitor status and drive the state machine forward
-        self._timer = self.create_timer(1.0, self._timer_callback)
+        self._timer = self.create_timer(1.0, self._timer_callback)    
 
         # Start scanning immediately
         self._drive_client.scan()
@@ -111,9 +112,10 @@ class TestDriveNode(Node):
         self.get_logger().info(f'DriveClient status: {status.name}')
 
         if status == DriveStatus.STOPPED:
-            self.get_logger().info('STOPPED — simulating harvest activity complete, calling resume() after 5sec')
-            time.sleep(5.0)
-            self._drive_client.resume()
+            self.get_logger().info('STOPPED — simulating harvest activity complete, calling resume() after 10sec')
+            self.get_clock().sleep_for(Duration(seconds=10.0))           
+            self.get_logger().info('Resumed — simulated harvest activity.')
+            # self._drive_client.resume()
 
         elif status == DriveStatus.CANCELED:
             self.get_logger().warning('DriveClient CANCELED — stopping monitor')
