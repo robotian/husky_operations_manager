@@ -1,4 +1,4 @@
-/*/test_drive_node:
+/*/test_drive_client:
   ros__parameters:
 
     drive:
@@ -12,8 +12,9 @@
 
       # ── Alignment ────────────────────────────────────────────────────────────
       ex_tolerance:  0.01    # m — forward/backward stop tolerance
-      ey_tolerance:  0.02    # m — lateral stop tolerance
+      ey_tolerance:  0.01    # m — lateral stop tolerance
       ey_sign:       -1.0    # confirmed: raw ey negative when bush is to the right
+      kp:            0.5     # proportional gain for yaw correction — tune on robot
 
       # ── Departure ────────────────────────────────────────────────────────────
       departure_clearance:   0.2   # m — distance past bush before re-enabling detection
@@ -22,7 +23,7 @@
       # Robot stops if no valid detection received after traveling this distance.
       # Converted to time internally: timeout = no_detection_distance / v_linear
       # e.g. 0.5m / 0.1m/s = 5.0s timeout
-      no_detection_distance: 0.2   # m
+      no_detection_distance: 1.0   # m
 
       # ── cmd_vel ───────────────────────────────────────────────────────────────
       cmd_vel_rate: 10.0     # Hz — republish velocity while active

@@ -42,6 +42,7 @@ setup(
             'test_undocking_client = husky_operations_manager.unit_test.test_undocking_client:main',
             'test_harvest_client = husky_operations_manager.unit_test.test_harvest_client:main',
             'test_drive_client = husky_operations_manager.unit_test.test_drive_client:main',
+            'test_drive_v2 = husky_operations_manager.unit_test.test_drive_v2:main',
             
             'frame_align = husky_operations_manager.frame_align:main',
 

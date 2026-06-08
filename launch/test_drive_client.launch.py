@@ -32,10 +32,11 @@ def generate_launch_description():
         namespace=LaunchConfiguration('namespace'),
         output='screen',
         parameters=[config_file],
+        arguments=['--ros-args', '--log-level', 'DriveClient:=debug'],
         remappings=[
             ('/tf', 'tf'),
             ('/tf_static', 'tf_static'),
-        ],
+        ]
     )
 
     return LaunchDescription(

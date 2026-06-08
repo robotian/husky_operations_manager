@@ -54,31 +54,32 @@ class TestDriveNode(Node):
     # =========================================================================
 
     def _declare_parameters(self) -> None:
-        self.declare_parameter('drive.base_frame', 'base_link')
-        self.declare_parameter('drive.v_linear', 0.1)
-        self.declare_parameter('drive.v_angular', 0.2)
-        self.declare_parameter('drive.ex_tolerance', 0.01)
-        self.declare_parameter('drive.ey_tolerance', 0.01)
-        self.declare_parameter('drive.ey_sign', -1.0)
-        self.declare_parameter('drive.departure_clearance', 0.2)
+        self.declare_parameter('drive.base_frame',             'base_link')
+        self.declare_parameter('drive.v_linear',               0.2)
+        self.declare_parameter('drive.v_angular',              0.5)
+        self.declare_parameter('drive.ex_tolerance',           0.01)
+        self.declare_parameter('drive.ey_tolerance',           0.01)
+        self.declare_parameter('drive.ey_sign',                -1.0)
+        self.declare_parameter('drive.kp',                     1.0)
+        self.declare_parameter('drive.departure_clearance',    0.3)
         self.declare_parameter('drive.no_detection_distance',  1.0)
-        self.declare_parameter('drive.detection_topic', 'sensors/camera_1/detection/image_annotated/detection_pose')
-        self.declare_parameter('drive.cmd_vel_rate', 10.0)
-
+        self.declare_parameter('drive.detection_topic',        'sensors/camera_1/detection/image_annotated/detection_pose')
+        self.declare_parameter('drive.cmd_vel_rate',           10.0)
+ 
     def _build_drive_config(self) -> DriveConfig:
         config = DriveConfig(
-            base_frame=str(self.get_parameter('drive.base_frame').value),
-            v_linear=float(self.get_parameter('drive.v_linear').value),
-            v_angular=float(self.get_parameter('drive.v_angular').value),
-            ex_tolerance=float(self.get_parameter('drive.ex_tolerance').value),
-            ey_tolerance=float(self.get_parameter('drive.ey_tolerance').value),
-            ey_sign=float(self.get_parameter('drive.ey_sign').value),
-            departure_clearance=float(self.get_parameter('drive.departure_clearance').value),
+            base_frame             = str(self.get_parameter('drive.base_frame').value),
+            v_linear               = float(self.get_parameter('drive.v_linear').value),
+            v_angular              = float(self.get_parameter('drive.v_angular').value),
+            ex_tolerance           = float(self.get_parameter('drive.ex_tolerance').value),
+            ey_tolerance           = float(self.get_parameter('drive.ey_tolerance').value),
+            ey_sign                = float(self.get_parameter('drive.ey_sign').value),
+            kp                     = float(self.get_parameter('drive.kp').value),
+            departure_clearance    = float(self.get_parameter('drive.departure_clearance').value),
             no_detection_distance  = float(self.get_parameter('drive.no_detection_distance').value),
-            detection_topic=str(self.get_parameter('drive.detection_topic').value),
-            cmd_vel_rate=float(self.get_parameter('drive.cmd_vel_rate').value),
+            detection_topic        = str(self.get_parameter('drive.detection_topic').value),
+            cmd_vel_rate           = float(self.get_parameter('drive.cmd_vel_rate').value),
         )
-        
         self.get_logger().info(
             f'DriveConfig loaded | '
             f'v_linear={config.v_linear} v_angular={config.v_angular} | '
@@ -87,8 +88,8 @@ class TestDriveNode(Node):
             f'departure_clearance={config.departure_clearance}m | '
             f'no_detection_distance={config.no_detection_distance}m'
         )
-
         return config
+
 
     # =========================================================================
     # TIMER — status monitor and state machine driver
