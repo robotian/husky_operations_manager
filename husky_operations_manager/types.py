@@ -146,6 +146,19 @@ class ManipulatorTaskFeedback:
 
 
 @dataclass
+class UnloaderFeedback:
+    """Feedback data for an unloader carriage goal."""
+
+    status: int
+    target: str           # 'HOME' or 'END'
+    progress_percent: float
+    step_count: int
+    at_home_limit: bool
+    at_end_limit: bool
+    feedback_message: str
+
+
+@dataclass
 class DriveConfig:
     """Configuration for DriveClient."""
     base_frame: str
