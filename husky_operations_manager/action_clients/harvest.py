@@ -1,4 +1,6 @@
 """
+TODO: Depercated script. To be Deleated after confirmation of operations.
+
 NOTE: This is the working action client used to run MTC Harvest Action Server
 implemented as a part of mtc_tutorial packages.
 
