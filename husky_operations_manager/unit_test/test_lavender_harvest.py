@@ -36,15 +36,9 @@ from husky_operations_manager.action_clients.drive import DriveClient
 from husky_operations_manager.action_clients.navigation import NavigationActionClient
 from husky_operations_manager.action_clients.reverse_drive import ReverseDriveClient
 from husky_operations_manager.action_clients.undocking import UndockingActionClient
-from husky_operations_manager.types import (
-    DockInstanceConfig,
-    DockPluginConfig,
-    DockingConfig,
-    DriveConfig,
-)
-from husky_operations_manager.docking_param_fetcher import DockingParamFetcher
+from husky_operations_manager.action_clients.drive import DriveConfig
+from husky_operations_manager.types import DockInstanceConfig, DockPose, ReverseDriveConfig
 from husky_operations_manager.robot_enums import (
-    DockingParamFetcherStatus,
     DriveStatus,
     NavigationStatus,
     OnlineFlagEnum,
@@ -107,21 +101,33 @@ class LavenderHarvestNode(Node):
 
         self.robot_state_pub = self.create_publisher(RobotStatus, f'{self.namespace}/status/robot', 10)
 
-        # Set to None until DockingParamFetcher completes
-        self.docking_config: DockingConfig | None = None
-        self.active_dock: DockInstanceConfig | None = None
-        self.active_plugin: DockPluginConfig | None = None
-        self.reverse_drive_client: ReverseDriveClient | None = None
-        self.navigation: NavigationActionClient | None = None
-        self.docking_action_client: DockingActionClient | None = None
-        self.undocking_action_client: UndockingActionClient | None = None
-        self.drive_client: DriveClient | None = None
+        self.navigation              = NavigationActionClient(self)
+        self.docking_action_client   = DockingActionClient(self)
+        self.undocking_action_client = UndockingActionClient(self)
+        self.reverse_drive_client    = ReverseDriveClient(self, ReverseDriveConfig(
+            dock_names=[self.active_dock.instance_name],
+            dock_configs={self.active_dock.instance_name: self.active_dock},
+            plugin_name=self.plugin_name,
+            staging_x_offset=self.staging_x_offset,
+            staging_yaw_offset=self.staging_yaw_offset,
+            base_frame=self.base_frame,
+            controller_frequency=self.controller_frequency,
+            v_linear_min=self.v_linear_min,
+            v_angular_max=self.v_angular_max,
+            linear_tolerance=self.linear_tolerance,
+            angular_tolerance=self.angular_tolerance,
+            dock_backwards=self.dock_backwards,
+        ))
+        self.drive_client = DriveClient(self, self._drive_config)
 
-        self._CONFIG_POLL_TIMEOUT_SEC: float = 30.0
-        self._param_fetcher = DockingParamFetcher(self)
-        self._param_fetcher.fetch()
-        self._config_poll_start_time: float = self.get_clock().now().nanoseconds / 1e9
-        self._config_poll_timer = self.create_timer(0.5, self._poll_docking_config)
+        self.task_generator = TaskGenerator()
+
+        self.init_check_timer = self.create_timer(
+            self.timing_initial_check_delay, self._initial_position_check_timer
+        )
+        self.timer = self.create_timer(self.timing_timer_period, self.timer_callback)
+
+        self.get_logger().info('LavenderHarvestNode ready.')
 
     # =========================================================================
     # PARAMS AND VARIABLES INITIALIZATION
@@ -137,14 +143,38 @@ class LavenderHarvestNode(Node):
         self.declare_parameter('loading.increment', 20.0)
 
         # DriveClient
-        self.declare_parameter('drive.base_frame', 'base_link')
-        self.declare_parameter('drive.tf_polling_rate', 10.0)
-        self.declare_parameter('drive.tf_base_frame', 'arm_0_base_link')
-        self.declare_parameter('drive.tf_detection_frame', 'arm_0_detections')
-        self.declare_parameter('drive.tolerance', 0.05)
-        self.declare_parameter('drive.timeout', 30.0)
-        self.declare_parameter('drive.v_linear', 0.2)
-        self.declare_parameter('drive.v_angular', 0.5)
+        self.declare_parameter('drive.detection_topic',      '/detections')
+        self.declare_parameter('drive.no_detection_distance', 0.5)
+        self.declare_parameter('drive.base_frame',            'base_link')
+        self.declare_parameter('drive.cmd_vel_rate',          10.0)
+        self.declare_parameter('drive.v_linear',              0.2)
+        self.declare_parameter('drive.v_angular',             0.5)
+        self.declare_parameter('drive.kp',                    1.0)
+        self.declare_parameter('drive.ex_tolerance',          0.05)
+        self.declare_parameter('drive.ey_tolerance',          0.05)
+        self.declare_parameter('drive.ey_sign',              -1.0)
+        self.declare_parameter('drive.departure_clearance',   0.1)
+
+        # Dock instances
+        self.declare_parameter('docks.names', ['main_dock'])
+        dock_names = list(self.get_parameter('docks.names').value)
+        for name in dock_names:
+            self.declare_parameter(f'docks.{name}.type',  'simple_charging_dock')
+            self.declare_parameter(f'docks.{name}.frame', 'map')
+            self.declare_parameter(f'docks.{name}.pose',  [0.0, 0.0, 0.0])
+
+        # Plugin / controller / undocking
+        self.declare_parameter('plugin.name',                       'simple_charging_dock')
+        self.declare_parameter('plugin.staging_x_offset',          -0.7)
+        self.declare_parameter('plugin.staging_yaw_offset',         0.0)
+        self.declare_parameter('controller.base_frame',             'base_link')
+        self.declare_parameter('controller.controller_frequency',    50.0)
+        self.declare_parameter('controller.v_linear_min',            0.15)
+        self.declare_parameter('controller.v_linear_max',            0.15)
+        self.declare_parameter('controller.v_angular_max',           0.25)
+        self.declare_parameter('undocking.linear_tolerance',         0.05)
+        self.declare_parameter('undocking.angular_tolerance',        0.1)
+        self.declare_parameter('undocking.dock_backwards',           False)
 
         # Navigation
         self.declare_parameter('navigation.max_retries', 3)
@@ -181,17 +211,45 @@ class LavenderHarvestNode(Node):
         self.timing_timer_period = float(self.get_parameter('timing.timer_period').value)
         self.timing_initial_check_delay = float(self.get_parameter('timing.initial_position_check_delay').value)
 
-        # DriveConfig
+        # DriveConfig (drive.py local class, not types.DriveConfig)
         self._drive_config = DriveConfig(
+            detection_topic=str(self.get_parameter('drive.detection_topic').value),
+            no_detection_distance=float(self.get_parameter('drive.no_detection_distance').value),
             base_frame=str(self.get_parameter('drive.base_frame').value),
-            tolerance=float(self.get_parameter('drive.tolerance').value),
-            timeout=float(self.get_parameter('drive.timeout').value),
-            tf_polling_rate=float(self.get_parameter('drive.tf_polling_rate').value),
-            tf_base_frame=str(self.get_parameter('drive.tf_base_frame').value),
-            tf_detection_frame=str(self.get_parameter('drive.tf_detection_frame').value),
+            cmd_vel_rate=float(self.get_parameter('drive.cmd_vel_rate').value),
             v_linear=float(self.get_parameter('drive.v_linear').value),
             v_angular=float(self.get_parameter('drive.v_angular').value),
+            kp=float(self.get_parameter('drive.kp').value),
+            ex_tolerance=float(self.get_parameter('drive.ex_tolerance').value),
+            ey_tolerance=float(self.get_parameter('drive.ey_tolerance').value),
+            ey_sign=float(self.get_parameter('drive.ey_sign').value),
+            departure_clearance=float(self.get_parameter('drive.departure_clearance').value),
         )
+
+        # Dock / plugin / controller / undocking
+        dock_names = list(self.get_parameter('docks.names').value)
+        dock_configs: dict[str, DockInstanceConfig] = {}
+        for name in dock_names:
+            pose = list(self.get_parameter(f'docks.{name}.pose').value)
+            dock_configs[name] = DockInstanceConfig(
+                instance_name=name,
+                type=str(self.get_parameter(f'docks.{name}.type').value),
+                frame=str(self.get_parameter(f'docks.{name}.frame').value),
+                pose=DockPose(x=float(pose[0]), y=float(pose[1]), theta=float(pose[2])),
+            )
+        self.active_dock = dock_configs[dock_names[0]]
+
+        self.plugin_name        = str(self.get_parameter('plugin.name').value)
+        self.staging_x_offset   = float(self.get_parameter('plugin.staging_x_offset').value)
+        self.staging_yaw_offset = float(self.get_parameter('plugin.staging_yaw_offset').value)
+        self.base_frame           = str(self.get_parameter('controller.base_frame').value)
+        self.controller_frequency = float(self.get_parameter('controller.controller_frequency').value)
+        self.v_linear_min         = float(self.get_parameter('controller.v_linear_min').value)
+        self.v_linear_max         = float(self.get_parameter('controller.v_linear_max').value)
+        self.v_angular_max        = float(self.get_parameter('controller.v_angular_max').value)
+        self.linear_tolerance  = float(self.get_parameter('undocking.linear_tolerance').value)
+        self.angular_tolerance = float(self.get_parameter('undocking.angular_tolerance').value)
+        self.dock_backwards    = bool(self.get_parameter('undocking.dock_backwards').value)
 
         self.get_logger().info(
             f'Parameters loaded | rows={self.num_rows} | '
@@ -336,74 +394,6 @@ class LavenderHarvestNode(Node):
         self.get_logger().debug('Subscriptions initialised')
 
     # =========================================================================
-    # DOCKING CONFIG POLL
-    # =========================================================================
-
-    def _poll_docking_config(self):
-        """Poll DockingParamFetcher every 0.5s — mirrors HuskyOperationsManager."""
-        status = self._param_fetcher.get_status()
-        self.get_logger().debug(f'DockingParamFetcher poll | status={status.name}')
-
-        if status == DockingParamFetcherStatus.DONE:
-            self._config_poll_timer.cancel()
-            self._on_docking_config_ready()
-            return
-
-        if status == DockingParamFetcherStatus.ERROR:
-            elapsed = self.get_clock().now().nanoseconds / 1e9 - self._config_poll_start_time
-
-            if elapsed >= self._CONFIG_POLL_TIMEOUT_SEC:
-                self.get_logger().error(
-                    f'DockingParamFetcher failed — '
-                    f'docking_server unavailable after {self._CONFIG_POLL_TIMEOUT_SEC:.0f}s | '
-                    f'elapsed={elapsed:.1f}s — shutting down'
-                )
-                self._config_poll_timer.cancel()
-                self.destroy_node()
-                rclpy.shutdown()
-                return
-
-            self.get_logger().warning(
-                f'DockingParamFetcher ERROR — retrying | elapsed={elapsed:.1f}s / {self._CONFIG_POLL_TIMEOUT_SEC:.0f}s'
-            )
-            self._param_fetcher.reset()
-            self._param_fetcher.fetch()
-
-    def _on_docking_config_ready(self):
-        """
-        Handle DockingParamFetcher DONE event.
-
-        Initialises action clients (require DockingConfig), DriveClient,
-        TaskGenerator, and starts the main timer and initial position check.
-        """
-        self.docking_config = self._param_fetcher.get_config()
-        self.active_dock = self.docking_config.dock_configs[self.docking_config.docks[0]]
-        self.active_plugin = self.docking_config.plugin_configs[self.docking_config.dock_plugins[0]]
-
-        self.get_logger().info(
-            f"DockingConfig ready | dock='{self.active_dock.instance_name}' | plugin='{self.active_plugin.plugin_name}'"
-        )
-
-        self.navigation = NavigationActionClient(self)
-        self.docking_action_client = DockingActionClient(self)
-        self.undocking_action_client = UndockingActionClient(self)
-        self.reverse_drive_client = ReverseDriveClient(self, self.docking_config)
-        self.drive_client = DriveClient(self, self._drive_config)
-
-        # TaskGenerator handles CHARGING and UNLOADING task construction including
-        # dock parameters. No constructor args needed — dock params are hardcoded
-        # fallbacks in the generator. build_route_to_dock() returns [] if farm
-        # layout is not available (acceptable for early testing).
-        self.task_generator = TaskGenerator()
-
-        self.init_check_timer = self.create_timer(
-            self.timing_initial_position_check_delay, self._initial_position_check_timer
-        )
-        self.timer = self.create_timer(self.timing_timer_period, self.timer_callback)
-
-        self.get_logger().info('LavenderHarvestNode ready.')
-
-    # =========================================================================
     # MAIN CALLBACK METHODS
     # =========================================================================
 
@@ -513,7 +503,7 @@ class LavenderHarvestNode(Node):
         current_pos = self.pose_status.pose.pose.position
 
         distance = self._calculate_distance(
-            current_pos.x, current_pos.y, charger_dock_pose.dock_x, charger_dock_pose.dock_y
+            current_pos.x, current_pos.y, charger_dock_pose.pose.x, charger_dock_pose.pose.y
         )
 
         self.get_logger().info(
@@ -537,10 +527,6 @@ class LavenderHarvestNode(Node):
         if not self.is_initialized or self.startup_undock_complete:
             return
 
-        if self.docking_config is None:
-            self.get_logger().warning('_handle_startup_undocking called but docking_config is None')
-            return
-
         self.get_logger().debug(
             f'Startup undocking | current_status={self.current_status.name} | '
             f'reverse_drive_active={self.reverse_drive_active}'
@@ -553,9 +539,9 @@ class LavenderHarvestNode(Node):
 
         elif self.current_status == RobotStatusEnum.START_UNDOCKING:
             robot_status.task = 'Startup: Undocking'
-            dock_type = self.active_dock.type
-            staging_x_offset = self.active_plugin.staging_x_offset
-            v_linear = self.docking_config.controller_v_linear_max
+            dock_type          = self.active_dock.type
+            staging_x_offset   = self.staging_x_offset
+            v_linear           = self.v_linear_max
             max_undocking_time = (abs(staging_x_offset) / max(v_linear, 0.01)) * 1.25
 
             self.get_logger().debug(

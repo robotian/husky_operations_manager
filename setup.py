@@ -15,7 +15,6 @@ setup(
         ('share/' + package_name + '/config', glob('config/*.yaml')),
         ('share/' + package_name + '/config/test', glob('config/test/*.yaml')),
         ('share/' + package_name + '/data', glob('data/*')),
-        ('share/' + package_name + '/mesh', glob('mesh/*')),
         ('share/' + package_name + '/launch', glob('launch/*')),
     ],
     install_requires=['setuptools'],
@@ -32,23 +31,24 @@ setup(
     entry_points={
         'console_scripts': [
             'husky_operations_manager = husky_operations_manager.husky_operations_manager:main',
-
-            # Unit Test nodes
-            'reverse_navigation_node = husky_operations_manager.unit_test.test_reverse_navigation:main',
-            'docking_param_fetcher = husky_operations_manager.unit_test.test_docking_param_fetcher:main',
-            'test_harvest_ops = husky_operations_manager.unit_test.test_husky_ops_navigation:main',
-            'test_navigation_client = husky_operations_manager.unit_test.test_navigation_client:main',
-            'test_docking_client = husky_operations_manager.unit_test.test_docking_client:main',
-            'test_undocking_client = husky_operations_manager.unit_test.test_undocking_client:main',
-            'test_harvest_client = husky_operations_manager.unit_test.test_harvest_client:main',
-            'test_drive_client = husky_operations_manager.unit_test.test_drive_client:main',
-            'test_drive_v2 = husky_operations_manager.unit_test.test_drive_v2:main',
-            'test_unloader_client = husky_operations_manager.unit_test.test_unloader_client:main',
-            
             'frame_align = husky_operations_manager.frame_align:main',
 
+            # Unit Test nodes
+            'test_navigation_client = husky_operations_manager.unit_test.test_navigation_client:main',
+            'test_drive_client = husky_operations_manager.unit_test.test_drive_client:main',
+            'test_reverse_navigation = husky_operations_manager.unit_test.test_reverse_navigation:main',            
+            'test_docking_client = husky_operations_manager.unit_test.test_docking_client:main',
+            'test_undocking_client = husky_operations_manager.unit_test.test_undocking_client:main',            
+            'test_unloader_client = husky_operations_manager.unit_test.test_unloader_client:main',  
+
+            # Ops Sequence Test nodes         
+            'test_startup = husky_operations_manager.unit_test.test_startup_init:main',
+            'test_dock_unload_undock = husky_operations_manager.unit_test.test_dock_unload_undock:main',
+            
+            'test_harvest_ops = husky_operations_manager.unit_test.test_husky_ops_navigation:main',
+            'test_harvest_client = husky_operations_manager.unit_test.test_harvest_client:main',
+
             'test_lavender_harvest = husky_operations_manager.unit_test.test_lavender_harvest:main',
-            'test_husky_ops_parameter_fetch = husky_operations_manager.unit_test.test_husky_ops_parameter_fetch:main',
         ],
     },
 )

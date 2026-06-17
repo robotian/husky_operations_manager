@@ -1,132 +1,197 @@
 """
-test_drive_client.py
- 
-Standalone test node for the updated DriveClient.
- 
-Exercises the full DriveClient state machine:
-  IDLE → scan() → SCANNING → (detection) → STOPPED
-       → resume() → DEPARTING → (clearance) → SCANNING → ...
- 
-A 1Hz timer monitors DriveStatus and calls resume() when STOPPED,
-simulating a harvest activity completing instantly.
- 
-The node does NOT subscribe to ImageDetectionPose directly —
-DriveClient owns that subscription internally.
+test_drive_v2.py
+
+Standalone test node for DriveClient v2 (drive_v2.py).
+
+Simulates the parent harvesting node's interaction with DriveClient:
+  1. Calls scan() on startup — robot moves forward
+  2. DriveClient heading correction drives msg.center.y → 0 (camera centered)
+  3. DriveClient stops when |msg.center.x| <= ex_tolerance (arm level with bush)
+  4. On STOPPED — simulates 10s harvest activity then calls resume()
+  5. DriveClient departs past bush, resets controller, resumes SCANNING
+
+Parameters are hardcoded for field tuning. No YAML loading.
+
+Run:
+  ros2 run husky_operations_manager test_drive_v2 \
+    --ros-args -r __ns:=/j100_0921 -r /tf:=tf -r /tf_static:=tf_static \
+    --log-level DriveClient:=debug
 """
 
 import rclpy
-from rclpy.duration import Duration
 from rclpy.node import Node
 
-from husky_operations_manager.action_clients.drive import DriveClient, DriveConfig, DriveStatus
+from husky_operations_manager.robot_enums import DriveStatus
+from husky_operations_manager.types import DriveConfig
+from husky_operations_manager.action_clients.drive import DriveClient
 
 
-class TestDriveNode(Node):
+# =============================================================================
+# Hardcoded parameters — edit here for field tuning
+# =============================================================================
+
+DRIVE_CONFIG = DriveConfig(
+    # --- Subscriptions ---
+    detection_topic='manipulators/arm_0_detection/image_annotated/detection_pose',
+    odom_topic='ground_truth/odom',
+    # --- cmd_vel ---
+    base_frame='base_link',
+    cmd_vel_rate=10.0,  # Hz — republish rate between detections
+    # --- Stop condition ---
+    ex_tolerance=0.01,  # m — bush level with arm tolerance
+    stop_lookahead=0.05,  # m — stop 4cm before ex=0 to compensate detection drop coasting
+    # Tune to: v_linear_min * expected_drop_gap_seconds
+    # At v_linear_min=0.01m/s, 0.04m covers ~400ms drop gap
+    # --- Coast gate ---
+    ex_coast_gate=0.15,  # m — zero velocity on invalid detections within 10cm
+    # --- Angular gate ---
+    # Zero angular correction when |ex| <= ex_angular_gate.
+    # Robot drives straight for the final approach segment.
+    # Prevents yaw at the stop point.
+    ex_angular_gate=0.05,  # m — 5x ex_tolerance
+    # --- Controller gain ---
+    # Single gain on camera Y centering error (heading error signal).
+    # At ey=0.09m: angular_z = 0.5 * 0.09 = 0.045 rad/s
+    # Turn radius at v_linear_min: 0.02 / 0.045 = 0.44m — gentle curve, no orbiting
+    k_rho=0.5,
+    # --- Speed limits ---
+    v_linear_min=0.007,  # m/s — minimum speed near stop point
+    v_linear_max=0.015,  # m/s — speed at first detection
+    v_angular_max=0.15,  # rad/s — angular correction clamp
+    # Turn radius floor: 0.02/0.15 = 0.13m
+    # --- Departure ---
+    departure_clearance=0.2,  # m — distance past bush before next scan
+    # --- No-detection timeout ---
+    # Converted to time: 1.0m / 0.1m/s = 10s
+    no_detection_distance=1.0,  # m — row end assumed after this distance
+)
+
+HARVEST_SIMULATION_DURATION_SEC = 10.0  # seconds — simulated harvest activity
+
+
+# =============================================================================
+# Test Node
+# =============================================================================
+
+
+class TestDriveV2Node(Node):
     """
-    Test harness for DriveClient.
+    Test harness for DriveClient v2.
 
-    Starts scanning on boot. When DriveClient reaches STOPPED,
-    simulates instant harvest completion and calls resume().
-    Logs all status transitions at 1Hz.
+    Monitors DriveClient status at 1Hz. On STOPPED, simulates harvest
+    activity for HARVEST_SIMULATION_DURATION_SEC then calls resume().
+    Uses a one-shot ROS2 timer for harvest simulation — executor keeps
+    spinning during the wait, detection callbacks continue to fire normally.
     """
 
     def __init__(self):
-        super().__init__('test_drive_node')
+        super().__init__('test_drive_v2')
 
-        self.namespace = self.get_namespace().rstrip('/')
-        self.get_logger().info(f'Node namespace: {self.namespace}')
-
-        self._declare_parameters()
-        drive_config = self._build_drive_config()
-
-        # DriveClient owns detection subscription and TF lookup internally
-        self._drive_client = DriveClient(self, drive_config)
-
-        # Monitor status and drive the state machine forward
-        self._timer = self.create_timer(1.0, self._timer_callback)    
-
-        # Start scanning immediately
-        self._drive_client.scan()
-        self.get_logger().info('DriveClient started — SCANNING')
-
-    # =========================================================================
-    # PARAMETERS
-    # =========================================================================
-
-    def _declare_parameters(self) -> None:
-        self.declare_parameter('drive.base_frame',             'base_link')
-        self.declare_parameter('drive.v_linear',               0.2)
-        self.declare_parameter('drive.v_angular',              0.5)
-        self.declare_parameter('drive.ex_tolerance',           0.01)
-        self.declare_parameter('drive.ey_tolerance',           0.01)
-        self.declare_parameter('drive.ey_sign',                -1.0)
-        self.declare_parameter('drive.kp',                     1.0)
-        self.declare_parameter('drive.departure_clearance',    0.3)
-        self.declare_parameter('drive.no_detection_distance',  1.0)
-        self.declare_parameter('drive.detection_topic',        'sensors/camera_1/detection/image_annotated/detection_pose')
-        self.declare_parameter('drive.cmd_vel_rate',           10.0)
- 
-    def _build_drive_config(self) -> DriveConfig:
-        config = DriveConfig(
-            base_frame             = str(self.get_parameter('drive.base_frame').value),
-            v_linear               = float(self.get_parameter('drive.v_linear').value),
-            v_angular              = float(self.get_parameter('drive.v_angular').value),
-            ex_tolerance           = float(self.get_parameter('drive.ex_tolerance').value),
-            ey_tolerance           = float(self.get_parameter('drive.ey_tolerance').value),
-            ey_sign                = float(self.get_parameter('drive.ey_sign').value),
-            kp                     = float(self.get_parameter('drive.kp').value),
-            departure_clearance    = float(self.get_parameter('drive.departure_clearance').value),
-            no_detection_distance  = float(self.get_parameter('drive.no_detection_distance').value),
-            detection_topic        = str(self.get_parameter('drive.detection_topic').value),
-            cmd_vel_rate           = float(self.get_parameter('drive.cmd_vel_rate').value),
-        )
+        self._namespace = self.get_namespace().rstrip('/')
+        self.get_logger().info(f'Node namespace: {self._namespace}')
         self.get_logger().info(
-            f'DriveConfig loaded | '
-            f'v_linear={config.v_linear} v_angular={config.v_angular} | '
-            f'ex_tolerance={config.ex_tolerance}m ey_tolerance={config.ey_tolerance}m | '
-            f'ey_sign={config.ey_sign:+.1f} | '
-            f'departure_clearance={config.departure_clearance}m | '
-            f'no_detection_distance={config.no_detection_distance}m'
+            f'DriveConfig | '
+            f'v_linear=[{DRIVE_CONFIG.v_linear_min}, {DRIVE_CONFIG.v_linear_max}]m/s | '
+            f'v_angular_max={DRIVE_CONFIG.v_angular_max}rad/s | '
+            f'k_rho={DRIVE_CONFIG.k_rho} | '
+            f'ex_tolerance={DRIVE_CONFIG.ex_tolerance}m | '
+            f'stop_lookahead={DRIVE_CONFIG.stop_lookahead}m | '
+            f'ex_coast_gate={DRIVE_CONFIG.ex_coast_gate}m | '
+            f'ex_angular_gate={DRIVE_CONFIG.ex_angular_gate}m | '
+            f'odom_topic={self._namespace}/{DRIVE_CONFIG.odom_topic} | '
+            f'departure_clearance={DRIVE_CONFIG.departure_clearance}m | '
+            f'no_detection_distance={DRIVE_CONFIG.no_detection_distance}m'
         )
-        return config
 
+        self._drive_client = DriveClient(self, DRIVE_CONFIG)
+
+        # 1Hz status monitor
+        self._monitor_timer = self.create_timer(1.0, self._monitor_callback)
+
+        # One-shot harvest simulation timer — created on demand
+        self._harvest_timer = None
+        self._harvest_pending = False  # prevents multiple resume() calls per STOPPED
+
+        # Poll at 0.2s until odom is received, then call scan()
+        # Fixed delay is unreliable — odom may not arrive within any given window
+        self._start_timer = self.create_timer(0.2, self._wait_for_odom)
+        self.get_logger().info('Waiting for odom before starting scan...')
 
     # =========================================================================
-    # TIMER — status monitor and state machine driver
+    # Startup
     # =========================================================================
 
-    def _timer_callback(self) -> None:
+    def _wait_for_odom(self) -> None:
         """
-        1Hz monitor loop.
+        Poll at 0.2s until DriveClient confirms odom received, then call scan().
 
-        Logs current DriveStatus on every tick.
-        When STOPPED: calls resume() to simulate instant harvest completion.
-        When CANCELED/ERROR: logs and stops the timer.
+        Avoids fixed delay race condition — scan() is only called once odom
+        has actually been received and ey_sign can be correctly computed.
+        """
+        if not self._drive_client.is_ready():
+            self.get_logger().info('Waiting for odom...', throttle_duration_sec=1.0)
+            return
+
+        self._start_timer.cancel()
+        self._start_timer = None
+        self.get_logger().info('Odom received — calling DriveClient scan()')
+        self._drive_client.scan()
+
+    # =========================================================================
+    # Monitor callback
+    # =========================================================================
+
+    def _monitor_callback(self) -> None:
+        """
+        1Hz status monitor.
+
+        On STOPPED (and no harvest already pending) — starts the one-shot
+        harvest simulation timer.
         """
         status = self._drive_client.get_status()
         self.get_logger().info(f'DriveClient status: {status.name}')
 
-        if status == DriveStatus.STOPPED:
-            self.get_logger().info('STOPPED — simulating harvest activity complete, calling resume() after 10sec')
-            self.get_clock().sleep_for(Duration(seconds=10.0))           
-            self.get_logger().info('Resumed — simulated harvest activity.')
-            self._drive_client.resume()
+        if status == DriveStatus.STOPPED and not self._harvest_pending:
+            self._harvest_pending = True
+            self.get_logger().info(
+                f'STOPPED — starting simulated harvest | duration={HARVEST_SIMULATION_DURATION_SEC:.0f}s'
+            )
+            self._harvest_timer = self.create_timer(
+                HARVEST_SIMULATION_DURATION_SEC,
+                self._on_harvest_complete,
+            )
 
-        elif status == DriveStatus.CANCELED:
-            self.get_logger().warning('DriveClient CANCELED — stopping monitor')
-            self._timer.cancel()
+    # =========================================================================
+    # Harvest simulation
+    # =========================================================================
 
-        elif status == DriveStatus.ERROR:
-            self.get_logger().error('DriveClient ERROR — call reset() to recover')
-            self._timer.cancel()
+    def _on_harvest_complete(self) -> None:
+        """
+        Fires once after HARVEST_SIMULATION_DURATION_SEC.
+
+        Cancels the one-shot timer, clears harvest pending flag,
+        calls resume() on DriveClient.
+        """
+        if self._harvest_timer is not None:
+            self._harvest_timer.cancel()
+            self._harvest_timer = None
+
+        self._harvest_pending = False
+        self.get_logger().info('Simulated harvest complete — calling resume()')
+        self._drive_client.resume()
+
+
+# =============================================================================
+# Entry point
+# =============================================================================
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = TestDriveNode()
+    node = TestDriveV2Node()
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, SystemExit):
+    except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()

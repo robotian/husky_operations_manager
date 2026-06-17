@@ -34,6 +34,9 @@ class TestDockingNode(Node):
 
         self.get_logger().info('Test Docking Client Node Started')
 
+        self.declare_parameter('dock_id', 'husky_charger')
+        self.dock_id = str(self.get_parameter('dock_id').value)
+
         # Initialize docking action client
         self.docking_client = DockingActionClient(self)
 
@@ -57,7 +60,7 @@ class TestDockingNode(Node):
         # Build DockGoal
         dock_goal = DockGoal()
         dock_goal.use_dock_id = True
-        dock_goal.dock_id = 'husky_charger'
+        dock_goal.dock_id = self.dock_id
         dock_goal.navigate_to_staging_pose = True
 
         # Build SubTask

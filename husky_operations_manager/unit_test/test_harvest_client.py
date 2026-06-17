@@ -19,7 +19,7 @@ from rclpy.node import Node
 
 from status_interfaces.action import ManipulatorTask
 from status_interfaces.msg import SubTask
-from husky_operations_manager.robot_enums import RobotStatusEnum, ManipulatorStatus
+from husky_operations_manager.robot_enums import RobotStatusEnum
 from husky_operations_manager.action_clients.manipulator import ArmCommand, ManipulatorTaskActionClient
 
 
