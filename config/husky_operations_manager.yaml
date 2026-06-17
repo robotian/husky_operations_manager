@@ -11,11 +11,37 @@
       retry_delay: 3.0  # seconds
       threshold: 0.25  # meters - distance to consider "at dock"
 
-    # Undocking settings
+    # ── Dock instances ────────────────────────────────────────────────────────
+    docks:
+      names: [husky_charger, unloading_station]
+      husky_charger:
+        type:  simple_charging_dock
+        frame: map
+        pose:  [0.8, -1.945, 0.0]      # [x, y, theta_rad]
+      unloading_station:
+        type:  simple_charging_dock
+        frame: map
+        pose:  [0.85, 1.60, 1.571]
+
+    # ── Plugin (staging offsets) ──────────────────────────────────────────────
+    plugin:
+      name: simple_charging_dock
+      staging_x_offset:  -1.5
+      staging_yaw_offset: 0.0
+
+    # ── Controller (reverse drive motion params) ──────────────────────────────
+    controller:
+      base_frame:              base_link
+      controller_frequency:    50.0
+      v_linear_min:            0.15
+      v_linear_max:            0.15
+      v_angular_max:           0.25
+
+    # ── Undocking tolerances ──────────────────────────────────────────────────
     undocking:
-      max_retries: 2
-      retry_delay: 3.0  # seconds
-      staging_threshold: 0.05  # meters - staging area crossing threshold
+      linear_tolerance:  0.05
+      angular_tolerance: 0.1
+      dock_backwards:    false
 
     # Battery settings
     battery:

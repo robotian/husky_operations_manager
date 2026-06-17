@@ -15,7 +15,7 @@ def generate_launch_description():
     config_file = PathJoinSubstitution([pkg_share, 'config', 'husky_operations_manager.yaml'])
 
     # Declare launch arguments
-    namespace_arg = DeclareLaunchArgument('namespace', default_value='/a300_00036', description='Robot namespace')
+    namespace_arg = DeclareLaunchArgument('namespace', default_value='/a200_0284', description='Robot namespace')
 
     config_file_arg = DeclareLaunchArgument(
         'config_file', default_value=config_file, description='Path to configuration file'
@@ -28,9 +28,7 @@ def generate_launch_description():
         namespace=LaunchConfiguration('namespace'),
         name='husky_operations_manager',
         output='screen',
-        parameters=[
-            LaunchConfiguration('config_file'),
-        ],
+        parameters=[LaunchConfiguration('config_file')],
         remappings=[
             ('/tf', 'tf'),
             ('/tf_static', 'tf_static'),
