@@ -247,7 +247,7 @@ class ReverseDriveClient:
         cmd.angular.z = max(-self._ang_speed, min(self._ang_speed, self._ang_speed * (heading_error / math.pi)))
 
         robot_yaw = _yaw_from_quaternion(robot_pose.pose.orientation)
-        self.logger.info(
+        self.logger.debug(
             f'robot=({robot_pose.pose.position.x:.3f}, {robot_pose.pose.position.y:.3f}, '
             f'{math.degrees(robot_yaw):.1f}deg) | '
             f'target=({target.pose.position.x:.3f}, {target.pose.position.y:.3f}) | '
@@ -262,7 +262,7 @@ class ReverseDriveClient:
         msg.header.stamp = self.node.get_clock().now().to_msg()
         msg.header.frame_id = self.config.base_frame
         msg.twist = twist
-        self.logger.info(f'Sending msg: {msg}', throttle_duration_sec=1.0)
+        self.logger.debug(f'Sending msg: {msg}', throttle_duration_sec=1.0)
         self._cmd_vel_pub.publish(msg)
 
     # ------------------------------------------------------------------

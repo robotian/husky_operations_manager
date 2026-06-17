@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Isolated test node for the HuskyOperationsManager startup-init sequence.
 
@@ -30,7 +31,6 @@ from husky_operations_manager.types import DockInstanceConfig, DockPose, Reverse
 from husky_operations_manager.action_clients.navigation import NavigationActionClient
 from husky_operations_manager.action_clients.docking import DockingActionClient
 from husky_operations_manager.action_clients.undocking import UndockingActionClient
-from husky_operations_manager.action_clients.manipulator import ManipulatorTaskActionClient, ArmCommand
 from husky_operations_manager.action_clients.reverse_drive import ReverseDriveClient
 
 
@@ -101,7 +101,6 @@ class StartupInitTestNode(Node):
         self.navigation              = NavigationActionClient(self)
         self.docking_action_client   = DockingActionClient(self)
         self.undocking_action_client = UndockingActionClient(self)
-        self.manipulator_client      = ManipulatorTaskActionClient(self)
 
         self.get_logger().info(
             f"Clients ready | docks={list(DOCK_CONFIGS.keys())} | "
@@ -126,8 +125,6 @@ class StartupInitTestNode(Node):
         self.current_status:   RobotStatusEnum = RobotStatusEnum.IDLE
         self.previous_status:  RobotStatusEnum = RobotStatusEnum.IDLE
         self.last_undocking_subtask: SubTask | None = None
-        self.arm_stow_pending: bool = False
-        self.last_confirmed_arm_command: str = ArmCommand.UNKNOWN
 
     # =========================================================================
     # PHASE 1 — INITIAL POSITION CHECK
@@ -229,20 +226,6 @@ class StartupInitTestNode(Node):
         )
         self.last_undocking_subtask = subtask
 
-        if self.arm_stow_pending:
-            self._poll_manipulator()
-            return
-
-        if self.last_confirmed_arm_command != ArmCommand.GO_STOW:
-            if not self.arm_stow_pending:
-                self.get_logger().info("Sending arm STOW before undocking")
-                if self.manipulator_client.send_stow_goal(subtask):
-                    self.arm_stow_pending = True
-                else:
-                    self.get_logger().error("STOW goal failed — going to ERROR")
-                    self._transition(RobotStatusEnum.ERROR)
-            return
-
         self.get_logger().info(
             f"Sending undocking goal | dock_type='{self.active_dock.type}' | "
             f"max_undocking_time={max_undocking_time:.1f}s"
@@ -296,18 +279,6 @@ class StartupInitTestNode(Node):
             self.reverse_drive_active = False
             self.reverse_drive_client.reset()
             self._finish(f"Startup undocking FAILED — reverse drive {status.name}")
-
-    def _poll_manipulator(self):
-        arm_status = self.manipulator_client.get_status()
-        if self.arm_stow_pending and arm_status == RobotStatusEnum.DONE_HARVESTING:
-            self.arm_stow_pending = False
-            self.last_confirmed_arm_command = ArmCommand.GO_STOW
-            self.manipulator_client.reset()
-            self.get_logger().info("Arm STOW confirmed — proceeding with undocking")
-        elif arm_status == RobotStatusEnum.ERROR:
-            self.arm_stow_pending = False
-            self.manipulator_client.reset()
-            self._finish("Startup undocking FAILED — arm STOW error")
 
     # =========================================================================
     # HELPERS
