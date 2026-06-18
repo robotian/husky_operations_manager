@@ -124,6 +124,13 @@ class HuskyOperationsManager(Node):
         self.declare_parameter('undocking.angular_tolerance',        0.1)
         self.declare_parameter('undocking.dock_backwards',           False)
 
+        # Subscription topics (relative to namespace)
+        self.declare_parameter('topics.battery', 'platform/bms/state')
+        self.declare_parameter('topics.pose',    'ground_truth/pose')
+        self.declare_parameter('topics.imu',     'sensors/gps_0/imu')
+        self.declare_parameter('topics.estop',   'platform/emergency_stop')
+        self.declare_parameter('topics.task',    'status/task')
+
     def _get_paramters(self):
         """Read all declared parameters into instance variables."""
         self.navigation_max_retries = int(self.get_parameter('navigation.max_retries').value)
@@ -167,6 +174,13 @@ class HuskyOperationsManager(Node):
         self.linear_tolerance  = float(self.get_parameter('undocking.linear_tolerance').value)
         self.angular_tolerance = float(self.get_parameter('undocking.angular_tolerance').value)
         self.dock_backwards    = bool(self.get_parameter('undocking.dock_backwards').value)
+
+        # Subscription topics
+        self.topic_battery = str(self.get_parameter('topics.battery').value)
+        self.topic_pose    = str(self.get_parameter('topics.pose').value)
+        self.topic_imu     = str(self.get_parameter('topics.imu').value)
+        self.topic_estop   = str(self.get_parameter('topics.estop').value)
+        self.topic_task    = str(self.get_parameter('topics.task').value)
 
         self.get_logger().debug(f"Parameters loaded | "
             f"nav_retries={self.navigation_max_retries} nav_delay={self.navigation_retry_delay}s | "
@@ -272,35 +286,35 @@ class HuskyOperationsManager(Node):
         # Battery state — used for low-battery detection and charge completion checks
         self.battery_sub = self.create_subscription(
             BatteryState,
-            f'{self.namespace}/platform/bms/state',
+            f'{self.namespace}/{self.topic_battery}',
             lambda msg: setattr(self, 'battery_status', msg),
             qos_profile_sensor_data)
 
         # Ground-truth pose — used for initial dock distance check and navigation target check
         self.pose_sub = self.create_subscription(
             PoseWithCovarianceStamped,
-            f"{self.namespace}/ground_truth/pose",
+            f'{self.namespace}/{self.topic_pose}',
             self._pose_callback,
             10)
 
         # IMU — stored but not currently used in state machine logic
         self.imu_sub = self.create_subscription(
             Imu,
-            f'{self.namespace}/sensors/gps_0/imu',
+            f'{self.namespace}/{self.topic_imu}',
             lambda msg: setattr(self, 'imu_status', msg),
             qos_profile_sensor_data)
 
         # Emergency stop — mapped to online_flag in published RobotStatus
         self.estop_sub = self.create_subscription(
             Bool,
-            f'{self.namespace}/platform/emergency_stop',
+            f'{self.namespace}/{self.topic_estop}',
             lambda msg: setattr(self, 'estop_status', msg),
             qos_profile_sensor_data)
 
         # Task topic — published by JobPublisher with HARVESTING, CHARGING, or UNLOADING tasks
         self.task_sub = self.create_subscription(
             Task,
-            f'{self.namespace}/status/task',
+            f'{self.namespace}/{self.topic_task}',
             self._task_callback,
             10)
 

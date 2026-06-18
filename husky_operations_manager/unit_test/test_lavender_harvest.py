@@ -1,58 +1,28 @@
+#!/usr/bin/env python3
 """
-test_lavender_harvest.py.
+LavenderHarvestNode — combined NavigateThroughPoses + DriveClient harvesting node.
 
-Standalone integration-test node for lavender row harvesting using DriveClient
-(camera-based detection) and NavigationActionClient.
-
-Operational sequence:
-  - Boot → startup undocking (if at dock) → _need_row_navigation=True
-  - Each tick: _generate_next_task() produces the highest-priority task
-      1. Battery low             → CHARGING_TASK  (route via row_end → dock)
-      2. Load >= 100%            → UNLOADING_TASK (route via row_end → dock)
-      3. All rows complete       → CHARGING_TASK  (final charge, then idle)
-      4. Default                 → HARVESTING_TASK [MOVING, HARVESTING]
-
-_subtask_moving handles both Nav2 (when _need_row_navigation=True) and
-DriveClient (when _need_row_navigation=False) within a single MOVING subtask.
-
-_subtask_harvesting is UNCHANGED from HuskyOperationsManager — 5s simulated
-harvest timer, DESTINATION_REACHED → START_HARVESTING → HARVESTING → DONE_HARVESTING → JOB_DONE.
-
-After every JOB_DONE the task type determines what comes next:
-  HARVESTING_TASK → _need_row_navigation=False  (stay on row, resume DriveClient)
-  UNLOADING_TASK  → restore return_row/side, _need_row_navigation=True
-  CHARGING_TASK   → _need_row_navigation=True   (navigate back to current row start)
+Startup sequence:  nearest-dock selection → startup undocking (with arm STOW gate)
+                   → send task trigger to server
+Task execution:    dual-mode navigation
+                     - Nav2 (NavigateThroughPoses) for row start / dock area
+                     - DriveClient for camera-guided row traversal
+Arm control:       STOW/READY gating via ManipulatorTaskActionClient
+                   (identical pattern to husky_operations_manager.py)
+Unloading:         UnloaderActionClient  END → delay → HOME
+Task generation:   publishes trigger to server; server creates task and stores in DB
 """
 
 import math
 import time
-from enum import IntEnum
-
-from geometry_msgs.msg import PoseWithCovarianceStamped
-
-
-from husky_operations_manager.action_clients.docking import DockingActionClient
-from husky_operations_manager.action_clients.drive import DriveClient
-from husky_operations_manager.action_clients.navigation import NavigationActionClient
-from husky_operations_manager.action_clients.reverse_drive import ReverseDriveClient
-from husky_operations_manager.action_clients.undocking import UndockingActionClient
-from husky_operations_manager.action_clients.drive import DriveConfig
-from husky_operations_manager.types import DockInstanceConfig, DockPose, ReverseDriveConfig
-from husky_operations_manager.robot_enums import (
-    DriveStatus,
-    NavigationStatus,
-    OnlineFlagEnum,
-    ReverseDriveStatus,
-    RobotStatusEnum,
-)
-from husky_operations_manager.local_task_generator import TaskGenerator
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from sensor_msgs.msg import BatteryState, Imu, NavSatFix
-
+from std_msgs.msg import Bool, String
 from status_interfaces.msg import (
     ImageDetectionPose,
     RobotStatus,
@@ -61,146 +31,171 @@ from status_interfaces.msg import (
     UndockGoal,
     WayPoint,
 )
+from status_interfaces.action import OperateUnloader
 
-from std_msgs.msg import Bool
-
-
-class RowSide(IntEnum):
-    """Enumerate the two sides of a harvest row."""
-
-    A = 0
-    B = 1
-
-    def __str__(self):
-        """Return the enum member name as a string."""
-        return self.name
+from husky_operations_manager.robot_enums import (
+    DriveStatus,
+    NavigationStatus,
+    OnlineFlagEnum,
+    ReverseDriveStatus,
+    RobotStatusEnum,
+)
+from husky_operations_manager.types import (
+    DockInstanceConfig,
+    DockPose,
+    DriveConfig,
+    ReverseDriveConfig,
+)
+from husky_operations_manager.action_clients.docking import DockingActionClient
+from husky_operations_manager.action_clients.drive import DriveClient
+from husky_operations_manager.action_clients.manipulator import (
+    ArmCommand,
+    ManipulatorTaskActionClient,
+)
+from husky_operations_manager.action_clients.navigation import NavigationActionClient
+from husky_operations_manager.action_clients.reverse_drive import ReverseDriveClient
+from husky_operations_manager.action_clients.undocking import UndockingActionClient
+from husky_operations_manager.action_clients.unloader import UnloaderActionClient
 
 
 class LavenderHarvestNode(Node):
     """
-    Integration-test node for camera-guided lavender row harvesting.
+    Combined NavigateThroughPoses + DriveClient node for lavender row harvesting.
 
-    Mirrors HuskyOperationsManager architecture (same action clients, startup
-    sequence, subtask handlers, and state machine) but generates tasks
-    internally via TaskGenerator instead of receiving them from JobPublisher.
+    Startup: nearest-dock selection → startup undocking → task trigger to server
+    Task:    Nav2 to row start then DriveClient for bush-by-bush traversal
+    Arm:     STOW/READY gating around every harvest cycle and undocking
+    Unload:  UnloaderActionClient  END → delay → HOME
     """
 
     def __init__(self):
-        """Initialise the node, parameters, subscribers, publishers, and timers."""
         super().__init__('test_lavender_harvest')
 
         self.namespace = self.get_namespace().rstrip('/')
         self.get_logger().info(f'Node namespace: {self.namespace}')
 
-        self._declare_parameters()
-        self._get_parameters()
-        self._get_farm_row_parameters()
+        self._declare_parameter()
+        self._get_paramters()
         self._init_state_variables()
         self._init_sensor_data()
         self._init_subscriptions()
 
+        # Publishers
         self.robot_state_pub = self.create_publisher(RobotStatus, f'{self.namespace}/status/robot', 10)
+        self.task_trigger_pub = self.create_publisher(String, f'{self.namespace}/{self.task_trigger_topic}', 10)
 
-        self.navigation              = NavigationActionClient(self)
-        self.docking_action_client   = DockingActionClient(self)
+        # Action clients that do NOT require active_dock — built here
+        self.navigation = NavigationActionClient(self)
+        self.docking_action_client = DockingActionClient(self)
         self.undocking_action_client = UndockingActionClient(self)
-        self.reverse_drive_client    = ReverseDriveClient(self, ReverseDriveConfig(
-            dock_names=[self.active_dock.instance_name],
-            dock_configs={self.active_dock.instance_name: self.active_dock},
-            plugin_name=self.plugin_name,
-            staging_x_offset=self.staging_x_offset,
-            staging_yaw_offset=self.staging_yaw_offset,
-            base_frame=self.base_frame,
-            controller_frequency=self.controller_frequency,
-            v_linear_min=self.v_linear_min,
-            v_angular_max=self.v_angular_max,
-            linear_tolerance=self.linear_tolerance,
-            angular_tolerance=self.angular_tolerance,
-            dock_backwards=self.dock_backwards,
-        ))
-        self.drive_client = DriveClient(self, self._drive_config)
+        self.manipulator_client = ManipulatorTaskActionClient(self)
+        self.unloader_action_client = UnloaderActionClient(self)
 
-        self.task_generator = TaskGenerator()
+        # DriveClient built from YAML drive.* params
+        self.drive_client = DriveClient(
+            self,
+            DriveConfig(
+                detection_topic=self.drive_detection_topic,
+                odom_topic=self.drive_odom_topic,
+                base_frame=self.drive_base_frame,
+                cmd_vel_rate=self.drive_cmd_vel_rate,
+                ex_tolerance=self.drive_ex_tolerance,
+                stop_lookahead=self.drive_stop_lookahead,
+                ex_coast_gate=self.drive_ex_coast_gate,
+                ex_angular_gate=self.drive_ex_angular_gate,
+                k_rho=self.drive_k_rho,
+                v_linear_min=self.drive_v_linear_min,
+                v_linear_max=self.drive_v_linear_max,
+                v_angular_max=self.drive_v_angular_max,
+                departure_clearance=self.drive_departure_clearance,
+                no_detection_distance=self.drive_no_detection_distance,
+            ),
+        )
+
+        # active_dock and reverse_drive_client are resolved in _check_initial_position
+        self.active_dock: DockInstanceConfig | None = None
+        self.reverse_drive_client: ReverseDriveClient | None = None
 
         self.init_check_timer = self.create_timer(
-            self.timing_initial_check_delay, self._initial_position_check_timer
+            self.timing_initial_position_check_delay,
+            self._initial_position_check_timer,
         )
         self.timer = self.create_timer(self.timing_timer_period, self.timer_callback)
 
-        self.get_logger().info('LavenderHarvestNode ready.')
+        self.get_logger().info('LavenderHarvestNode initialised.')
 
     # =========================================================================
-    # PARAMS AND VARIABLES INITIALIZATION
+    # PARAMETERS
     # =========================================================================
 
-    def _declare_parameters(self):
-        """Declare all ROS2 parameters sourced from YAML at launch."""
-        # General
-        self.declare_parameter('num_rows', 1)
-        self.declare_parameter('no_detection_timeout', 10.0)
-        self.declare_parameter('harvest_duration', 5.0)
-        self.declare_parameter('unload_duration', 5.0)
+    def _declare_parameter(self):
+        """Declare all ROS2 parameters with defaults. Values are overridden by YAML."""
+        self.declare_parameter('navigation.max_retries', 3)
+        self.declare_parameter('navigation.retry_delay', 5.0)
+        self.declare_parameter('docking.max_retries', 2)
+        self.declare_parameter('docking.retry_delay', 3.0)
+        self.declare_parameter('docking.threshold', 0.25)
+        self.declare_parameter('battery.low_threshold', 50.0)
+        self.declare_parameter('battery.full_threshold', 99.0)
         self.declare_parameter('loading.increment', 20.0)
-
-        # DriveClient
-        self.declare_parameter('drive.detection_topic',      '/detections')
-        self.declare_parameter('drive.no_detection_distance', 0.5)
-        self.declare_parameter('drive.base_frame',            'base_link')
-        self.declare_parameter('drive.cmd_vel_rate',          10.0)
-        self.declare_parameter('drive.v_linear',              0.2)
-        self.declare_parameter('drive.v_angular',             0.5)
-        self.declare_parameter('drive.kp',                    1.0)
-        self.declare_parameter('drive.ex_tolerance',          0.05)
-        self.declare_parameter('drive.ey_tolerance',          0.05)
-        self.declare_parameter('drive.ey_sign',              -1.0)
-        self.declare_parameter('drive.departure_clearance',   0.1)
+        self.declare_parameter('unloading.home_delay_s', 2.0)
+        self.declare_parameter('timing.timer_period', 1.0)
+        self.declare_parameter('timing.initial_position_check_delay', 2.0)
 
         # Dock instances
         self.declare_parameter('docks.names', ['main_dock'])
         dock_names = list(self.get_parameter('docks.names').value)
         for name in dock_names:
-            self.declare_parameter(f'docks.{name}.type',  'simple_charging_dock')
+            self.declare_parameter(f'docks.{name}.type', 'simple_charging_dock')
             self.declare_parameter(f'docks.{name}.frame', 'map')
-            self.declare_parameter(f'docks.{name}.pose',  [0.0, 0.0, 0.0])
+            self.declare_parameter(f'docks.{name}.pose', [0.0, 0.0, 0.0])
 
-        # Plugin / controller / undocking
-        self.declare_parameter('plugin.name',                       'simple_charging_dock')
-        self.declare_parameter('plugin.staging_x_offset',          -0.7)
-        self.declare_parameter('plugin.staging_yaw_offset',         0.0)
-        self.declare_parameter('controller.base_frame',             'base_link')
-        self.declare_parameter('controller.controller_frequency',    50.0)
-        self.declare_parameter('controller.v_linear_min',            0.15)
-        self.declare_parameter('controller.v_linear_max',            0.15)
-        self.declare_parameter('controller.v_angular_max',           0.25)
-        self.declare_parameter('undocking.linear_tolerance',         0.05)
-        self.declare_parameter('undocking.angular_tolerance',        0.1)
-        self.declare_parameter('undocking.dock_backwards',           False)
+        # Plugin (staging offsets)
+        self.declare_parameter('plugin.name', 'simple_charging_dock')
+        self.declare_parameter('plugin.staging_x_offset', -1.5)
+        self.declare_parameter('plugin.staging_yaw_offset', 0.0)
 
-        # Navigation
-        self.declare_parameter('navigation.max_retries', 3)
-        self.declare_parameter('navigation.retry_delay', 5.0)
+        # Controller (reverse drive motion params)
+        self.declare_parameter('controller.base_frame', 'base_link')
+        self.declare_parameter('controller.controller_frequency', 50.0)
+        self.declare_parameter('controller.v_linear_min', 0.15)
+        self.declare_parameter('controller.v_linear_max', 0.15)
+        self.declare_parameter('controller.v_angular_max', 0.25)
 
-        # Docking
-        self.declare_parameter('docking.max_retries', 2)
-        self.declare_parameter('docking.retry_delay', 3.0)
-        self.declare_parameter('docking.threshold', 0.25)
+        # Undocking tolerances
+        self.declare_parameter('undocking.linear_tolerance', 0.05)
+        self.declare_parameter('undocking.angular_tolerance', 0.1)
+        self.declare_parameter('undocking.dock_backwards', False)
 
-        # Battery
-        self.declare_parameter('battery.low_threshold', 50.0)
-        self.declare_parameter('battery.full_threshold', 99.0)
+        # DriveClient
+        self.declare_parameter('drive.detection_topic', 'manipulators/arm_0_detection/image_annotated/detection_pose')
+        self.declare_parameter('drive.odom_topic', 'platform/odom')
+        self.declare_parameter('drive.base_frame', 'base_link')
+        self.declare_parameter('drive.cmd_vel_rate', 10.0)
+        self.declare_parameter('drive.v_linear_min', 0.05)
+        self.declare_parameter('drive.v_linear_max', 0.2)
+        self.declare_parameter('drive.v_angular_max', 0.5)
+        self.declare_parameter('drive.k_rho', 1.0)
+        self.declare_parameter('drive.ex_tolerance', 0.05)
+        self.declare_parameter('drive.stop_lookahead', 0.05)
+        self.declare_parameter('drive.ex_coast_gate', 0.1)
+        self.declare_parameter('drive.ex_angular_gate', 0.05)
+        self.declare_parameter('drive.departure_clearance', 0.3)
+        self.declare_parameter('drive.no_detection_distance', 0.5)
 
-        # Timing
-        self.declare_parameter('timing.timer_period', 1.0)
-        self.declare_parameter('timing.initial_position_check_delay', 2.0)
+        # Task trigger
+        self.declare_parameter('task.trigger_topic', 'job/trigger')
 
-    def _get_parameters(self):
+        # Subscription topics (relative to robot namespace)
+        self.declare_parameter('topics.battery', 'platform/bms/state')
+        self.declare_parameter('topics.pose', 'ground_truth/pose')
+        self.declare_parameter('topics.imu', 'sensors/gps_0/imu')
+        self.declare_parameter('topics.estop', 'platform/emergency_stop')
+        self.declare_parameter('topics.task', 'status/task')
+        self.declare_parameter('topics.detection', 'manipulators/arm_0_detection/image_annotated/detection_pose')
+
+    def _get_paramters(self):
         """Read all declared parameters into instance variables."""
-        self.num_rows = int(self.get_parameter('num_rows').value)
-        self.no_detection_timeout = float(self.get_parameter('no_detection_timeout').value)
-        self.harvest_duration = float(self.get_parameter('harvest_duration').value)
-        self.unload_duration = float(self.get_parameter('unload_duration').value)
-        self.loading_increment = float(self.get_parameter('loading.increment').value)
-
         self.navigation_max_retries = int(self.get_parameter('navigation.max_retries').value)
         self.navigation_retry_delay = float(self.get_parameter('navigation.retry_delay').value)
         self.docking_max_retries = int(self.get_parameter('docking.max_retries').value)
@@ -208,95 +203,75 @@ class LavenderHarvestNode(Node):
         self.docking_threshold = float(self.get_parameter('docking.threshold').value)
         self.battery_low_threshold = float(self.get_parameter('battery.low_threshold').value)
         self.battery_full_threshold = float(self.get_parameter('battery.full_threshold').value)
+        self.loading_increment = float(self.get_parameter('loading.increment').value)
+        self.unloading_home_delay_s = float(self.get_parameter('unloading.home_delay_s').value)
         self.timing_timer_period = float(self.get_parameter('timing.timer_period').value)
-        self.timing_initial_check_delay = float(self.get_parameter('timing.initial_position_check_delay').value)
-
-        # DriveConfig (drive.py local class, not types.DriveConfig)
-        self._drive_config = DriveConfig(
-            detection_topic=str(self.get_parameter('drive.detection_topic').value),
-            no_detection_distance=float(self.get_parameter('drive.no_detection_distance').value),
-            base_frame=str(self.get_parameter('drive.base_frame').value),
-            cmd_vel_rate=float(self.get_parameter('drive.cmd_vel_rate').value),
-            v_linear=float(self.get_parameter('drive.v_linear').value),
-            v_angular=float(self.get_parameter('drive.v_angular').value),
-            kp=float(self.get_parameter('drive.kp').value),
-            ex_tolerance=float(self.get_parameter('drive.ex_tolerance').value),
-            ey_tolerance=float(self.get_parameter('drive.ey_tolerance').value),
-            ey_sign=float(self.get_parameter('drive.ey_sign').value),
-            departure_clearance=float(self.get_parameter('drive.departure_clearance').value),
+        self.timing_initial_position_check_delay = float(
+            self.get_parameter('timing.initial_position_check_delay').value
         )
 
-        # Dock / plugin / controller / undocking
+        # Build dock configs dict — used for nearest-dock selection in _check_initial_position
         dock_names = list(self.get_parameter('docks.names').value)
-        dock_configs: dict[str, DockInstanceConfig] = {}
+        self.dock_configs: dict[str, DockInstanceConfig] = {}
         for name in dock_names:
             pose = list(self.get_parameter(f'docks.{name}.pose').value)
-            dock_configs[name] = DockInstanceConfig(
+            self.dock_configs[name] = DockInstanceConfig(
                 instance_name=name,
                 type=str(self.get_parameter(f'docks.{name}.type').value),
                 frame=str(self.get_parameter(f'docks.{name}.frame').value),
                 pose=DockPose(x=float(pose[0]), y=float(pose[1]), theta=float(pose[2])),
             )
-        self.active_dock = dock_configs[dock_names[0]]
 
-        self.plugin_name        = str(self.get_parameter('plugin.name').value)
-        self.staging_x_offset   = float(self.get_parameter('plugin.staging_x_offset').value)
+        self.plugin_name = str(self.get_parameter('plugin.name').value)
+        self.staging_x_offset = float(self.get_parameter('plugin.staging_x_offset').value)
         self.staging_yaw_offset = float(self.get_parameter('plugin.staging_yaw_offset').value)
-        self.base_frame           = str(self.get_parameter('controller.base_frame').value)
-        self.controller_frequency = float(self.get_parameter('controller.controller_frequency').value)
-        self.v_linear_min         = float(self.get_parameter('controller.v_linear_min').value)
-        self.v_linear_max         = float(self.get_parameter('controller.v_linear_max').value)
-        self.v_angular_max        = float(self.get_parameter('controller.v_angular_max').value)
-        self.linear_tolerance  = float(self.get_parameter('undocking.linear_tolerance').value)
-        self.angular_tolerance = float(self.get_parameter('undocking.angular_tolerance').value)
-        self.dock_backwards    = bool(self.get_parameter('undocking.dock_backwards').value)
 
-        self.get_logger().info(
-            f'Parameters loaded | rows={self.num_rows} | '
-            f'harvest_duration={self.harvest_duration}s '
-            f'unload_duration={self.unload_duration}s | '
+        self.base_frame = str(self.get_parameter('controller.base_frame').value)
+        self.controller_frequency = float(self.get_parameter('controller.controller_frequency').value)
+        self.v_linear_min = float(self.get_parameter('controller.v_linear_min').value)
+        self.v_linear_max = float(self.get_parameter('controller.v_linear_max').value)
+        self.v_angular_max = float(self.get_parameter('controller.v_angular_max').value)
+
+        self.linear_tolerance = float(self.get_parameter('undocking.linear_tolerance').value)
+        self.angular_tolerance = float(self.get_parameter('undocking.angular_tolerance').value)
+        self.dock_backwards = bool(self.get_parameter('undocking.dock_backwards').value)
+
+        self.drive_detection_topic = str(self.get_parameter('drive.detection_topic').value)
+        self.drive_odom_topic = str(self.get_parameter('drive.odom_topic').value)
+        self.drive_base_frame = str(self.get_parameter('drive.base_frame').value)
+        self.drive_cmd_vel_rate = float(self.get_parameter('drive.cmd_vel_rate').value)
+        self.drive_v_linear_min = float(self.get_parameter('drive.v_linear_min').value)
+        self.drive_v_linear_max = float(self.get_parameter('drive.v_linear_max').value)
+        self.drive_v_angular_max = float(self.get_parameter('drive.v_angular_max').value)
+        self.drive_k_rho = float(self.get_parameter('drive.k_rho').value)
+        self.drive_ex_tolerance = float(self.get_parameter('drive.ex_tolerance').value)
+        self.drive_stop_lookahead = float(self.get_parameter('drive.stop_lookahead').value)
+        self.drive_ex_coast_gate = float(self.get_parameter('drive.ex_coast_gate').value)
+        self.drive_ex_angular_gate = float(self.get_parameter('drive.ex_angular_gate').value)
+        self.drive_departure_clearance = float(self.get_parameter('drive.departure_clearance').value)
+        self.drive_no_detection_distance = float(self.get_parameter('drive.no_detection_distance').value)
+
+        self.task_trigger_topic = str(self.get_parameter('task.trigger_topic').value)
+
+        self.topic_battery = str(self.get_parameter('topics.battery').value)
+        self.topic_pose = str(self.get_parameter('topics.pose').value)
+        self.topic_imu = str(self.get_parameter('topics.imu').value)
+        self.topic_estop = str(self.get_parameter('topics.estop').value)
+        self.topic_task = str(self.get_parameter('topics.task').value)
+        self.topic_detection = str(self.get_parameter('topics.detection').value)
+
+        self.get_logger().debug(
+            f'Parameters loaded | '
+            f'nav_retries={self.navigation_max_retries} nav_delay={self.navigation_retry_delay}s | '
+            f'dock_retries={self.docking_max_retries} dock_delay={self.docking_retry_delay}s '
+            f'dock_threshold={self.docking_threshold}m | '
+            f'battery_low={self.battery_low_threshold}% battery_full={self.battery_full_threshold}% | '
             f'load_increment={self.loading_increment}% | '
-            f'no_detection_timeout={self.no_detection_timeout}s'
+            f'timer={self.timing_timer_period}s'
         )
 
-    def _get_farm_row_parameters(self):
-        """Declare and load per-row waypoint parameters."""
-        # Row waypoints — flat structure, indexed by row number
-        # Declares parameters for num_rows rows (driven by YAML)
-        for i in range(self.num_rows):
-            self.declare_parameter(f'row_{i}_side_a_start', [0.0, 0.0, 0.0])
-            self.declare_parameter(f'row_{i}_side_a_end', [0.0, 5.0, 0.0])
-            self.declare_parameter(f'row_{i}_side_b_start', [0.5, 5.0, 3.14])
-            self.declare_parameter(f'row_{i}_side_b_end', [0.5, 0.0, 3.14])
-
-        # Load all row waypoints into a list of dicts
-        self.row_waypoints: list[dict] = []
-        for i in range(self.num_rows):
-            self.row_waypoints.append(
-                {
-                    'side_a_start': list(self.get_parameter(f'row_{i}_side_a_start').value),
-                    'side_a_end': list(self.get_parameter(f'row_{i}_side_a_end').value),
-                    'side_b_start': list(self.get_parameter(f'row_{i}_side_b_start').value),
-                    'side_b_end': list(self.get_parameter(f'row_{i}_side_b_end').value),
-                }
-            )
-
     def _init_state_variables(self):
-        """
-        Initialise all state-tracking variables to their boot defaults.
-
-        Grouped by concern:
-          - Startup: boot sequence completion flags
-          - Robot state: current and previous RobotStatusEnum
-          - Task management: task, subtask, and index
-          - Row traversal: row index, side, and navigation routing flags
-          - Return context: row/side to return to after unloading
-          - Detection: last detection timestamp and received flag
-          - Retry counters: navigation and docking
-          - Job timers: harvesting/unloading timer state
-          - Undocking: stored subtask and task type context
-          - Reverse drive: fallback active flag
-        """
+        """Initialise all state-tracking variables to their boot defaults."""
         # --- Startup ---
         self.is_initialized = False
         self.is_at_docking_station = False
@@ -309,39 +284,16 @@ class LavenderHarvestNode(Node):
         # --- Task management ---
         self.current_task: Task | None = None
         self.current_sub_task: SubTask | None = None
-        self.current_sub_task_index: int = 0
+        self.current_sub_task_index = 0
         self.last_handled_task_id: int | None = None
         self.last_handled_task_type: int | None = None
         self.last_handled_subtask_type: int | None = None
-        self._task_counter: int = 0
-
         self.current_node_id = 0
         self.current_load_status = 0.0
-
-        # --- Row traversal ---
-        # _need_row_navigation=True  → JOB_START sends Nav2 goal first
-        # _need_row_navigation=False → JOB_START skips Nav2, DriveClient starts at DESTINATION_REACHED
-        self.current_row: int = 0
-        self.current_side: RowSide = RowSide.A
-        self._need_row_navigation: bool = True  # True at boot: navigate to row 0 start first
-        self._all_rows_complete: bool = False
-        self._harvest_complete: bool = False
-
-        # --- Return context (set when unloading is triggered) ---
-        self.return_row: int = 0
-        self.return_side: RowSide = RowSide.A
-
-        # --- Detection ---
-        self.last_detection_time: float | None = None
-        self._detection_received: bool = False
 
         # --- Retry counters ---
         self.navigation_retry_count = 0
         self.docking_retry_count = 0
-
-        # --- Job timers ---
-        self.job_start_time = None
-        self.job_duration = 0.0
 
         # --- Undocking ---
         self.last_undocking_subtask: SubTask | None = None
@@ -350,64 +302,163 @@ class LavenderHarvestNode(Node):
         # --- Reverse drive ---
         self.reverse_drive_active: bool = False
 
+        # --- Navigation routing ---
+        # True  = next HARVESTING MOVING sends Nav2 goal first
+        # False = skip Nav2, go straight to DriveClient at DESTINATION_REACHED
+        self._need_row_navigation: bool = True
+
+        # --- DriveClient detection tracking ---
+        # Reset False on each scan()/resume(); True when a valid detection arrives.
+        # Distinguishes STOPPED-at-bush from STOPPED-by-no-detection-timeout.
+        self._detection_received: bool = False
+        self.last_detection_time: float | None = None
+
+        # --- Unloader phase ---
+        # False = awaiting AT_END; True = AT_END done, now commanding HOME.
+        self._unloader_at_end: bool = False
+
+        # --- Arm state (mirrors husky_operations_manager.py) ---
+        # Boot assumption: arm configuration unknown — STOW gate fires on first undock.
+        self.last_confirmed_arm_command: str = ArmCommand.UNKNOWN
+        # True while waiting for a STOW goal to complete via _handle_manipulator.
+        self.arm_stow_pending: bool = False
+        # True while waiting for a READY goal to complete via _handle_manipulator.
+        self.arm_ready_pending: bool = False
+
         self.get_logger().debug('State variables initialised')
 
     def _init_sensor_data(self):
         """Initialise sensor data containers with empty default messages."""
         self.battery_status = BatteryState()
+        self.task = Task()
         self.gps_status = NavSatFix()
         self.pose_status = PoseWithCovarianceStamped()
         self.imu_status = Imu()
         self.estop_status = Bool()
 
     def _init_subscriptions(self):
-        """Create all ROS2 subscriptions."""
+        """Create all ROS2 subscriptions using YAML-configured topic names."""
         self.battery_sub = self.create_subscription(
             BatteryState,
-            f'{self.namespace}/platform/bms/state',
+            f'{self.namespace}/{self.topic_battery}',
             lambda msg: setattr(self, 'battery_status', msg),
             qos_profile_sensor_data,
         )
-
         self.pose_sub = self.create_subscription(
-            PoseWithCovarianceStamped, f'{self.namespace}/ground_truth/pose', self._pose_callback, 10
+            PoseWithCovarianceStamped,
+            f'{self.namespace}/{self.topic_pose}',
+            self._pose_callback,
+            10,
         )
-
         self.imu_sub = self.create_subscription(
             Imu,
-            f'{self.namespace}/sensors/gps_0/imu',
+            f'{self.namespace}/{self.topic_imu}',
             lambda msg: setattr(self, 'imu_status', msg),
             qos_profile_sensor_data,
         )
-
         self.estop_sub = self.create_subscription(
             Bool,
-            f'{self.namespace}/platform/emergency_stop',
+            f'{self.namespace}/{self.topic_estop}',
             lambda msg: setattr(self, 'estop_status', msg),
             qos_profile_sensor_data,
         )
-
-        detection_topic = f'{self.namespace}/manipulators/arm_0_detection/image_annotated/detection_pose'
-        self.detection_sub = self.create_subscription(ImageDetectionPose, detection_topic, self._detection_callback, 10)
-
-        self.get_logger().info(f'Subscribed to detection topic: {detection_topic}')
+        self.task_sub = self.create_subscription(
+            Task,
+            f'{self.namespace}/{self.topic_task}',
+            self._task_callback,
+            10,
+        )
+        self.detection_sub = self.create_subscription(
+            ImageDetectionPose,
+            f'{self.namespace}/{self.topic_detection}',
+            self._detection_callback,
+            qos_profile_sensor_data,
+        )
         self.get_logger().debug('Subscriptions initialised')
 
     # =========================================================================
-    # MAIN CALLBACK METHODS
+    # SUBSCRIPTION CALLBACKS
+    # =========================================================================
+
+    def _pose_callback(self, msg: PoseWithCovarianceStamped):
+        """Store latest ground-truth pose for dock distance checks."""
+        self.pose_status = msg
+
+    def _detection_callback(self, msg: ImageDetectionPose):
+        """Set _detection_received on valid detection — used by _subtask_moving."""
+        if msg.detection_valid:
+            self._detection_received = True
+            self.last_detection_time = self.get_clock().now().nanoseconds / 1e9
+            self.get_logger().debug(f'Detection | center=({msg.center.x:.3f}, {msg.center.y:.3f})')
+
+    def _task_callback(self, msg: Task):
+        """
+        Handle incoming Task messages from JobPublisher.
+
+        Detects new task (task_id or task_type changed) or new subtask (first subtask
+        type differs from last processed). Repeated identical publishes are no-ops.
+        """
+        subtasks_summary = [(st.sub_task_id, st.type, st.description) for st in msg.sub_tasks]
+        self.get_logger().debug(
+            f'Received task | ID: {msg.task_id} | Type: {msg.task_type} | '
+            f'Target Node: {msg.target_node_id} | SubTasks: {subtasks_summary}'
+        )
+
+        is_new_task = (
+            msg.task_id != self.last_handled_task_id
+            or self.current_task
+            and msg.task_type != self.current_task.task_type
+        )
+
+        is_new_subtask = False
+        if isinstance(msg.sub_tasks, list) and len(msg.sub_tasks) > 0:
+            first_subtask = msg.sub_tasks[0]
+            if isinstance(first_subtask, SubTask):
+                is_new_subtask = first_subtask.type != self.last_handled_subtask_type
+
+        self.get_logger().debug(
+            f'Task callback | id={msg.task_id} type={msg.task_type} | '
+            f'is_new_task={is_new_task} is_new_subtask={is_new_subtask} | '
+            f'last_task_id={self.last_handled_task_id} '
+            f'last_subtask_type={self.last_handled_subtask_type}'
+        )
+
+        if is_new_task:
+            self.get_logger().info(f'New Task: {msg.description} (ID: {msg.task_id})')
+            self.current_sub_task_index = 0
+            self.last_handled_subtask_type = None
+        elif is_new_subtask:
+            self.get_logger().info(f'New Subtask for task ID: {msg.task_id}')
+            self.current_sub_task_index = 0
+            if self.current_status == RobotStatusEnum.JOB_DONE:
+                self._transition_status(RobotStatusEnum.IDLE)
+
+        if self.last_handled_task_id is None:
+            self.current_load_status = self.task.crop_load
+
+        self.task = msg
+
+    # =========================================================================
+    # TASK TRIGGER
+    # =========================================================================
+
+    def _send_task_trigger(self):
+        """Publish a trigger to the server to generate and store the next task."""
+        msg = String()
+        msg.data = self.namespace
+        self.task_trigger_pub.publish(msg)
+        self.get_logger().info(f'Task trigger published to {self.task_trigger_topic}')
+
+    # =========================================================================
+    # MAIN TIMER CALLBACK
     # =========================================================================
 
     def timer_callback(self):
         """
-        Run the main control loop — fires at timing_timer_period (default 1Hz).
+        1 Hz control loop.
 
-        Each tick:
-          1. Build a fresh RobotStatus from current sensor readings
-          2. Route to the correct handler based on current state:
-               ERROR/ABNORMAL  → _handle_error_recovery
-               startup not done → _handle_startup_undocking
-               otherwise       → _handle_task_execution
-          3. Stamp the final status values and publish to /status/robot
+        Routes to error recovery, startup undocking, or task execution.
+        Publishes RobotStatus at the end of every tick.
         """
         robot_status = RobotStatus()
         robot_status.header.stamp = self.get_clock().now().to_msg()
@@ -418,12 +469,9 @@ class LavenderHarvestNode(Node):
         self._set_location_status(robot_status)
 
         self.get_logger().debug(
-            f'Timer tick | status={self.current_status.name} | '
-            f'row={self.current_row} side={self.current_side} | '
-            f'load={self.current_load_status:.1f}% | '
-            f'startup_done={self.startup_undock_complete} | '
-            f'need_nav={self._need_row_navigation} | '
-            f'battery={self._normalize_battery(self.battery_status.percentage):.1f}%'
+            f'Tick | status={self.current_status.name} | '
+            f'startup_undock_complete={self.startup_undock_complete} | '
+            f'reverse_drive_active={self.reverse_drive_active}'
         )
 
         if self.current_status in [RobotStatusEnum.ERROR, RobotStatusEnum.ABNORMAL]:
@@ -439,56 +487,21 @@ class LavenderHarvestNode(Node):
         self.robot_state_pub.publish(robot_status)
 
     # =========================================================================
-    # SUBSCRIPTION CALLBACKS
-    # =========================================================================
-
-    def _pose_callback(self, msg):
-        """Store latest ground-truth pose for dock distance checks."""
-        self.pose_status = msg
-
-    def _detection_callback(self, msg: ImageDetectionPose):
-        """
-        Handle an ImageDetectionPose message and stop DriveClient on detection.
-
-        On detection_valid=True:
-          - Update last_detection_time (resets no-detection timeout)
-          - If DriveClient is active, call drive_client.stop() which validates
-            TF alignment before publishing zero velocity.
-
-        On detection_valid=False: no action.
-        """
-        if not msg.detection_valid:
-            return
-
-        self.last_detection_time = self.get_clock().now().nanoseconds / 1e9
-        self._detection_received = True
-
-        self.get_logger().debug(
-            f'Detection valid | center=({msg.center.x:.3f}, {msg.center.y:.3f}, {msg.center.z:.3f})'
-        )
-
-        if self.drive_client is not None and self.drive_client.is_active():
-            self.get_logger().info('Valid detection — calling drive_client.stop()')
-            self.drive_client.stop()
-
-    # =========================================================================
-    # STARTUP AND INITIALIZATION
+    # STARTUP — INITIAL POSITION CHECK
     # =========================================================================
 
     def _initial_position_check_timer(self):
-        """Fire once after timing_initial_position_check_delay."""
+        """Fire once after initial_position_check_delay; wait for pose then check."""
         if self.pose_status is None:
             self.get_logger().warning('Waiting for pose data...')
             return
         self.init_check_timer.cancel()
-        self.check_initial_position()
+        self._check_initial_position()
 
-    def check_initial_position(self):
+    def _check_initial_position(self):
         """
-        Determine whether the robot starts at a docking station.
-
-        Sets startup_undock_complete=True if the robot is NOT at a dock so the
-        node can skip the startup undocking sequence and proceed directly to tasks.
+        Find nearest dock by Euclidean distance, build ReverseDriveClient,
+        and decide whether startup undocking is needed.
         """
         if self.is_initialized:
             return
@@ -496,34 +509,72 @@ class LavenderHarvestNode(Node):
         if not self.pose_status or not self.pose_status.pose:
             self.get_logger().warning('No pose data — retrying in 1s')
             time.sleep(1.0)
-            self.check_initial_position()
+            self._check_initial_position()
             return
 
-        charger_dock_pose = self.active_dock
-        current_pos = self.pose_status.pose.pose.position
+        pos = self.pose_status.pose.pose.position
 
-        distance = self._calculate_distance(
-            current_pos.x, current_pos.y, charger_dock_pose.pose.x, charger_dock_pose.pose.y
+        # Nearest dock by Euclidean distance (not dock_names[0])
+        nearest_dock = min(
+            self.dock_configs.values(),
+            key=lambda d: math.sqrt((pos.x - d.pose.x) ** 2 + (pos.y - d.pose.y) ** 2),
+        )
+        dist = math.sqrt((pos.x - nearest_dock.pose.x) ** 2 + (pos.y - nearest_dock.pose.y) ** 2)
+
+        self.active_dock = nearest_dock
+
+        # Build ReverseDriveClient with nearest dock at index 0
+        ordered_names = [nearest_dock.instance_name] + [n for n in self.dock_configs if n != nearest_dock.instance_name]
+        self.reverse_drive_client = ReverseDriveClient(
+            self,
+            ReverseDriveConfig(
+                dock_names=ordered_names,
+                dock_configs=self.dock_configs,
+                plugin_name=self.plugin_name,
+                staging_x_offset=self.staging_x_offset,
+                staging_yaw_offset=self.staging_yaw_offset,
+                base_frame=self.base_frame,
+                controller_frequency=self.controller_frequency,
+                v_linear_min=self.v_linear_min,
+                v_angular_max=self.v_angular_max,
+                linear_tolerance=self.linear_tolerance,
+                angular_tolerance=self.angular_tolerance,
+                dock_backwards=self.dock_backwards,
+            ),
         )
 
         self.get_logger().info(
-            f'Initial Robot position: ({current_pos.x:.3f}, {current_pos.y:.3f}), '
-            f"Dock Name: '{charger_dock_pose.instance_name}' | "
-            f'Distance to dock: {distance:.3f}m'
+            f'Position check | robot=({pos.x:.3f}, {pos.y:.3f}) | '
+            f"nearest='{nearest_dock.instance_name}' "
+            f'({nearest_dock.pose.x:.3f}, {nearest_dock.pose.y:.3f}) | '
+            f'dist={dist:.3f}m | threshold={self.docking_threshold}m'
         )
 
-        if distance <= self.docking_threshold:
+        if dist <= self.docking_threshold:
             self.is_at_docking_station = True
-            self.get_logger().info('Robot at dock - will undock before tasks')
+            self.startup_undock_complete = False
+            self.get_logger().info('Robot AT dock — startup undocking required')
         else:
             self.is_at_docking_station = False
             self.startup_undock_complete = True
-            self.get_logger().info('Robot ready for tasks')
+            self.get_logger().info('Robot NOT at dock — skipping startup undocking')
+            self._send_task_trigger()
 
         self.is_initialized = True
 
+    # =========================================================================
+    # STARTUP — UNDOCKING STATE MACHINE
+    # =========================================================================
+
     def _handle_startup_undocking(self, robot_status: RobotStatus):
-        """Drive the startup undocking state machine — mirrors HuskyOperationsManager."""
+        """
+        Drive startup undocking state machine (called while startup_undock_complete=False).
+
+        Tick 1 (IDLE):            → START_UNDOCKING
+        Tick 2 (START_UNDOCKING): call _handle_manipulator if arm_stow_pending,
+                                  then call _subtask_undocking (which has STOW gate)
+        Tick 3+ (else):           poll undocking or reverse drive
+        """
         if not self.is_initialized or self.startup_undock_complete:
             return
 
@@ -539,20 +590,31 @@ class LavenderHarvestNode(Node):
 
         elif self.current_status == RobotStatusEnum.START_UNDOCKING:
             robot_status.task = 'Startup: Undocking'
-            dock_type          = self.active_dock.type
-            staging_x_offset   = self.staging_x_offset
-            v_linear           = self.v_linear_max
+
+            dock_type = self.active_dock.type
+            staging_x_offset = self.staging_x_offset
+            v_linear = self.v_linear_max
             max_undocking_time = (abs(staging_x_offset) / max(v_linear, 0.01)) * 1.25
 
             self.get_logger().debug(
-                f"Startup UndockGoal | dock_type='{dock_type}' | max_undocking_time={max_undocking_time:.1f}s"
+                f"Startup UndockGoal | dock_type='{dock_type}' | "
+                f'staging_x_offset={staging_x_offset} | '
+                f'max_undocking_time={max_undocking_time:.1f}s'
             )
 
             startup_subtask = SubTask()
             startup_subtask.type = SubTask.UNDOCKING
             startup_subtask.description = 'Startup Undocking'
-            startup_subtask.undock_goal = UndockGoal(dock_type=dock_type, max_undocking_time=max_undocking_time)
+            startup_subtask.undock_goal = UndockGoal(
+                dock_type=dock_type,
+                max_undocking_time=max_undocking_time,
+            )
             self.last_undocking_subtask = startup_subtask
+
+            # Poll manipulator during startup so the STOW gate can be cleared
+            if self.arm_stow_pending:
+                self._handle_manipulator(robot_status)
+
             self._subtask_undocking()
 
         else:
@@ -567,35 +629,24 @@ class LavenderHarvestNode(Node):
 
     def _handle_task_execution(self, robot_status: RobotStatus):
         """
-        Handle task execution — called from timer_callback when startup_undock_complete is True.
+        Main task loop — called from timer_callback when startup is complete and
+        status is not ERROR/ABNORMAL.
 
-        Called only when status is not ERROR/ABNORMAL.
-
-        Changes from HuskyOperationsManager:
-          1. No task from JobPublisher — call _generate_next_task() when no current_task.
-          2. Battery check done inline; clears current_task instead of going ERROR.
-          3. _handle_task_start at JOB_DONE sets _need_row_navigation based on task type.
+        Each tick:
+          1. Validate task — go IDLE if absent
+          2. Battery check — interrupt on low battery
+          3. Process action clients (nav/dock/undock/reverse-drive/arm)
+          4. Refresh current_sub_task
+          5. Route: IDLE/JOB_DONE → _handle_task_start; else → _execute_current_subtask
         """
-        # CHANGE 1: Generate task internally when none is active
-        if not self.current_task:
-            self._generate_next_task()
-            if not self.current_task:
-                if self.current_status != RobotStatusEnum.IDLE:
-                    self._transition_status(RobotStatusEnum.IDLE)
-                return
+        if not self.task or not self.task.description or not self.task.job_schedule:
+            if self.current_status != RobotStatusEnum.IDLE:
+                self._transition_status(RobotStatusEnum.IDLE)
+            return
 
-        # CHANGE 2: Battery check — cancel active motion, clear task so
-        # next tick generates a CHARGING_TASK (priority 1 in _generate_next_task)
-        battery_pct = self._normalize_battery(self.battery_status.percentage)
-        if self.current_task.task_type != Task.CHARGING_TASK and battery_pct <= self.battery_low_threshold:
-            self.get_logger().warning(
-                f'Battery low: {battery_pct:.1f}% — '
-                f'threshold={self.battery_low_threshold}% | '
-                f'task_type={self.current_task.task_type} | '
-                f'status={self.current_status.name}'
-            )
-            self._cancel_all_motion()
-            self.current_task = None
+        self.current_task = self.task
+
+        if self._check_and_handle_low_battery():
             return
 
         self._process_action_clients(robot_status)
@@ -619,103 +670,42 @@ class LavenderHarvestNode(Node):
         else:
             self._execute_current_subtask()
 
-    def _generate_next_task(self):
+    def _check_and_handle_low_battery(self) -> bool:
         """
-        Select and build the highest-priority task.
+        Interrupt task on low battery. Returns True when caller should skip the tick.
 
-        Priority order (highest to lowest):
-          1. Battery low                → CHARGING_TASK via row_end route
-          2. Load >= 100%               → UNLOADING_TASK via row_end route
-          3. All rows complete          → CHARGING_TASK (final charge, then idle)
-          4. Default                    → HARVESTING_TASK [MOVING, HARVESTING]
+        Non-CHARGING task with low battery → cancel navigation → ERROR
+        ERROR with CHARGING_TASK → clear error, IDLE (bypass _handle_error_recovery)
         """
-        if self._harvest_complete:
-            self.get_logger().info('All rows harvested and final charging done — staying IDLE.')
-            return
+        if not self.task or not self.current_task:
+            return False
 
         battery_pct = self._normalize_battery(self.battery_status.percentage)
 
-        # Priority 1: Low battery — charge via row_end to avoid reversing over unvisited row
-        if battery_pct <= self.battery_low_threshold and not self._all_rows_complete:
-            self.get_logger().info(f'Battery low ({battery_pct:.1f}%) — generating CHARGING_TASK')
-            self._need_row_navigation = True
-            row = self.row_waypoints[self.current_row]
-            end = row['side_a_end' if self.current_side == RowSide.A else 'side_b_end']
-            self.current_task = self.task_generator.generate_charging_task(end[0], end[1])
-            if self.current_task is None:
-                self.get_logger().error('CHARGING_TASK routing failed — no path to staging area')
-            return
-
-        # Priority 2: Full load — unload via row_end
-        if self.current_load_status >= 100.0:
-            self.get_logger().info(f'Load full ({self.current_load_status:.1f}%) — generating UNLOADING_TASK')
-            self.return_row = self.current_row
-            self.return_side = self.current_side
-            self._need_row_navigation = True
-            row = self.row_waypoints[self.current_row]
-            end = row['side_a_end' if self.current_side == RowSide.A else 'side_b_end']
-            self.current_task = self.task_generator.generate_unloading_task(end[0], end[1])
-            if self.current_task is None:
-                self.get_logger().error('UNLOADING_TASK routing failed — no path to staging area')
-            return
-
-        # Priority 3: All rows complete — final charging
-        if self._all_rows_complete:
-            self.get_logger().info('All rows complete — generating final CHARGING_TASK')
-            self._all_rows_complete = False
-            self._harvest_complete = True
-            self._need_row_navigation = True
-            robot_x = self.pose_status.pose.pose.position.x
-            robot_y = self.pose_status.pose.pose.position.y
-            self.current_task = self.task_generator.generate_charging_task(robot_x, robot_y)
-            if self.current_task is None:
-                self.get_logger().error('Final CHARGING_TASK routing failed — no path to staging area')
-            return
-
-        # Default: drive row with DriveClient, harvest detected bush
-        self._task_counter += 1
-        robot_x = self.pose_status.pose.pose.position.x
-        robot_y = self.pose_status.pose.pose.position.y
-        self.current_task = self.task_generator.generate_harvest_task(
-            self._task_counter, robot_x, robot_y, self._need_row_navigation
-        )
-        if self.current_task is None:
-            self.get_logger().error('HARVESTING_TASK routing failed — no path to harvest row')
-            return
-
-        self.get_logger().info(
-            f'Generated HARVESTING_TASK | '
-            f'row={self.current_row} side={self.current_side} | '
-            f'need_nav={self._need_row_navigation} | '
-            f'task_id={self._task_counter}'
-        )
-
-    def _advance_row(self):
-        """
-        Advance to the next row or side after no-detection timeout.
-
-        Side A done → Side B, _need_row_navigation=True
-        Side B done, rows remaining → next row Side A, _need_row_navigation=True
-        Side B done, last row → _all_rows_complete=True
-        """
-        if self.current_side == RowSide.A:
-            self.get_logger().info(f'Row {self.current_row} Side A complete → advancing to Side B')
-            self.current_side = RowSide.B
-            self._need_row_navigation = True
-
-        elif self.current_row < self.num_rows - 1:
-            self.get_logger().info(
-                f'Row {self.current_row} Side B complete → advancing to Row {self.current_row + 1} Side A'
+        if self.task.task_type != Task.CHARGING_TASK and battery_pct <= self.battery_low_threshold:
+            self.get_logger().warning(
+                f'Battery low: {battery_pct:.1f}% — '
+                f'threshold={self.battery_low_threshold}% | '
+                f'task_type={self.task.task_type} | status={self.current_status.name}'
             )
-            self.current_row += 1
-            self.current_side = RowSide.A
-            self._need_row_navigation = True
+            if self.current_status in [RobotStatusEnum.START_MOVING, RobotStatusEnum.MOVING]:
+                self.navigation.cancel_goal()
+            self._transition_status(RobotStatusEnum.ERROR)
+            return True
 
-        else:
-            self.get_logger().info(f'Row {self.current_row} Side B complete — all rows done')
-            self._all_rows_complete = True
+        if self.current_status == RobotStatusEnum.ERROR and self.current_task.task_type == Task.CHARGING_TASK:
+            self.get_logger().info(f'Recovering from low battery — CHARGING_TASK received | battery={battery_pct:.1f}%')
+            self._transition_status(RobotStatusEnum.IDLE)
+
+        return False
 
     def _process_action_clients(self, robot_status: RobotStatus):
+        """
+        Poll all active action clients each tick.
+
+        Priority: navigation → docking → undocking → reverse drive
+        Arm manipulator is polled independently (runs in parallel with motion).
+        """
         nav_status = self.navigation.get_navigation_status()
         dock_status = self.docking_action_client.get_status()
         undock_status = self.undocking_action_client.get_status()
@@ -724,7 +714,9 @@ class LavenderHarvestNode(Node):
             f'Action clients | nav={nav_status.name} | '
             f'dock={dock_status.name} | '
             f'undock={undock_status.name} | '
-            f'reverse_drive_active={self.reverse_drive_active}'
+            f'reverse_drive_active={self.reverse_drive_active} | '
+            f'arm_stow_pending={self.arm_stow_pending} | '
+            f'arm_ready_pending={self.arm_ready_pending}'
         )
 
         if nav_status != NavigationStatus.IDLE:
@@ -736,8 +728,17 @@ class LavenderHarvestNode(Node):
         elif self.reverse_drive_active:
             self._handle_reverse_drive(robot_status)
 
+        # Arm polled independently — its completion unblocks harvesting and undocking flows
+        arm_harvest_active = (
+            self.current_status == RobotStatusEnum.HARVESTING
+            and not self.arm_stow_pending
+            and not self.arm_ready_pending
+        )
+        if self.arm_stow_pending or self.arm_ready_pending or arm_harvest_active:
+            self._handle_manipulator(robot_status)
+
     def _update_current_subtask(self):
-        """Refresh current_sub_task from sub_tasks list using current_sub_task_index."""
+        """Refresh current_sub_task from sub_tasks[current_sub_task_index]."""
         if not self.current_task:
             return
 
@@ -755,15 +756,16 @@ class LavenderHarvestNode(Node):
 
     def _handle_task_start(self):
         """
-        Initialise a new task or handle task completion at JOB_DONE.
+        Initialise a new task or clear a completed one.
 
-        New task (task_id or task_type changed):
-          - Cache task identifiers, clear undocking state, → JOB_START
+        New task (id/type changed):
+          - Update _need_row_navigation based on last task type
+          - Cache new task identifiers, clear undocking state, → JOB_START
+          - Send task trigger after CHARGING/UNLOADING task completes (return to row)
 
-        CHANGE 3: At JOB_DONE, set _need_row_navigation based on completed task type:
-          HARVESTING_TASK → False  (resume same row with DriveClient)
-          UNLOADING_TASK  → True + restore return context
-          CHARGING_TASK   → True   (navigate back to row after charging)
+        Same task, JOB_DONE:
+          - If HARVESTING_TASK: _need_row_navigation = False (resume row on next subtask)
+          - → IDLE, clear current_task, send trigger for next task
         """
         if not self.current_task:
             return
@@ -772,53 +774,49 @@ class LavenderHarvestNode(Node):
             self.current_task.task_id != self.last_handled_task_id
             or self.current_task.task_type != self.last_handled_task_type
         ):
-            self.get_logger().info(f'Starting Task: {self.current_task.description} | ID: {self.current_task.task_id}')
+            self.get_logger().info(
+                f'Starting Task: {self.current_task.description} | '
+                f'ID: {self.current_task.task_id} | '
+                f'Current Node: {self.current_node_id} | '
+                f'Target Node: {self.current_task.target_node_id}'
+            )
             self.get_logger().debug(
                 f'Task start | task_type={self.current_task.task_type} | '
                 f'last_task_id={self.last_handled_task_id} | '
-                'num_subtasks='
-                f'{len(self.current_task.sub_tasks) if isinstance(self.current_task.sub_tasks, list) else 0}'
+                f'last_task_type={self.last_handled_task_type}'
             )
+
+            # Update _need_row_navigation: returning from dock requires Nav2 back to row
+            if self.last_handled_task_type in (Task.CHARGING_TASK, Task.UNLOADING_TASK):
+                self._need_row_navigation = True
+            # HARVESTING → HARVESTING: keep current value (set by _subtask_moving)
+
             self.last_handled_task_id = self.current_task.task_id
             self.last_handled_task_type = self.current_task.task_type
             self.last_handled_subtask_type = None
             self.last_undocking_subtask = None
             self.undocking_after_task_type = None
-            self.current_sub_task_index = 0
             self._transition_status(RobotStatusEnum.JOB_START)
 
         elif self.current_status == RobotStatusEnum.JOB_DONE:
-            task_type = self.current_task.task_type
-
-            if task_type == Task.HARVESTING_TASK:
-                # Stay on same row — DriveClient resumes without Nav2
+            # Same task still publishing — consecutive subtask (e.g. next bush)
+            if self.current_task.task_type == Task.HARVESTING_TASK:
+                # Next subtask continues the row — DriveClient resumes, no Nav2
                 self._need_row_navigation = False
-                self.get_logger().debug(
-                    f'HARVESTING JOB_DONE — resuming row {self.current_row} side {self.current_side}'
-                )
-            elif task_type == Task.UNLOADING_TASK:
-                self.current_row = self.return_row
-                self.current_side = self.return_side
+            elif self.current_task.task_type in (Task.CHARGING_TASK, Task.UNLOADING_TASK):
                 self._need_row_navigation = True
-                self.get_logger().info(
-                    f'UNLOADING JOB_DONE — returning to row {self.return_row} side {self.return_side}'
-                )
-            elif task_type == Task.CHARGING_TASK:
-                # Navigate back to the current row after charging
-                self._need_row_navigation = True
-                self.get_logger().debug(
-                    f'CHARGING JOB_DONE — navigating to row {self.current_row} side {self.current_side}'
-                )
 
+            self.get_logger().debug(
+                f'JOB_DONE — same task still publishing | task_id={self.current_task.task_id} — transitioning to IDLE'
+            )
             self._transition_status(RobotStatusEnum.IDLE)
             self.current_task = None
+            self._send_task_trigger()
 
     def _execute_current_subtask(self):
         """Route to the correct subtask handler based on current_sub_task.type."""
         if not isinstance(self.current_sub_task, SubTask):
-            self.get_logger().debug(
-                f'_execute_current_subtask called but no valid subtask | status={self.current_status.name}'
-            )
+            self.get_logger().debug(f'_execute_current_subtask — no valid subtask | status={self.current_status.name}')
             return
 
         if self.current_sub_task.type != self.last_handled_subtask_type:
@@ -831,6 +829,7 @@ class LavenderHarvestNode(Node):
             SubTask.DOCKING: self._subtask_docking,
             SubTask.CHARGING: self._subtask_charging,
             SubTask.UNLOADING: self._subtask_unloading,
+            SubTask.UNDOCKING: self._subtask_undocking,
         }
 
         handler = task_handler_map.get(self.current_sub_task.type)
@@ -840,11 +839,18 @@ class LavenderHarvestNode(Node):
             self.get_logger().warning(f'Unknown subtask type: {self.current_sub_task.type} — no handler registered')
 
     # =========================================================================
-    # ACTION CLIENT HANDLERS — mirrors HuskyOperationsManager
+    # ACTION CLIENT HANDLERS
     # =========================================================================
 
     def _handle_navigation(self, robot_status: RobotStatus):
-        """Monitor NavigationActionClient and update RobotStatus."""
+        """
+        Monitor NavigationActionClient.
+
+        ACTIVE    → MOVING
+        SUCCEEDED → reset, update node, → DESTINATION_REACHED
+        ABORTED/ERROR → retry logic
+        CANCELED  → reset, → IDLE
+        """
         nav_status = self.navigation.get_navigation_status()
         wpf_status = self.navigation.get_current_status()
 
@@ -859,6 +865,7 @@ class LavenderHarvestNode(Node):
 
         self.get_logger().debug(
             f'Navigation handler | nav_status={nav_status.name} | '
+            f'current_node={self.current_node_id} | '
             f'retry_count={self.navigation_retry_count}/{self.navigation_max_retries}'
         )
 
@@ -882,7 +889,7 @@ class LavenderHarvestNode(Node):
             self._transition_status(RobotStatusEnum.IDLE)
 
     def _handle_navigation_retry(self):
-        """Retry NavigateThroughPoses up to navigation_max_retries."""
+        """Retry NavigateThroughPoses up to navigation_max_retries, then ERROR."""
         self.get_logger().warning(
             f'Navigation failed | retry {self.navigation_retry_count + 1}/{self.navigation_max_retries}'
         )
@@ -918,7 +925,7 @@ class LavenderHarvestNode(Node):
 
         nav_status = self.navigation.get_navigation_status()
         if nav_status in [NavigationStatus.ACTIVE, NavigationStatus.SENDING]:
-            self.get_logger().warning(f'Navigation still active ({nav_status.name}) — skipping retry until complete')
+            self.get_logger().warning(f'Navigation still active ({nav_status.name}) — skipping retry')
             return
 
         self.navigation.reset()
@@ -931,13 +938,18 @@ class LavenderHarvestNode(Node):
             self._transition_status(RobotStatusEnum.ERROR)
 
     def _handle_docking(self, robot_status: RobotStatus):
-        """Monitor DockingActionClient and update RobotStatus."""
+        """
+        Monitor DockingActionClient.
+
+        DOCKING      → DOCKING
+        DONE_DOCKING → reset, → DONE_DOCKING
+        ERROR        → retry
+        """
         status = self.docking_action_client.get_status()
         feedback = self.docking_action_client.get_feedback()
 
         if feedback:
             robot_status.task = feedback.task
-            robot_status.current_node_id = self.current_node_id
         else:
             robot_status.task = 'Docking in progress'
 
@@ -959,22 +971,19 @@ class LavenderHarvestNode(Node):
             self._handle_docking_retry()
 
     def _handle_docking_retry(self):
-        """Retry dock_robot goal up to docking_max_retries, then go to ERROR."""
-        dock_id = (
-            self.current_sub_task.dock_goal.dock_id
-            if self.current_sub_task and self.current_sub_task.dock_goal
-            else 'unknown'
-        )
-        self.get_logger().error(
-            f"Docking failed | retry {self.docking_retry_count + 1}/{self.docking_max_retries} | dock_id='{dock_id}'"
-        )
+        """Retry dock_robot goal up to docking_max_retries, then ERROR."""
+        self.get_logger().error(f'Docking failed | retry {self.docking_retry_count + 1}/{self.docking_max_retries}')
 
         if self.docking_retry_count < self.docking_max_retries:
             self.docking_retry_count += 1
+            self.get_logger().info(
+                f'Retrying docking in {self.docking_retry_delay:.1f}s | '
+                f'attempt {self.docking_retry_count}/{self.docking_max_retries}'
+            )
             time.sleep(self.docking_retry_delay)
             self._retry_docking()
         else:
-            self.get_logger().error(f'Docking failed after {self.docking_max_retries} retries — transitioning to ERROR')
+            self.get_logger().error(f'Docking failed after {self.docking_max_retries} retries — ERROR')
             self.docking_action_client.reset()
             self._transition_status(RobotStatusEnum.ERROR)
             self.docking_retry_count = 0
@@ -984,6 +993,7 @@ class LavenderHarvestNode(Node):
         if not self.current_sub_task:
             self.get_logger().error('Docking retry failed — no current subtask')
             return
+
         if self.docking_action_client.send_docking_goal(self.current_sub_task):
             self._transition_status(RobotStatusEnum.DOCKING)
         else:
@@ -992,21 +1002,18 @@ class LavenderHarvestNode(Node):
 
     def _handle_undocking(self, robot_status: RobotStatus):
         """
-        Monitor UndockingActionClient and update RobotStatus.
+        Monitor UndockingActionClient.
 
-        Context-aware DONE_UNDOCKING handling:
-          startup context (startup_undock_complete=False):
-            Set startup_undock_complete=True, clear task IDs, → IDLE
-          task context (startup_undock_complete=True):
-            Stay at DONE_UNDOCKING — _subtask_charging or _subtask_unloading
-            will call _subtask_undocking on the next tick → JOB_DONE.
+        Context-aware DONE_UNDOCKING:
+          startup context → startup_undock_complete=True, clear task IDs, → IDLE,
+                            send task trigger (request first task)
+          task context    → stay at DONE_UNDOCKING for _subtask_undocking → JOB_DONE
         """
         status = self.undocking_action_client.get_status()
         feedback = self.undocking_action_client.get_feedback()
 
         if feedback:
             robot_status.task = feedback.task
-            robot_status.current_node_id = self.current_node_id
         else:
             robot_status.task = 'Undocking in progress'
 
@@ -1023,12 +1030,13 @@ class LavenderHarvestNode(Node):
             self.undocking_action_client.reset()
 
             if not self.startup_undock_complete:
-                self.get_logger().debug('Undocking DONE — startup context: setting startup_undock_complete=True → IDLE')
+                self.get_logger().debug('Undocking DONE — startup context: → IDLE, sending task trigger')
                 self.startup_undock_complete = True
                 self.last_handled_task_id = None
                 self.last_handled_task_type = None
                 self._transition_status(RobotStatusEnum.IDLE)
-                self.get_logger().info('Robot ready for tasks')
+                self.get_logger().info('Startup undocking complete — requesting first task')
+                self._send_task_trigger()
             else:
                 self.get_logger().debug(
                     'Undocking DONE — task context: staying at DONE_UNDOCKING for _subtask_undocking'
@@ -1038,22 +1046,26 @@ class LavenderHarvestNode(Node):
             self._handle_undocking_retry()
 
     def _handle_undocking_retry(self):
-        """Start ReverseDriveClient as undocking fallback."""
+        """Undocking action failed — start ReverseDriveClient as fallback."""
         self.undocking_action_client.reset()
         self.get_logger().warning(
-            f'Undocking failed — starting reverse drive to staging pose | '
+            f'Undocking failed — starting reverse drive | '
             f"dock='{self.active_dock.instance_name if self.active_dock else 'unknown'}'"
         )
 
-        if self.reverse_drive_client.drive_to_staging():
+        if self.reverse_drive_client and self.reverse_drive_client.drive_to_staging():
             self.reverse_drive_active = True
             self._transition_status(RobotStatusEnum.UNDOCKING)
         else:
-            self.get_logger().error('ReverseDriveClient refused to start — transitioning to ERROR')
+            self.get_logger().error(f'ReverseDriveClient refused to start — dock_backwards={self.dock_backwards}')
             self._transition_status(RobotStatusEnum.ERROR)
 
     def _handle_reverse_drive(self, robot_status: RobotStatus):
-        """Monitor ReverseDriveClient — context-aware, mirrors HuskyOperationsManager."""
+        """
+        Monitor ReverseDriveClient (fallback after undocking failure).
+
+        Same context-aware logic as _handle_undocking for the DONE branch.
+        """
         robot_status.task = 'Reverse drive to staging pose'
         status = self.reverse_drive_client.get_status()
 
@@ -1070,52 +1082,159 @@ class LavenderHarvestNode(Node):
             self.reverse_drive_client.reset()
 
             if not self.startup_undock_complete:
+                self.get_logger().debug('Reverse drive DONE — startup context: → IDLE, sending task trigger')
                 self.startup_undock_complete = True
                 self.last_handled_task_id = None
                 self.last_handled_task_type = None
                 self._transition_status(RobotStatusEnum.DONE_UNDOCKING)
                 self._transition_status(RobotStatusEnum.IDLE)
-                self.get_logger().info('Robot ready for tasks')
+                self.get_logger().info('Startup undocking complete — requesting first task')
+                self._send_task_trigger()
             else:
+                self.get_logger().debug('Reverse drive DONE — task context: DONE_UNDOCKING for _subtask_undocking')
                 self._transition_status(RobotStatusEnum.DONE_UNDOCKING)
 
         elif status == ReverseDriveStatus.ERROR:
-            self.get_logger().error('Reverse drive failed — transitioning to ERROR')
+            self.get_logger().error('Reverse drive failed — ERROR')
             self.reverse_drive_active = False
             self.reverse_drive_client.reset()
             self._transition_status(RobotStatusEnum.ERROR)
 
         elif status == ReverseDriveStatus.CANCELED:
-            self.get_logger().warning('Reverse drive canceled — transitioning to IDLE')
+            self.get_logger().warning('Reverse drive canceled — IDLE')
             self.reverse_drive_active = False
             self.reverse_drive_client.reset()
             self._transition_status(RobotStatusEnum.IDLE)
+
+    def _handle_manipulator(self, robot_status: RobotStatus):
+        """
+        Monitor ManipulatorTaskActionClient for STOW, READY, or START_HARVEST goals.
+
+        Verbatim from husky_operations_manager.py:1226-1337.
+
+        Context-aware completion:
+          STOW confirmed in START_UNDOCKING   → re-enter _subtask_undocking
+          STOW confirmed in DONE_HARVESTING   → no-op (_subtask_harvesting picks up next tick)
+          READY confirmed in DESTINATION_REACHED → no-op (_subtask_harvesting picks up next tick)
+          Harvest complete (HARVESTING, no flags) → DONE_HARVESTING
+          ERROR → clear flags, reset, → ERROR
+        """
+        arm_status = self.manipulator_client.get_status()
+
+        self.get_logger().debug(
+            f'Manipulator handler | arm_status={arm_status.name} | '
+            f'current_status={self.current_status.name} | '
+            f'arm_stow_pending={self.arm_stow_pending} | '
+            f'arm_ready_pending={self.arm_ready_pending} | '
+            f"last_confirmed_arm='{self.last_confirmed_arm_command}'"
+        )
+
+        # ---- STOW completion ----
+        if self.arm_stow_pending and arm_status == RobotStatusEnum.DONE_HARVESTING:
+            self.get_logger().info(f'Arm STOW confirmed | context={self.current_status.name}')
+            self.arm_stow_pending = False
+            self.last_confirmed_arm_command = ArmCommand.GO_STOW
+            self.manipulator_client.reset()
+
+            if self.current_status == RobotStatusEnum.START_UNDOCKING:
+                self.get_logger().debug('STOW confirmed in START_UNDOCKING — re-entering _subtask_undocking')
+                self._subtask_undocking()
+            elif self.current_status == RobotStatusEnum.DONE_HARVESTING:
+                self.get_logger().debug(
+                    'STOW confirmed in DONE_HARVESTING — _subtask_harvesting will advance to JOB_DONE on next tick'
+                )
+            else:
+                self.get_logger().warning(
+                    f'STOW confirmed in unexpected context={self.current_status.name} — no action taken'
+                )
+
+        # ---- READY completion ----
+        elif self.arm_ready_pending and arm_status == RobotStatusEnum.DONE_HARVESTING:
+            self.get_logger().info(f'Arm READY confirmed | context={self.current_status.name}')
+            self.arm_ready_pending = False
+            self.last_confirmed_arm_command = ArmCommand.GO_READY
+            self.manipulator_client.reset()
+
+            if self.current_status == RobotStatusEnum.DESTINATION_REACHED:
+                self.get_logger().debug(
+                    'READY confirmed in DESTINATION_REACHED — '
+                    '_subtask_harvesting will advance to START_HARVESTING on next tick'
+                )
+            else:
+                self.get_logger().warning(
+                    f'READY confirmed in unexpected context={self.current_status.name} — no action taken'
+                )
+
+        # ---- Harvest completion (START_HARVEST goal succeeded) ----
+        elif (
+            not self.arm_stow_pending
+            and not self.arm_ready_pending
+            and arm_status == RobotStatusEnum.DONE_HARVESTING
+            and self.current_status == RobotStatusEnum.HARVESTING
+        ):
+            self.get_logger().info('Harvest goal complete — transitioning to DONE_HARVESTING')
+            self.manipulator_client.reset()
+            self._transition_status(RobotStatusEnum.DONE_HARVESTING)
+
+        # ---- ERROR ----
+        elif arm_status == RobotStatusEnum.ERROR:
+            self.get_logger().error(
+                f'Arm command failed | context={self.current_status.name} | '
+                f'stow_pending={self.arm_stow_pending} | '
+                f'ready_pending={self.arm_ready_pending}'
+            )
+            self.arm_stow_pending = False
+            self.arm_ready_pending = False
+            self.manipulator_client.reset()
+            self._transition_status(RobotStatusEnum.ERROR)
 
     # =========================================================================
     # ERROR HANDLING
     # =========================================================================
 
     def _handle_error_recovery(self):
-        """Cancel active navigation and reset to IDLE — mirrors HuskyOperationsManager."""
+        """Cancel navigation and arm goals, reset subtask state, → IDLE."""
         if self.current_status not in [RobotStatusEnum.ERROR, RobotStatusEnum.ABNORMAL]:
             return
 
         self.get_logger().warning(
-            f'Error recovery | status={self.current_status.name} | row={self.current_row} side={self.current_side}'
+            f'Error recovery | status={self.current_status.name} | '
+            f'task_id={self.last_handled_task_id} | '
+            f'subtask_type={self.last_handled_subtask_type}'
         )
 
         nav_status = self.navigation.get_navigation_status()
         if nav_status in [NavigationStatus.ACTIVE, NavigationStatus.ACCEPTED]:
+            self.get_logger().info('Cancelling active navigation during error recovery')
             try:
                 self.navigation.cancel_goal()
                 time.sleep(self.navigation_retry_delay)
             except Exception as e:
                 self.get_logger().warning(f'Navigation cancel raised exception: {e}')
 
+        self.arm_stow_pending = False
+        self.arm_ready_pending = False
+        self.manipulator_client.reset()
+
         self.current_sub_task = None
         self.current_sub_task_index = 0
-        self.get_logger().debug('Error recovery — reset subtask state, transitioning to IDLE')
+        self.get_logger().debug('Error recovery — reset subtask state, → IDLE')
         self._transition_status(RobotStatusEnum.IDLE)
+
+    def _cancel_all_motion(self):
+        """Cancel navigation, DriveClient, and manipulator. Clear arm pending flags."""
+        nav_status = self.navigation.get_navigation_status()
+        if nav_status in [NavigationStatus.ACTIVE, NavigationStatus.ACCEPTED]:
+            self.navigation.cancel_goal()
+
+        if self.drive_client.is_active():
+            self.drive_client.cancel()
+
+        if self.manipulator_client.get_status() == RobotStatusEnum.HARVESTING:
+            self.manipulator_client.cancel_goal()
+
+        self.arm_stow_pending = False
+        self.arm_ready_pending = False
 
     # =========================================================================
     # SUBTASK HANDLERS
@@ -1123,39 +1242,41 @@ class LavenderHarvestNode(Node):
 
     def _subtask_moving(self):
         """
-        Handle the MOVING subtask — unified handler for Nav2 navigation and DriveClient row traversal.
+        Dual-mode navigation subtask.
 
-        When _need_row_navigation=True (new row, cross-to-side, post-charge/unload):
-          JOB_START → START_MOVING → send Nav2 goal → MOVING
-          (nav result handled by _handle_navigation via _process_action_clients)
-          DESTINATION_REACHED → set _need_row_navigation=False + branch by task type:
-            HARVESTING_TASK → drive_client.forward() → MOVING
-            CHARGING/UNLOADING → advance subtask index to DOCKING, stay DESTINATION_REACHED
+        JOB_START:
+          HARVESTING and _need_row_navigation=False → DESTINATION_REACHED (skip Nav2)
+          Otherwise → START_MOVING (Nav2 path)
 
-        When _need_row_navigation=False (resume same row after harvest):
-          JOB_START → DESTINATION_REACHED directly (skip Nav2)
-          DESTINATION_REACHED → drive_client.forward() → MOVING
+        DESTINATION_REACHED:
+          HARVESTING_TASK → start DriveClient, → MOVING
+          CHARGING/UNLOADING → task interruption: cancel, trigger server, → IDLE
 
-        During MOVING (DriveClient active):
-          no_detection_timeout → _advance_row(), current_task=None, → IDLE
-          DriveStatus.IDLE (detection stopped + aligned) → advance subtask to HARVESTING,
-                                                           → DESTINATION_REACHED
+        MOVING (DriveClient active):
+          STOPPED + detection → advance subtask, → DESTINATION_REACHED
+          STOPPED + no detection → row end; _need_row_navigation=True, trigger, → JOB_DONE
+          CANCELED/ERROR → ERROR
         """
         if not self.current_task:
             return
 
+        task_type = self.current_task.task_type
+
         self.get_logger().debug(
             f'_subtask_moving | status={self.current_status.name} | '
-            f'need_nav={self._need_row_navigation} | '
-            f'row={self.current_row} side={self.current_side}'
+            f'task_type={task_type} | '
+            f'_need_row_navigation={self._need_row_navigation}'
         )
 
         if self.current_status == RobotStatusEnum.JOB_START:
-            if self._need_row_navigation:
-                self._transition_status(RobotStatusEnum.START_MOVING)
-            else:
-                # DriveClient path — skip Nav2, start driving immediately
+            if task_type == Task.HARVESTING_TASK and not self._need_row_navigation:
+                # Skip Nav2 — DriveClient resumes the current row
+                self.get_logger().info(
+                    'HARVESTING + _need_row_navigation=False — skipping Nav2, proceeding directly to DriveClient'
+                )
                 self._transition_status(RobotStatusEnum.DESTINATION_REACHED)
+            else:
+                self._transition_status(RobotStatusEnum.START_MOVING)
 
         elif self.current_status == RobotStatusEnum.START_MOVING:
             if self.navigation.is_navigation_active():
@@ -1164,79 +1285,77 @@ class LavenderHarvestNode(Node):
                     f'nav_status={self.navigation.get_navigation_status().name}'
                 )
                 return
-            self.get_logger().info(f'Starting navigation to row {self.current_row} side {self.current_side}')
+            self.get_logger().info(f'Starting navigation: {self.current_node_id} → {self.current_task.target_node_id}')
             if self.navigation.send_goal(self.current_task):
                 self._transition_status(RobotStatusEnum.MOVING)
             else:
-                self.get_logger().error('Failed to send navigation goal')
+                self.get_logger().error(f'Failed to send navigation goal | task_id={self.current_task.task_id}')
                 self._transition_status(RobotStatusEnum.ERROR)
 
         elif self.current_status == RobotStatusEnum.DESTINATION_REACHED:
-            # Nav2 phase complete (or was skipped) — decide next action by task type
-            self._need_row_navigation = False
-
-            if self.current_task.task_type == Task.HARVESTING_TASK:
-                # Row traversal — start DriveClient
-                self.get_logger().info(f'Starting DriveClient for row {self.current_row} side {self.current_side}')
-                self.last_detection_time = self.get_clock().now().nanoseconds / 1e9
+            if task_type == Task.HARVESTING_TASK:
+                # --- Start DriveClient for row traversal ---
+                self._need_row_navigation = False
+                drive_status = self.drive_client.get_status()
+                if drive_status == DriveStatus.STOPPED:
+                    self.get_logger().info('Resuming DriveClient from STOPPED (depart from bush)')
+                    self.drive_client.resume()
+                else:
+                    self.get_logger().info('Starting DriveClient scan (fresh row start)')
+                    self.drive_client.scan()
                 self._detection_received = False
-                self.drive_client.forward()
+                self.last_detection_time = self.get_clock().now().nanoseconds / 1e9
                 self._transition_status(RobotStatusEnum.MOVING)
+
             else:
-                # CHARGING_TASK / UNLOADING_TASK — Nav2 got us to the dock staging area.
-                # Advance subtask index so _subtask_docking picks up on the next tick.
+                # --- CHARGING or UNLOADING: task interruption ---
                 self.get_logger().info(
-                    f'Nav2 complete for'
-                    f'{Task.CHARGING_TASK if self.current_task.task_type == Task.CHARGING_TASK else "UNLOADING"}'
-                    ' task — advancing to DOCKING subtask'
+                    f'DESTINATION_REACHED for task_type={task_type} (CHARGING/UNLOADING) — task interruption'
                 )
-                self.current_sub_task_index += 1
-                # Status stays DESTINATION_REACHED — _subtask_docking entry condition
+                self._cancel_all_motion()
+                self._send_task_trigger()
+                # Reset so server's response is treated as a fresh task
+                self.last_handled_task_id = None
+                self.last_handled_task_type = None
+                self.current_task = None
+                self.current_sub_task = None
+                self.current_sub_task_index = 0
+                self._transition_status(RobotStatusEnum.IDLE)
 
         elif self.current_status == RobotStatusEnum.MOVING:
-            # For Nav2 path: _handle_navigation handles all transitions — no-op here
-            if self._need_row_navigation:
-                return
-
-            # DriveClient path: check timeout and drive status
+            # DriveClient is active — check its status
             drive_status = self.drive_client.get_status()
 
-            if drive_status in (DriveStatus.FORWARD, DriveStatus.REVERSE):
-                if self.last_detection_time is not None:
-                    elapsed = self.get_clock().now().nanoseconds / 1e9 - self.last_detection_time
-                    if elapsed >= self.no_detection_timeout:
-                        self.get_logger().info(
-                            f'No detection for {elapsed:.1f}s (timeout={self.no_detection_timeout}s) — row end assumed'
-                        )
-                        self.drive_client.cancel()
-                        self._advance_row()
-                        self.current_task = None
-                        self._transition_status(RobotStatusEnum.IDLE)
+            self.get_logger().debug(
+                f'DriveClient | drive_status={drive_status.name} | _detection_received={self._detection_received}'
+            )
 
-            elif drive_status == DriveStatus.IDLE:
-                # Detection stopped and aligned — advance to HARVESTING subtask
-                self.get_logger().info('DriveClient stopped (detection aligned) — advancing to HARVESTING subtask')
-                self.current_sub_task_index += 1
-                self._transition_status(RobotStatusEnum.DESTINATION_REACHED)
+            if drive_status in (DriveStatus.SCANNING, DriveStatus.DEPARTING):
+                pass  # Still moving — wait
 
-            elif drive_status == DriveStatus.CANCELED:
-                # Triggered by cancel() in the timeout path above — transition handled there
-                pass
+            elif drive_status == DriveStatus.STOPPED:
+                if self._detection_received:
+                    # Bush detected — advance to next subtask (HARVESTING)
+                    self.get_logger().info('Drive stopped at bush — advancing to HARVESTING subtask')
+                    self.current_sub_task_index += 1
+                    self._transition_status(RobotStatusEnum.DESTINATION_REACHED)
+                else:
+                    # No detection — row end
+                    self.get_logger().info('Drive stopped without detection — row end, requesting next task')
+                    self._need_row_navigation = True
+                    self.drive_client.reset()
+                    self._send_task_trigger()
+                    self._transition_status(RobotStatusEnum.JOB_DONE)
 
-            else:
-                self.get_logger().error(f'Unexpected DriveClient status: {drive_status.name} — transitioning to ERROR')
+            elif drive_status in (DriveStatus.CANCELED, DriveStatus.ERROR):
+                self.get_logger().error(f'DriveClient error/canceled | drive_status={drive_status.name}')
                 self._transition_status(RobotStatusEnum.ERROR)
 
     def _subtask_docking(self):
         """
         Handle the DOCKING subtask.
 
-        State progression:
-          DESTINATION_REACHED → START_DOCKING → 1s delay → send dock_robot → DOCKING
-          DONE_DOCKING        → advance current_sub_task_index to next subtask
-                                (CHARGING or UNLOADING); status stays DONE_DOCKING
-                                so the next handler's entry condition is satisfied.
-          (docking result handled by _handle_docking via _process_action_clients)
+        DESTINATION_REACHED → START_DOCKING → 1s delay → send dock_robot → DOCKING
         """
         dock_id = (
             self.current_sub_task.dock_goal.dock_id
@@ -1260,75 +1379,155 @@ class LavenderHarvestNode(Node):
                 )
                 self._transition_status(RobotStatusEnum.ERROR)
 
-        elif self.current_status == RobotStatusEnum.DONE_DOCKING:
-            # Docking complete — advance to CHARGING or UNLOADING subtask.
-            # Status stays DONE_DOCKING: that is the entry condition for both
-            # _subtask_charging and _subtask_unloading.
-            self.get_logger().info('Docking done — advancing subtask index to CHARGING/UNLOADING')
-            self.docking_retry_count = 0
-            self.current_sub_task_index += 1
-            # Do NOT change status here — let the next subtask handler pick it up
+    def _subtask_undocking(self):
+        """
+        Handle the UNDOCKING subtask (called from charging, unloading, startup, or standalone).
+
+        Arm safety gate at START_UNDOCKING:
+          Arm must be confirmed STOW before the undocking goal is sent.
+          If not: send STOW goal, arm_stow_pending=True, return.
+          _handle_manipulator re-enters this method once STOW is confirmed.
+
+        START_UNDOCKING → (STOW gate) → send undock_robot → UNDOCKING
+        DONE_UNDOCKING  → clear state → JOB_DONE
+        """
+        self.get_logger().debug(
+            f'_subtask_undocking | status={self.current_status.name} | '
+            f'last_undocking_subtask={"set" if self.last_undocking_subtask else "None"} | '
+            f'undocking_after_task_type={self.undocking_after_task_type} | '
+            f"last_confirmed_arm='{self.last_confirmed_arm_command}' | "
+            f'arm_stow_pending={self.arm_stow_pending}'
+        )
+
+        if self.current_status == RobotStatusEnum.START_UNDOCKING:
+            # ---- Arm safety gate ----
+            if self.last_confirmed_arm_command != ArmCommand.GO_STOW:
+                if not self.arm_stow_pending:
+                    self.get_logger().info(
+                        f"Arm not in STOW (last='{self.last_confirmed_arm_command}') — sending STOW before undocking"
+                    )
+                    undock_ref = self.current_sub_task or self.last_undocking_subtask
+                    if self.manipulator_client.send_stow_goal(undock_ref):
+                        self.arm_stow_pending = True
+                    else:
+                        self.get_logger().error('Failed to send STOW goal before undocking — ERROR')
+                        self._transition_status(RobotStatusEnum.ERROR)
+                else:
+                    self.get_logger().debug('Arm STOW already in progress — waiting before undocking')
+                return  # Hold at START_UNDOCKING until STOW confirmed
+
+            # ---- Arm confirmed STOW — proceed ----
+            self.get_logger().info('Starting undocking — arm confirmed STOW')
+
+            undock_subtask = self.current_sub_task if self.current_sub_task else self.last_undocking_subtask
+            dock_type = (
+                undock_subtask.undock_goal.dock_type if undock_subtask and undock_subtask.undock_goal else 'None'
+            )
+            self.get_logger().debug(
+                f'Undocking subtask | '
+                f'source={"current_sub_task" if self.current_sub_task else "last_undocking_subtask"} | '
+                f"dock_type='{dock_type}'"
+            )
+
+            if self.undocking_action_client.send_undocking_goal(undock_subtask):
+                self._transition_status(RobotStatusEnum.UNDOCKING)
+            else:
+                self.get_logger().error(
+                    f'Failed to send undocking goal | undocking_after_task_type={self.undocking_after_task_type}'
+                )
+                self._transition_status(RobotStatusEnum.ERROR)
+
+        elif self.current_status == RobotStatusEnum.DONE_UNDOCKING:
+            self.get_logger().info('Undocking done')
+            self.last_undocking_subtask = None
+            self.undocking_after_task_type = None
+            self._transition_status(RobotStatusEnum.JOB_DONE)
 
     def _subtask_harvesting(self):
         """
-        Handle the HARVESTING subtask.
+        Handle the HARVESTING subtask using ManipulatorTaskActionClient.
 
-        NOTE: This method is UNCHANGED from HuskyOperationsManager (test_husky_ops_navigation.py).
-        It simulates harvesting with a 5s timer. The arm fires the actual cutting cycle
-        in production; this timer is a stand-in for testing.
+        DESTINATION_REACHED → READY gate → START_HARVESTING → HARVESTING
+          → (via _handle_manipulator) → DONE_HARVESTING
+          → STOW gate → JOB_DONE
 
-        State progression:
-          DESTINATION_REACHED → START_HARVESTING → HARVESTING (5s) → DONE_HARVESTING → JOB_DONE
+        Arm gates mirror husky_operations_manager.py exactly.
         """
-        self.get_logger().debug(f'_subtask_harvesting | status={self.current_status.name} | ')
+        self.get_logger().debug(
+            f'_subtask_harvesting | status={self.current_status.name} | '
+            f'arm_ready_pending={self.arm_ready_pending} | '
+            f'arm_stow_pending={self.arm_stow_pending} | '
+            f"last_confirmed_arm='{self.last_confirmed_arm_command}'"
+        )
 
         if self.current_status == RobotStatusEnum.DESTINATION_REACHED:
+            # ---- READY gate ----
+            if self.last_confirmed_arm_command != ArmCommand.GO_READY:
+                if not self.arm_ready_pending:
+                    self.get_logger().info(
+                        f"Arm not in READY (last='{self.last_confirmed_arm_command}') — sending READY before harvesting"
+                    )
+                    if self.manipulator_client.send_ready_goal(self.current_sub_task):
+                        self.arm_ready_pending = True
+                    else:
+                        self.get_logger().error('Failed to send READY goal before harvesting — ERROR')
+                        self._transition_status(RobotStatusEnum.ERROR)
+                else:
+                    self.get_logger().debug('Arm READY already in progress — waiting')
+                return  # Hold at DESTINATION_REACHED until READY confirmed
+
+            # Arm confirmed READY — proceed to harvesting
             self._transition_status(RobotStatusEnum.START_HARVESTING)
 
         elif self.current_status == RobotStatusEnum.START_HARVESTING:
-            self._transition_status(RobotStatusEnum.HARVESTING)
-            self.get_logger().info('Harvesting started')
-
-            self.job_start_time = self.get_clock().now()
-            self.job_duration = self.harvest_duration
+            if self.manipulator_client.get_status() == RobotStatusEnum.HARVESTING:
+                self.get_logger().warning('Harvest goal send skipped — manipulator already active')
+                return
+            self.get_logger().info('Sending harvest goal to manipulator')
+            if self.manipulator_client.send_harvesting_goal(self.current_sub_task):
+                self._transition_status(RobotStatusEnum.HARVESTING)
+            else:
+                self.get_logger().error('Failed to send harvest goal — ERROR')
+                self._transition_status(RobotStatusEnum.ERROR)
 
         elif self.current_status == RobotStatusEnum.HARVESTING:
-            if self.job_start_time:
-                elapsed = (self.get_clock().now() - self.job_start_time).nanoseconds / 1e9
-                if elapsed >= self.job_duration:
-                    self.get_logger().info('Harvesting complete (simulated)')
-                    self.get_logger().debug(
-                        f'Harvesting timer done | elapsed={elapsed:.2f}s duration={self.job_duration:.1f}s'
-                    )
-                    self._transition_status(RobotStatusEnum.DONE_HARVESTING)
-                    self.job_start_time = None
+            # Result handled asynchronously by _handle_manipulator → DONE_HARVESTING
+            self.get_logger().debug('Harvesting in progress — waiting for manipulator result')
 
         elif self.current_status == RobotStatusEnum.DONE_HARVESTING:
-            new_load = min(self.current_load_status + self.loading_increment, 100.0)
-            self.get_logger().debug(
-                f'Load update | {self.current_load_status:.1f}% → {new_load:.1f}% (+{self.loading_increment:.1f}%)'
-            )
-            self.current_load_status = new_load
-            self.get_logger().info(f'Load status: {self.current_load_status:.1f}%')
-            self._transition_status(RobotStatusEnum.JOB_DONE)
+            # ---- STOW gate (guarded with arm_stow_pending to prevent re-increment) ----
+            if not self.arm_stow_pending and self.last_confirmed_arm_command != ArmCommand.GO_STOW:
+                new_load = min(self.current_load_status + self.loading_increment, 100.0)
+                self.get_logger().debug(
+                    f'Load update | {self.current_load_status:.1f}% → {new_load:.1f}% (+{self.loading_increment:.1f}%)'
+                )
+                self.current_load_status = new_load
+                self.get_logger().info(f'Load status: {self.current_load_status:.1f}%')
+
+                self.get_logger().info('Harvesting done — sending arm to STOW')
+                if self.manipulator_client.send_stow_goal(self.current_sub_task):
+                    self.arm_stow_pending = True
+                else:
+                    self.get_logger().error('Failed to send STOW goal after harvesting — ERROR')
+                    self._transition_status(RobotStatusEnum.ERROR)
+                return  # Hold until STOW confirmed
+
+            # STOW confirmed — advance to JOB_DONE
+            if self.last_confirmed_arm_command == ArmCommand.GO_STOW and not self.arm_stow_pending:
+                self.get_logger().info('Arm stowed after harvest — transitioning to JOB_DONE')
+                self._transition_status(RobotStatusEnum.JOB_DONE)
 
     def _subtask_charging(self):
         """
         Handle the CHARGING subtask.
 
-        State progression:
-          DONE_DOCKING   → START_CHARGING → CHARGING
-          CHARGING       → poll battery until >= battery_full_threshold → DONE_CHARGING
-          DONE_CHARGING  → store last_undocking_subtask, internally trigger undocking
-          DONE_UNDOCKING → delegate to _subtask_undocking → JOB_DONE
-
-        UNDOCKING is triggered internally — not a received subtask for CHARGING_TASK.
+        DONE_DOCKING → START_CHARGING → CHARGING (poll battery) → DONE_CHARGING
+        → store undocking subtask → START_UNDOCKING → _subtask_undocking → JOB_DONE
         """
         battery_pct = self._normalize_battery(self.battery_status.percentage)
         self.get_logger().debug(
             f'_subtask_charging | status={self.current_status.name} | '
-            f'battery={battery_pct:.1f}% | '
-            f'full_threshold={self.battery_full_threshold}%'
+            f'battery={battery_pct:.1f}% | full_threshold={self.battery_full_threshold}%'
         )
 
         if self.current_status == RobotStatusEnum.DONE_DOCKING:
@@ -1357,44 +1556,63 @@ class LavenderHarvestNode(Node):
 
     def _subtask_unloading(self):
         """
-        Handle the UNLOADING subtask.
+        Handle the UNLOADING subtask via UnloaderActionClient.
 
-        State progression:
-          DONE_DOCKING   → START_UNLOADING → UNLOADING (4s timer) → DONE_UNLOADING
-          DONE_UNLOADING → reset load, store last_undocking_subtask, trigger undocking
-          DONE_UNDOCKING → delegate to _subtask_undocking → JOB_DONE
-
-        current_load_status is reset to 0.0 when unloading completes.
+        DONE_DOCKING  → START_UNLOADING → send_goal(END) → UNLOADING
+        UNLOADING     → poll unloader status:
+                         DONE_UNLOADING + not _unloader_at_end
+                           → _unloader_at_end=True, delay, send_goal(HOME)
+                         DONE_UNLOADING + _unloader_at_end
+                           → current_load_status=0, → DONE_UNLOADING
+        DONE_UNLOADING → store undocking subtask → START_UNDOCKING → JOB_DONE
+        DONE_UNDOCKING → delegate to _subtask_undocking → JOB_DONE
         """
         self.get_logger().debug(
-            f'_subtask_unloading | status={self.current_status.name} | current_load={self.current_load_status:.1f}%'
+            f'_subtask_unloading | status={self.current_status.name} | '
+            f'current_load={self.current_load_status:.1f}% | '
+            f'_unloader_at_end={self._unloader_at_end}'
         )
 
         if self.current_status == RobotStatusEnum.DONE_DOCKING:
             self._transition_status(RobotStatusEnum.START_UNLOADING)
 
         elif self.current_status == RobotStatusEnum.START_UNLOADING:
-            self._transition_status(RobotStatusEnum.UNLOADING)
-            self.get_logger().info('Unloading started')
-            self.job_start_time = self.get_clock().now()
-            self.job_duration = self.unload_duration
+            self.get_logger().info('Sending unloader END goal')
+            self._unloader_at_end = False
+            if self.unloader_action_client.send_goal(OperateUnloader.Goal.END):
+                self._transition_status(RobotStatusEnum.UNLOADING)
+            else:
+                self.get_logger().error('Failed to send unloader END goal — ERROR')
+                self._transition_status(RobotStatusEnum.ERROR)
 
         elif self.current_status == RobotStatusEnum.UNLOADING:
-            if self.job_start_time:
-                elapsed = (self.get_clock().now() - self.job_start_time).nanoseconds / 1e9
-                if elapsed >= self.job_duration:
-                    self.get_logger().info('Unloading complete (simulated)')
-                    self.get_logger().debug(
-                        f'Unloading timer done | elapsed={elapsed:.2f}s duration={self.job_duration:.1f}s'
-                    )
+            unloader_status = self.unloader_action_client.get_status()
+
+            if unloader_status == RobotStatusEnum.DONE_UNLOADING:
+                if not self._unloader_at_end:
+                    self.get_logger().info(f'Unloader AT_END — delaying {self.unloading_home_delay_s:.1f}s then HOME')
+                    self._unloader_at_end = True
+                    time.sleep(self.unloading_home_delay_s)
+                    if not self.unloader_action_client.send_goal(OperateUnloader.Goal.HOME):
+                        self.get_logger().error('Failed to send unloader HOME goal — ERROR')
+                        self._transition_status(RobotStatusEnum.ERROR)
+                    # Status will return to UNLOADING on next tick (client resets internally)
+                else:
+                    # HOME confirmed — carriage returned
+                    self.get_logger().info('Unloader AT_HOME — unloading complete')
+                    self.current_load_status = 0.0
+                    self.unloader_action_client.reset()
                     self._transition_status(RobotStatusEnum.DONE_UNLOADING)
-                    self.job_start_time = None
+
+            elif unloader_status == RobotStatusEnum.ERROR:
+                self.get_logger().error('Unloader reported ERROR — transitioning to ERROR')
+                self.unloader_action_client.reset()
+                self._transition_status(RobotStatusEnum.ERROR)
 
         elif self.current_status == RobotStatusEnum.DONE_UNLOADING:
             self.get_logger().debug('DONE_UNLOADING — storing last_undocking_subtask and triggering undocking')
             self.last_undocking_subtask = self.current_sub_task
             self.undocking_after_task_type = Task.UNLOADING_TASK
-            self.current_load_status = 0.0
             self.get_logger().info('Unloading done, starting undocking')
             self._transition_status(RobotStatusEnum.START_UNDOCKING)
             self._subtask_undocking()
@@ -1403,110 +1621,11 @@ class LavenderHarvestNode(Node):
             self.get_logger().debug('DONE_UNDOCKING in unloading context — delegating to _subtask_undocking')
             self._subtask_undocking()
 
-    def _subtask_undocking(self):
-        """
-        Handle the UNDOCKING subtask.
-
-        Called in two ways:
-          1. Directly by _subtask_charging/_subtask_unloading when their tasks complete.
-          2. Via _handle_startup_undocking during the startup sequence.
-
-        UndockGoal source: last_undocking_subtask (stored by callers above).
-
-        State progression:
-          START_UNDOCKING → send undock_robot → UNDOCKING
-          DONE_UNDOCKING  → clear stored state → JOB_DONE
-          (undocking result handled by _handle_undocking via _process_action_clients)
-        """
-        self.get_logger().debug(
-            f'_subtask_undocking | status={self.current_status.name} | '
-            f'last_undocking_subtask={"set" if self.last_undocking_subtask else "None"} | '
-            f'undocking_after_task_type={self.undocking_after_task_type}'
-        )
-
-        if self.current_status == RobotStatusEnum.START_UNDOCKING:
-            undock_subtask = self.current_sub_task if self.current_sub_task else self.last_undocking_subtask
-            dock_type = (
-                undock_subtask.undock_goal.dock_type if undock_subtask and undock_subtask.undock_goal else 'None'
-            )
-
-            self.get_logger().debug(
-                f'Undocking subtask | '
-                f'source={"current_sub_task" if self.current_sub_task else "last_undocking_subtask"} | '
-                f"dock_type='{dock_type}'"
-            )
-
-            if self.undocking_action_client.send_undocking_goal(undock_subtask):
-                self._transition_status(RobotStatusEnum.UNDOCKING)
-            else:
-                self.get_logger().error(
-                    f'Failed to send undocking goal | undocking_after_task_type={self.undocking_after_task_type}'
-                )
-                self._transition_status(RobotStatusEnum.ERROR)
-
-        elif self.current_status == RobotStatusEnum.DONE_UNDOCKING:
-            self.get_logger().info('Undocking done')
-            self.last_undocking_subtask = None
-            self.undocking_after_task_type = None
-            self._transition_status(RobotStatusEnum.JOB_DONE)
-
     # =========================================================================
-    # UTILITY METHODS
-    # =========================================================================
-
-    def _cancel_all_motion(self):
-        """Cancel DriveClient and navigation without transitioning status."""
-        if self.drive_client and self.drive_client.is_active():
-            self.drive_client.cancel()
-        if self.navigation:
-            nav_status = self.navigation.get_navigation_status()
-            if nav_status in [NavigationStatus.ACTIVE, NavigationStatus.ACCEPTED]:
-                try:
-                    self.navigation.cancel_goal()
-                except Exception as e:
-                    self.get_logger().warning(f'Navigation cancel exception: {e}')
-
-    def _is_robot_at_target(self):
-        """
-        Check if the robot is within 0.25m of the final waypoint.
-
-        Used by _handle_navigation_retry to treat a nav abort as a success when
-        the robot is physically close enough to the destination.
-
-        Returns False if no subtask or pose data is available.
-        """
-        if not (self.current_sub_task and self.pose_status):
-            return False
-
-        robot_position = self.pose_status.pose.pose.position
-        waypoints_list = [WayPoint(**wp) if isinstance(wp, dict) else wp for wp in self.current_sub_task.data]
-        if not waypoints_list:
-            return False
-
-        target_wp = waypoints_list[-1]
-        distance = self._calculate_distance(robot_position.x, robot_position.y, target_wp.x, target_wp.y)
-
-        self.get_logger().debug(
-            f'_is_robot_at_target | '
-            f'robot=({robot_position.x:.3f}, {robot_position.y:.3f}) | '
-            f'target=({target_wp.x:.3f}, {target_wp.y:.3f}) | '
-            f'distance={distance:.3f}m threshold=0.25m'
-        )
-        return distance <= 0.25
-
-    def _transition_status(self, new_status: RobotStatusEnum):
-        """Safely transition to a new RobotStatusEnum, no-op on repeated same status."""
-        if self.current_status != new_status:
-            self.previous_status = self.current_status
-            self.current_status = new_status
-            self.get_logger().info(f'Status: {self.previous_status.name} → {self.current_status.name}')
-
-    # =========================================================================
-    # SENSOR STATUS METHODS — mirrors HuskyOperationsManager
+    # SENSOR STATUS HELPERS
     # =========================================================================
 
     def _set_battery_status(self, robot_status: RobotStatus):
-        """Populate battery fields in the outgoing RobotStatus."""
         robot_status.battery_level = self.battery_status.percentage
         if self.battery_status.capacity > 0.0 and self.battery_status.current > 0.0:
             battery_pct = self._normalize_battery(self.battery_status.percentage)
@@ -1516,33 +1635,64 @@ class LavenderHarvestNode(Node):
             robot_status.operation_hours_after_charging = '00 hours 00 minutes remaining approx...'
 
     def _set_estop_status(self, robot_status: RobotStatus):
-        """Map emergency stop signal to online_flag in the outgoing RobotStatus."""
         robot_status.online_flag = self.estop_status.data if self.estop_status.data else OnlineFlagEnum.ONLINE.value
 
     def _set_location_status(self, robot_status: RobotStatus):
-        """Populate position and orientation fields from the latest ground-truth pose."""
         if self.pose_status and self.pose_status.pose:
             robot_status.topo_map_position = self.pose_status.pose.pose.position
             robot_status.topo_map_orientation = self.pose_status.pose.pose.orientation
 
+    # =========================================================================
+    # UTILITY
+    # =========================================================================
+
+    def _transition_status(self, new_status: RobotStatusEnum):
+        """No-op if already in new_status; otherwise log and update."""
+        if self.current_status != new_status:
+            self.previous_status = self.current_status
+            self.current_status = new_status
+            self.get_logger().info(f'Status: {self.previous_status.name} → {self.current_status.name}')
+
     def _normalize_battery(self, percentage: float) -> float:
-        """Normalise battery percentage to 0–100 range."""
+        """Normalise 0-1 BMS percentage to 0-100."""
         return percentage * 100.0 if percentage <= 1.0 else percentage
 
     def _format_time_remaining(self, hours: float) -> str:
-        """Convert fractional hours to HH hours MM minutes string."""
         seconds = int(hours * 3600)
         minutes, seconds = divmod(seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-        return f'{hours:02} hours {minutes:02} minutes remaining approximately.'
+        hours_i, minutes = divmod(minutes, 60)
+        return f'{hours_i:02} hours {minutes:02} minutes remaining approximately.'
 
     def _calculate_distance(self, x1: float, y1: float, x2: float, y2: float) -> float:
-        """Return the Euclidean distance between two 2D points."""
         return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+
+    def _is_robot_at_target(self) -> bool:
+        """Return True if the robot is within 0.25 m of the final subtask waypoint."""
+        if not (self.current_sub_task and self.pose_status):
+            return False
+
+        robot_pos = self.pose_status.pose.pose.position
+        waypoints_list = [WayPoint(**wp) if isinstance(wp, dict) else wp for wp in self.current_sub_task.data]
+        if not waypoints_list:
+            return False
+        target_wp = waypoints_list[-1]
+        distance = self._calculate_distance(robot_pos.x, robot_pos.y, target_wp.x, target_wp.y)
+
+        self.get_logger().debug(
+            f'_is_robot_at_target | '
+            f'robot=({robot_pos.x:.3f}, {robot_pos.y:.3f}) | '
+            f'target=({target_wp.x:.3f}, {target_wp.y:.3f}) | '
+            f'distance={distance:.3f}m threshold=0.25m'
+        )
+        return distance <= 0.25
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 
 
 def main(args=None):
-    """Initialise rclpy, spin the node, and shut down cleanly."""
     rclpy.init(args=args)
     node = LavenderHarvestNode()
     try:

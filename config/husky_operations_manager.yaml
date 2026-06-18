@@ -60,3 +60,11 @@
     # Server timeout
     server:
       action_server_timeout: 5.0  # seconds
+
+    # Subscription topics (relative to robot namespace)
+    topics:
+      battery: platform/bms/state
+      pose:    ground_truth/pose
+      imu:     sensors/gps_0/imu
+      estop:   platform/emergency_stop
+      task:    status/task

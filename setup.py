@@ -49,6 +49,7 @@ setup(
             'test_harvest_client = husky_operations_manager.unit_test.test_harvest_client:main',
 
             'test_lavender_harvest = husky_operations_manager.unit_test.test_lavender_harvest:main',
+            'test_drive_harvest_unload = husky_operations_manager.unit_test.test_drive_harvest_unload:main',
         ],
     },
 )

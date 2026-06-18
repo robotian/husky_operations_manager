@@ -1,50 +1,93 @@
-test_husky_ops_parameter_fetch:
+/*/test_lavender_harvest:
   ros__parameters:
-    # ── General ────────────────────────────────────────────────────────────────
-    num_rows: 1 # Number of rows to harvest (configurable for multi-row farms)
-    no_detection_timeout: 10.0 # Seconds without detection before assuming row end
-    harvest_duration: 5.0 # Simulated harvest duration per bush (seconds)
-    unload_duration: 5.0 # Simulated unload duration (seconds)
-    loading:
-      increment: 20.0 # Load % added per harvest cycle
 
-    # ── Row 0 waypoints [x, y, theta] ─────────────────────────────────────────
-    # Side A: robot travels South → North (forward direction)
-    # Side B: robot travels North → South (opposite direction, other side of row)
-    # Add row_1_*, row_2_* etc. for additional rows (must match num_rows)
-    row_0_side_a_start: [0.0, 1.86, -1.57]
-    row_0_side_a_end: [0.0, -1.86, -1.57]
-    row_0_side_b_start: [-1.0, -1.86, 1.57]
-    row_0_side_b_end: [-1.0, 1.86, 1.57]
+    # ── Dock instances ────────────────────────────────────────────────────────
+    docks:
+      names: [husky_charger, unloading_station]
+      husky_charger:
+        type:  simple_charging_dock
+        frame: map
+        pose:  [0.8, -1.945, 0.0]      # [x, y, theta_rad]
+      unloading_station:
+        type:  simple_charging_dock
+        frame: map
+        pose:  [0.85, 1.60, 1.571]
 
-    # ── DriveClient ────────────────────────────────────────────────────────────
+    # ── Plugin (staging offsets) ──────────────────────────────────────────────
+    plugin:
+      name:               simple_charging_dock
+      staging_x_offset:  -1.5
+      staging_yaw_offset: 0.0
+
+    # ── Controller (reverse drive motion params) ──────────────────────────────
+    controller:
+      base_frame:           base_link
+      controller_frequency: 50.0
+      v_linear_min:         0.15
+      v_linear_max:         0.15
+      v_angular_max:        0.25
+
+    # ── Undocking tolerances ──────────────────────────────────────────────────
+    undocking:
+      linear_tolerance:  0.05
+      angular_tolerance: 0.1
+      dock_backwards:    false
+
+    # ── DriveClient (camera-guided row traversal) ─────────────────────────────
     drive:
-      base_frame: "base_link"
-      tf_polling_rate: 10.0 # TF alignment check rate (Hz)
-      tf_base_frame: "arm_0_base_link"
-      tf_detection_frame: "arm_0_detections"
-      tolerance: 0.05 # X axis alignment tolerance (m)
-      timeout: 30.0 # Max correction time before warning (s)
-      v_linear: 0.2 # Forward/reverse speed (m/s) — tune per terrain
-      v_angular: 0.5 # Angular speed (rad/s)
+      detection_topic:       manipulators/arm_0_detection/image_annotated/detection_pose
+      odom_topic:            platform/odom
+      base_frame:            base_link
+      cmd_vel_rate:          10.0
+      v_linear_min:          0.05
+      v_linear_max:          0.2
+      v_angular_max:         0.5
+      k_rho:                 1.0
+      ex_tolerance:          0.05
+      stop_lookahead:        0.05
+      ex_coast_gate:         0.1
+      ex_angular_gate:       0.05
+      departure_clearance:   0.3
+      no_detection_distance: 0.5
 
-    # ── Navigation ─────────────────────────────────────────────────────────────
+    # ── Navigation ────────────────────────────────────────────────────────────
     navigation:
       max_retries: 3
-      retry_delay: 5.0 # Seconds between retries
+      retry_delay: 5.0
 
-    # ── Docking ────────────────────────────────────────────────────────────────
+    # ── Docking ───────────────────────────────────────────────────────────────
     docking:
       max_retries: 2
       retry_delay: 3.0
-      threshold: 0.25 # Distance (m) to consider robot at dock
+      threshold:   0.25
 
-    # ── Battery ────────────────────────────────────────────────────────────────
+    # ── Battery ───────────────────────────────────────────────────────────────
     battery:
-      low_threshold: 50.0 # % — below this triggers ERROR
-      full_threshold: 99.0 # % — used for charging completion check
+      low_threshold:  50.0
+      full_threshold: 99.0
 
-    # ── Timing ─────────────────────────────────────────────────────────────────
+    # ── Loading ───────────────────────────────────────────────────────────────
+    loading:
+      increment: 20.0
+
+    # ── Unloading ─────────────────────────────────────────────────────────────
+    unloading:
+      home_delay_s: 2.0   # delay between AT_END result and sending HOME goal
+
+    # ── Timing ────────────────────────────────────────────────────────────────
     timing:
-      timer_period: 1.0 # Main control loop period (s)
-      initial_position_check_delay: 2.0 # Delay before initial dock check (s)
+      timer_period:                 1.0
+      initial_position_check_delay: 2.0
+
+    # ── Task generation ───────────────────────────────────────────────────────
+    task:
+      trigger_topic: job/trigger    # topic name for server-side task generation
+
+    # ── Subscription topics (relative to robot namespace) ─────────────────────
+    topics:
+      battery:   platform/bms/state
+      pose:      ground_truth/pose
+      imu:       sensors/gps_0/imu
+      estop:     platform/emergency_stop
+      task:      status/task
+      detection: manipulators/arm_0_detection/image_annotated/detection_pose
