@@ -8,10 +8,8 @@ from husky_operations_manager.action_clients.docking import DockingActionClient
 from husky_operations_manager.action_clients.navigation import NavigationActionClient
 from husky_operations_manager.action_clients.reverse_drive import ReverseDriveClient
 from husky_operations_manager.action_clients.undocking import UndockingActionClient
-from husky_operations_manager.types import DockInstanceConfig, DockPluginConfig, DockingConfig
-from husky_operations_manager.docking_param_fetcher import DockingParamFetcher
+from husky_operations_manager.types import DockInstanceConfig, DockPose, ReverseDriveConfig
 from husky_operations_manager.robot_enums import (
-    DockingParamFetcherStatus,
     NavigationStatus,
     OnlineFlagEnum,
     ReverseDriveStatus,
@@ -59,111 +57,30 @@ class HuskyOperationsManager(Node):
 
         self.robot_state_pub = self.create_publisher(RobotStatus, f'{self.namespace}/status/robot', 10)
 
-        # These are set to None here and populated once DockingParamFetcher completes.
-        # All action clients depend on DockingConfig so they cannot be created until
-        # _on_docking_config_ready fires.
-        self.docking_config: DockingConfig | None = None
-        self.active_dock: DockInstanceConfig | None = None
-        self.active_plugin: DockPluginConfig | None = None
-        self.reverse_drive_client: ReverseDriveClient | None = None
-
-        # 30s window for docking_server to become available before clean shutdown
-        self._CONFIG_POLL_TIMEOUT_SEC: float = 30.0
-
-        # Fetch all params from docking_server asynchronously.
-        # _poll_docking_config checks readiness every 0.5s and fires
-        # _on_docking_config_ready once the config is built.
-        self._param_fetcher = DockingParamFetcher(self)
-        self._param_fetcher.fetch()
-        self._config_poll_start_time: float = self.get_clock().now().nanoseconds / 1e9
-        self._config_poll_timer = self.create_timer(0.5, self._poll_docking_config)
-
-    def _on_docking_config_ready(self):
-        """
-        Handle DockingParamFetcher DONE event.
-
-        Resolves active_dock and active_plugin from index 0 of the respective lists.
-        Initialises all action clients (they require DockingConfig at construction)
-        and starts the main 1Hz timer and the initial position check timer.
-
-        TODO: Update active_dock and active_plugin values based on the assigned dock
-        to each robot in multi-robot setup
-        """
-        self.docking_config = self._param_fetcher.get_config()
-
-        # Index 0 is used as the single global dock and plugin throughout the node.
-        # Multi-dock support would require changing these to per-task lookups.
-        self.active_dock = self.docking_config.dock_configs[self.docking_config.docks[0]]
-        self.active_plugin = self.docking_config.plugin_configs[self.docking_config.dock_plugins[0]]
-
-        self.get_logger().info(
-            f"DockingConfig ready | dock='{self.active_dock.instance_name}' | plugin='{self.active_plugin.plugin_name}'"
-        )
-        self.get_logger().debug(
-            f'DockingConfig detail | '
-            f"dock_type='{self.active_dock.type}' | "
-            f'staging_x_offset={self.active_plugin.staging_x_offset} | '
-            f'v_linear_min={self.docking_config.controller_v_linear_min} | '
-            f'dock_backwards={self.docking_config.dock_backwards}'
-        )
-
-        # Initialise action clients now that DockingConfig is available
-        self.navigation = NavigationActionClient(self)
-        self.docking_action_client = DockingActionClient(self)
+        self.navigation              = NavigationActionClient(self)
+        self.docking_action_client   = DockingActionClient(self)
         self.undocking_action_client = UndockingActionClient(self)
-        # ReverseDriveClient is the fallback when undock_robot action fails.
-        # It drives the robot in reverse using TF closed-loop feedback.
-        self.reverse_drive_client = ReverseDriveClient(self, self.docking_config)
+        self.reverse_drive_client    = ReverseDriveClient(self, ReverseDriveConfig(
+            dock_names=[self.active_dock.instance_name],
+            dock_configs={self.active_dock.instance_name: self.active_dock},
+            plugin_name=self.plugin_name,
+            staging_x_offset=self.staging_x_offset,
+            staging_yaw_offset=self.staging_yaw_offset,
+            base_frame=self.base_frame,
+            controller_frequency=self.controller_frequency,
+            v_linear_min=self.v_linear_min,
+            v_angular_max=self.v_angular_max,
+            linear_tolerance=self.linear_tolerance,
+            angular_tolerance=self.angular_tolerance,
+            dock_backwards=self.dock_backwards,
+        ))
 
-        # Delay the initial position check to allow the pose subscription to
-        # receive its first message before comparing against the dock position.
         self.init_check_timer = self.create_timer(
             self.timing_initial_position_check_delay, self._initial_position_check_timer
         )
         self.timer = self.create_timer(self.timing_timer_period, self.timer_callback)
 
         self.get_logger().info('Husky Operations Manager ready.')
-
-    def _poll_docking_config(self):
-        """
-        Poll DockingParamFetcher every 0.5s.
-
-        Cancels itself on DONE or when the 30s timeout window is exceeded.
-        On DONE, fires _on_docking_config_ready which initialises all clients
-        and starts the main timers.
-
-        On ERROR, resets the fetcher and retries fetch() on the next timer tick
-        until the 30s deadline is reached, at which point the node shuts down
-        cleanly — it cannot operate without docking config.
-        """
-        status = self._param_fetcher.get_status()
-        self.get_logger().debug(f'DockingParamFetcher poll | status={status.name}')
-
-        if status == DockingParamFetcherStatus.DONE:
-            self._config_poll_timer.cancel()
-            self._on_docking_config_ready()
-            return
-
-        if status == DockingParamFetcherStatus.ERROR:
-            elapsed = self.get_clock().now().nanoseconds / 1e9 - self._config_poll_start_time
-
-            if elapsed >= self._CONFIG_POLL_TIMEOUT_SEC:
-                self.get_logger().error(
-                    f'DockingParamFetcher failed — '
-                    f'docking_server unavailable after {self._CONFIG_POLL_TIMEOUT_SEC:.0f}s | '
-                    f'elapsed={elapsed:.1f}s — shutting down'
-                )
-                self._config_poll_timer.cancel()
-                self.destroy_node()
-                rclpy.shutdown()
-                return
-
-            # Within timeout window — reset and retry on next timer tick
-            self.get_logger().warning(
-                f'DockingParamFetcher ERROR — retrying | elapsed={elapsed:.1f}s / {self._CONFIG_POLL_TIMEOUT_SEC:.0f}s'
-            )
-            self._param_fetcher.reset()
-            self._param_fetcher.fetch()
 
     # =========================================================================
     # PARAMS AND VARIABLES INITIALIZATION
@@ -183,6 +100,25 @@ class HuskyOperationsManager(Node):
         self.declare_parameter('timing.initial_position_check_delay', 2.0)
         self.declare_parameter('server.action_server_timeout', 5.0)
 
+        self.declare_parameter('docks.names', ['main_dock'])
+        dock_names = list(self.get_parameter('docks.names').value)
+        for name in dock_names:
+            self.declare_parameter(f'docks.{name}.type',  'simple_charging_dock')
+            self.declare_parameter(f'docks.{name}.frame', 'map')
+            self.declare_parameter(f'docks.{name}.pose',  [0.0, 0.0, 0.0])
+
+        self.declare_parameter('plugin.name',                       'simple_charging_dock')
+        self.declare_parameter('plugin.staging_x_offset',          -0.7)
+        self.declare_parameter('plugin.staging_yaw_offset',         0.0)
+        self.declare_parameter('controller.base_frame',             'base_link')
+        self.declare_parameter('controller.controller_frequency',    50.0)
+        self.declare_parameter('controller.v_linear_min',            0.15)
+        self.declare_parameter('controller.v_linear_max',            0.15)
+        self.declare_parameter('controller.v_angular_max',           0.25)
+        self.declare_parameter('undocking.linear_tolerance',         0.05)
+        self.declare_parameter('undocking.angular_tolerance',        0.1)
+        self.declare_parameter('undocking.dock_backwards',           False)
+
     def _get_paramters(self):
         """Read all declared parameters into instance variables."""
         self.navigation_max_retries = int(self.get_parameter('navigation.max_retries').value)
@@ -198,6 +134,30 @@ class HuskyOperationsManager(Node):
             self.get_parameter('timing.initial_position_check_delay').value
         )
         self.server_action_server_timeout = float(self.get_parameter('server.action_server_timeout').value)
+
+        dock_names = list(self.get_parameter('docks.names').value)
+        dock_configs: dict[str, DockInstanceConfig] = {}
+        for name in dock_names:
+            pose = list(self.get_parameter(f'docks.{name}.pose').value)
+            dock_configs[name] = DockInstanceConfig(
+                instance_name=name,
+                type=str(self.get_parameter(f'docks.{name}.type').value),
+                frame=str(self.get_parameter(f'docks.{name}.frame').value),
+                pose=DockPose(x=float(pose[0]), y=float(pose[1]), theta=float(pose[2])),
+            )
+        self.active_dock = dock_configs[dock_names[0]]
+
+        self.plugin_name        = str(self.get_parameter('plugin.name').value)
+        self.staging_x_offset   = float(self.get_parameter('plugin.staging_x_offset').value)
+        self.staging_yaw_offset = float(self.get_parameter('plugin.staging_yaw_offset').value)
+        self.base_frame           = str(self.get_parameter('controller.base_frame').value)
+        self.controller_frequency = float(self.get_parameter('controller.controller_frequency').value)
+        self.v_linear_min         = float(self.get_parameter('controller.v_linear_min').value)
+        self.v_linear_max         = float(self.get_parameter('controller.v_linear_max').value)
+        self.v_angular_max        = float(self.get_parameter('controller.v_angular_max').value)
+        self.linear_tolerance  = float(self.get_parameter('undocking.linear_tolerance').value)
+        self.angular_tolerance = float(self.get_parameter('undocking.angular_tolerance').value)
+        self.dock_backwards    = bool(self.get_parameter('undocking.dock_backwards').value)
 
         self.get_logger().debug(
             f'Parameters loaded | '
@@ -489,7 +449,7 @@ class HuskyOperationsManager(Node):
         current_pos = self.pose_status.pose.pose.position
 
         distance = self._calculate_distance(
-            current_pos.x, current_pos.y, charger_dock_pose.dock_x, charger_dock_pose.dock_y
+            current_pos.x, current_pos.y, charger_dock_pose.pose.x, charger_dock_pose.pose.y
         )
 
         self.get_logger().info(
@@ -499,9 +459,8 @@ class HuskyOperationsManager(Node):
         )
 
         self.get_logger().debug(
-            f'Dock position: ({charger_dock_pose.dock_x:.3f}, {charger_dock_pose.dock_y:.3f}) | '
-            f'docking_threshold={self.docking_threshold}m | '
-            f'num_docks={len(self.docking_config.dock_configs)}'
+            f'Dock position: ({charger_dock_pose.pose.x:.3f}, {charger_dock_pose.pose.y:.3f}) | '
+            f'docking_threshold={self.docking_threshold}m'
         )
 
         # TODO: validate the if condition so that undocking can occur when the robot
@@ -533,10 +492,6 @@ class HuskyOperationsManager(Node):
         if not self.is_initialized or self.startup_undock_complete:
             return
 
-        if self.docking_config is None:
-            self.get_logger().warning('_handle_startup_undocking called but docking_config is None')
-            return
-
         self.get_logger().debug(
             f'Startup undocking | current_status={self.current_status.name} | '
             f'reverse_drive_active={self.reverse_drive_active}'
@@ -552,9 +507,9 @@ class HuskyOperationsManager(Node):
 
             # Compute max_undocking_time from docking config rather than hardcoding.
             # Formula: distance to staging pose / minimum speed * safety factor of 2
-            dock_type = self.active_dock.type
-            staging_x_offset = self.active_plugin.staging_x_offset
-            v_linear = self.docking_config.controller_v_linear_max
+            dock_type          = self.active_dock.type
+            staging_x_offset   = self.staging_x_offset
+            v_linear           = self.v_linear_max
             max_undocking_time = (abs(staging_x_offset) / max(v_linear, 0.01)) * 1.25
 
             self.get_logger().debug(
@@ -1107,7 +1062,7 @@ class HuskyOperationsManager(Node):
             # Returns False when dock_backwards=True or already reversing
             self.get_logger().error(
                 f'ReverseDriveClient refused to start — '
-                f'dock_backwards={self.docking_config.dock_backwards if self.docking_config else "unknown"}'
+                f'dock_backwards={self.dock_backwards}'
             )
             self._transition_status(RobotStatusEnum.ERROR)
 

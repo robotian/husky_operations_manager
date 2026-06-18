@@ -1,16 +1,13 @@
-import math
-
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.task import Future
 
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
 from nav2_msgs.action._undock_robot import UndockRobot
 from status_interfaces.msg import SubTask, UndockGoal
 
-from husky_operations_manager.types import DockingFeedback, Docks
+from husky_operations_manager.types import DockingFeedback
 from husky_operations_manager.robot_enums import RobotStatusEnum
 
 class UndockingActionClient:

@@ -19,7 +19,7 @@ from nav2_msgs.action import NavigateThroughPoses
 from status_interfaces.msg import Task, SubTask, WayPoint, RobotStatus
 
 from husky_operations_manager.robot_enums import NavigationStatus
-from husky_operations_manager.types import WPFStatus
+from husky_operations_manager.types import NavigationFeedback
 
 
 class NavigationActionClient:
@@ -86,12 +86,12 @@ class NavigationActionClient:
         """
         return self.navigation_status
 
-    def get_current_status(self) -> WPFStatus | None:
+    def get_current_status(self) -> NavigationFeedback | None:
         """
         Get the current waypoint following status.
 
         Returns:
-            WPFStatus object with current navigation state, or None if no task active
+            NavigationFeedback object with current navigation state, or None if no task active
         """
         if not self.sub_task or not self.waypoints_list:
             return None
@@ -99,7 +99,7 @@ class NavigationActionClient:
         current_node_id = self._get_current_node_id()
         target_node_id = self.waypoints_list[-1].node_id if self.waypoints_list else -1
 
-        return WPFStatus(
+        return NavigationFeedback(
             status=int(self.navigation_status.value),
             task=self.sub_task.description,
             current_node_id=current_node_id,

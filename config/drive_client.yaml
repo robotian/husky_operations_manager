@@ -1,9 +1,29 @@
-ros__parameters:
-  base_frame: "base_link"
-  tf_polling_rate: 10.0 # TF alignment check rate (Hz)
-  tf_base_frame: "arm_0_base_link"
-  tf_detection_frame: "arm_0_detections"
-  tolerance: 0.05 # X axis alignment tolerance (m)
-  timeout: 30.0 # Max correction time before warning (s)
-  v_linear: 0.2 # Forward/reverse speed (m/s) — tune per terrain
-  v_angular: 0.5 # Angular speed (rad/s)
+/*/drive_client:
+  ros__parameters:
+
+    drive:
+      # ── Velocity ─────────────────────────────────────────────────────────────
+      base_frame:   'base_link'
+      v_linear:     0.1      # m/s — forward/reverse speed
+      v_angular:    0.2      # rad/s — turning speed
+
+      # ── Detection ────────────────────────────────────────────────────────────
+      detection_topic: 'sensors/camera_1/detection/image_annotated/detection_pose'
+
+      # ── Alignment ────────────────────────────────────────────────────────────
+      ex_tolerance:  0.01    # m — forward/backward stop tolerance
+      ey_tolerance:  0.01    # m — lateral stop tolerance
+      ey_sign:       -1.0    # confirmed: raw ey negative when bush is to the right
+      kp:            0.5     # proportional gain for yaw correction — tune on robot
+
+      # ── Departure ────────────────────────────────────────────────────────────
+      departure_clearance:   0.2   # m — distance past bush before re-enabling detection
+
+      # ── No detection timeout ─────────────────────────────────────────────────
+      # Robot stops if no valid detection received after traveling this distance.
+      # Converted to time internally: timeout = no_detection_distance / v_linear
+      # e.g. 0.5m / 0.1m/s = 5.0s timeout
+      no_detection_distance: 1.0   # m
+
+      # ── cmd_vel ───────────────────────────────────────────────────────────────
+      cmd_vel_rate: 10.0     # Hz — republish velocity while active

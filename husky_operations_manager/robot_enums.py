@@ -103,9 +103,9 @@ class DriveStatus(Enum):
     """Status enum for DriveClient."""
 
     IDLE = 0
-    FORWARD = 1
-    REVERSE = 2
-    DONE = 3
+    SCANNING = 1
+    STOPPED = 2
+    DEPARTING = 3
     CANCELED = 4
     ERROR = 5
 

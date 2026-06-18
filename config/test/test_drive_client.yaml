@@ -1,4 +1,4 @@
-test_husky_ops_parameter_fetch:
+test_lavender_harvest:
   ros__parameters:
     # ── General ────────────────────────────────────────────────────────────────
     num_rows: 1 # Number of rows to harvest (configurable for multi-row farms)
@@ -25,8 +25,8 @@ test_husky_ops_parameter_fetch:
       tf_detection_frame: "arm_0_detections"
       tolerance: 0.05 # X axis alignment tolerance (m)
       timeout: 30.0 # Max correction time before warning (s)
-      v_linear: 0.1 # Forward/reverse speed (m/s) — tune per terrain
-      v_angular: 0.2 # Angular speed (rad/s)
+      v_linear: 0.2 # Forward/reverse speed (m/s) — tune per terrain
+      v_angular: 0.5 # Angular speed (rad/s)
 
     # ── Navigation ─────────────────────────────────────────────────────────────
     navigation:

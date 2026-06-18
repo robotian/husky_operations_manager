@@ -1,6 +1,12 @@
 """
 This script is used for controlling the robot arm during manipulator task operations
 using the ManipulatorTask action server.
+
+NOTE: This action client works with kinova_task_manager package. 
+To run the action server use following command:
+
+ros2 launch kinova_task_manager manipulator_action_server.launch.py namespace:=a200_0284
+
 """
 from rclpy.node import Node
 from rclpy.action import ActionClient

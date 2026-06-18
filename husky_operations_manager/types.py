@@ -3,9 +3,66 @@ from geometry_msgs.msg import PoseStamped
 
 
 @dataclass
-class WPFStatus:
+class DockPose:
+    x: float
+    y: float
+    theta: float
+
+
+@dataclass
+class Docks:
+    name: str
+    type: str
+    frame: str
+    pose: DockPose
+
+
+@dataclass
+class DockInstanceConfig:
+    instance_name: str
+    type: str
+    frame: str
+    pose: DockPose
+
+
+@dataclass
+class DriveConfig:
+    detection_topic: str
+    odom_topic: str
+    base_frame: str
+    cmd_vel_rate: float
+    ex_tolerance: float
+    stop_lookahead: float
+    ex_coast_gate: float
+    ex_angular_gate: float
+    k_rho: float
+    v_linear_min: float
+    v_linear_max: float
+    v_angular_max: float
+    departure_clearance: float
+    no_detection_distance: float
+
+
+@dataclass
+class ReverseDriveConfig:
+    dock_names: list[str]
+    dock_configs: dict
+    plugin_name: str
+    staging_x_offset: float
+    staging_yaw_offset: float
+    base_frame: str
+    controller_frequency: float
+    v_linear_min: float
+    v_angular_max: float
+    linear_tolerance: float
+    angular_tolerance: float
+    dock_backwards: bool
+
+
+@dataclass
+class NavigationFeedback:
     """
-    WPFStatus class represents the status of a way point follower process.
+    NavigationFeedback class represents the status of a way point follower process.
 
     Attributes:
         status (int): The current status of the way point follower process.
@@ -38,101 +95,6 @@ class DockingFeedback:
 
 
 @dataclass
-class DockPose:
-    x: float
-    y: float
-    theta: float
-
-
-@dataclass
-class Docks:
-    name: str
-    type: str
-    frame: str
-    pose: DockPose
-
-
-@dataclass
-class DockPluginConfig:
-    plugin_name: str
-    plugin: str
-    docking_threshold: float
-    staging_x_offset: float
-    staging_yaw_offset: float
-    use_external_detection_pose: bool
-    external_detection_timeout: float
-    external_detection_translation_x: float
-    external_detection_translation_y: float
-    external_detection_rotation_roll: float
-    external_detection_rotation_pitch: float
-    external_detection_rotation_yaw: float
-    filter_coef: float
-    detector_service_name: str
-    detector_service_timeout: float
-    subscribe_toggle: bool
-    use_battery_status: bool
-    use_stall_detection: bool
-    stall_velocity_threshold: float
-    stall_effort_threshold: float
-    charging_threshold: float
-    rotate_to_dock: bool
-    dock_direction: str
-
-
-@dataclass
-class DockInstanceConfig:
-    instance_name: str
-    type: str
-    frame: str
-    pose: list
-    id: str
-    dock_x: float
-    dock_y: float
-    dock_theta: float
-
-
-@dataclass
-class DockingConfig:
-    # Raw lists from docking_server
-    dock_plugins: list
-    docks: list
-
-    # Fetched configs keyed by name
-    plugin_configs: dict  # plugin_name → DockPluginConfig
-    dock_configs: dict  # dock_name   → DockInstanceConfig
-
-    # Top-level params
-    base_frame: str
-    fixed_frame: str
-    controller_frequency: float
-    initial_perception_timeout: float
-    wait_charge_timeout: float
-    dock_approach_timeout: float
-    undock_linear_tolerance: float
-    undock_angular_tolerance: float
-    max_retries: int
-    dock_backwards: bool
-    dock_prestaging_tolerance: float
-
-    # Controller params
-    controller_k_phi: float
-    controller_k_delta: float
-    controller_v_linear_min: float
-    controller_v_linear_max: float
-    controller_v_angular_max: float
-    controller_slowdown_radius: float
-    controller_use_collision_detection: bool
-    controller_costmap_topic: str
-    controller_footprint_topic: str
-    controller_transform_tolerance: float
-    controller_projection_time: float
-    controller_simulation_time_step: float
-    controller_dock_collision_threshold: float
-    controller_rotate_to_heading_angular_vel: float
-    controller_rotate_to_heading_max_angular_accel: float
-
-
-@dataclass
 class ManipulatorTaskFeedback:
     """Feedback data for a harvesting arm task."""
 
@@ -146,13 +108,13 @@ class ManipulatorTaskFeedback:
 
 
 @dataclass
-class DriveConfig:
-    timeout: float
-    base_frame: str
-    tf_base_frame: str
-    tf_detection_frame: str
-    v_linear: float
-    v_angular: float
-    tf_polling_rate: float    
-    tolerance: float
+class UnloaderFeedback:
+    """Feedback data for an unloader carriage goal."""
 
+    status: int
+    target: str  # 'HOME' or 'END'
+    progress_percent: float
+    step_count: int
+    at_home_limit: bool
+    at_end_limit: bool
+    feedback_message: str
