@@ -7,6 +7,9 @@ To run the action server use following command:
 
 ros2 launch kinova_task_manager manipulator_action_server.launch.py namespace:=a200_0284
 
+
+Usages:
+ ros2 run husky_operations_manager test_harvest_client --ros-args -r __ns:=/a200_0284 -r /tf:=tf -r /tf_static:=tf_static
 """
 from rclpy.node import Node
 from rclpy.action import ActionClient
