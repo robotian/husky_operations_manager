@@ -109,6 +109,20 @@ class LavenderHarvestNode(Node):
                 v_angular_max=self.drive_v_angular_max,
                 departure_clearance=self.drive_departure_clearance,
                 no_detection_distance=self.drive_no_detection_distance,
+                ang_tol=self.drive_ang_tol,
+                k_v_p=self.drive_k_v_p,
+                k_v_d=self.drive_k_v_d,
+                k_omega_p=self.drive_k_omega_p,
+                k_omega_d=self.drive_k_omega_d,
+                k_beta_p=self.drive_k_beta_p,
+                k_beta_d=self.drive_k_beta_d,
+                a_max=self.drive_a_max,
+                alpha_max=self.drive_alpha_max,
+                backward_distance_threshold=self.drive_backward_distance_threshold,
+                cam_tx=self.drive_cam_tx,
+                cam_ty=self.drive_cam_ty,
+                bushrow_theta=self.drive_bushrow_theta,
+                arm_tx_offset=self.drive_arm_tx_offset,
             ),
         )
 
@@ -182,6 +196,22 @@ class LavenderHarvestNode(Node):
         self.declare_parameter('drive.ex_angular_gate', 0.05)
         self.declare_parameter('drive.departure_clearance', 0.3)
         self.declare_parameter('drive.no_detection_distance', 0.5)
+        # --- PD target-pose controller (drive.py) ---
+        self.declare_parameter('drive.ang_tol', 0.05)
+        self.declare_parameter('drive.k_v_p', 0.2)
+        self.declare_parameter('drive.k_v_d', 0.2)
+        self.declare_parameter('drive.k_omega_p', 0.4)
+        self.declare_parameter('drive.k_omega_d', 0.1)
+        self.declare_parameter('drive.k_beta_p', 1.0)
+        self.declare_parameter('drive.k_beta_d', 1.0)
+        self.declare_parameter('drive.a_max', 0.05)
+        self.declare_parameter('drive.alpha_max', 0.3)
+        self.declare_parameter('drive.backward_distance_threshold', 1.0)
+        # --- Camera mount / row geometry (drive.py) ---
+        self.declare_parameter('drive.cam_tx', -0.239)
+        self.declare_parameter('drive.cam_ty', -0.500)
+        self.declare_parameter('drive.bushrow_theta', 0.0)
+        self.declare_parameter('drive.arm_tx_offset', 0.214)
 
         # Task trigger
         self.declare_parameter('task.trigger_topic', 'job/trigger')
@@ -250,6 +280,22 @@ class LavenderHarvestNode(Node):
         self.drive_ex_angular_gate = float(self.get_parameter('drive.ex_angular_gate').value)
         self.drive_departure_clearance = float(self.get_parameter('drive.departure_clearance').value)
         self.drive_no_detection_distance = float(self.get_parameter('drive.no_detection_distance').value)
+        # --- PD target-pose controller (drive.py) ---
+        self.drive_ang_tol = float(self.get_parameter('drive.ang_tol').value)
+        self.drive_k_v_p = float(self.get_parameter('drive.k_v_p').value)
+        self.drive_k_v_d = float(self.get_parameter('drive.k_v_d').value)
+        self.drive_k_omega_p = float(self.get_parameter('drive.k_omega_p').value)
+        self.drive_k_omega_d = float(self.get_parameter('drive.k_omega_d').value)
+        self.drive_k_beta_p = float(self.get_parameter('drive.k_beta_p').value)
+        self.drive_k_beta_d = float(self.get_parameter('drive.k_beta_d').value)
+        self.drive_a_max = float(self.get_parameter('drive.a_max').value)
+        self.drive_alpha_max = float(self.get_parameter('drive.alpha_max').value)
+        self.drive_backward_distance_threshold = float(self.get_parameter('drive.backward_distance_threshold').value)
+        # --- Camera mount / row geometry (drive.py) ---
+        self.drive_cam_tx = float(self.get_parameter('drive.cam_tx').value)
+        self.drive_cam_ty = float(self.get_parameter('drive.cam_ty').value)
+        self.drive_bushrow_theta = float(self.get_parameter('drive.bushrow_theta').value)
+        self.drive_arm_tx_offset = float(self.get_parameter('drive.arm_tx_offset').value)
 
         self.task_trigger_topic = str(self.get_parameter('task.trigger_topic').value)
 

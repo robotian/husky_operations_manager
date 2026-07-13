@@ -1,18 +1,21 @@
 """
-drive_v2.py
+drive.py
 
-Camera-guided drive controller for lavender row harvesting.
+Camera-guided PD drive controller for lavender row harvesting.
+
+Ported from the reference simulation (`DriveClientSimulatorV1.ipynb`,
+`ROS2DriveClientNode`) — a target-pose + PD position/heading controller,
+as opposed to the direct ex/ey proportional controller in drive_v2.py.
 
 Owned by a parent harvesting node which provides the ROS2 node handle
-and drives the lifecycle via the public API (scan / resume / cancel / reset).
+and drives the lifecycle via the public API (scan / resume).
 
 -------------------------------------------------------------------------------
 Coordinate Frames
 -------------------------------------------------------------------------------
 
   camera_1_detections (= camera_1_color_optical_frame orientation):
-    Confirmed via tf2_echo and rviz.
-    +X → backward  (negative when bush is ahead, zero when level, positive when passed)
+    +X → backward  (bush ahead → negative center.x)
     +Y → left
     +Z → down
 
@@ -22,113 +25,87 @@ Coordinate Frames
     +Z → up
 
   Camera is mounted upside-down and backward-facing (~179° roll + ~179° yaw).
-  camera_1_detections is a child of camera_1_color_optical_frame with same orientation.
 
 -------------------------------------------------------------------------------
-Error Signals
+Target Pose Calculation
 -------------------------------------------------------------------------------
 
-  ex = msg.center.x
-      Forward/backward centering error in camera_1_detections frame.
-      Negative  → bush is ahead of the arm (approaching).
-      Zero      → bush is level with the arm (stop point reached).
-      Positive  → robot has passed the bush (overshoot).
-      Sign is consistent across all robot headings — no correction needed.
+  On every valid detection, the bush position (msg.center.x, msg.center.y —
+  camera-frame local offsets) is rotated into the odom frame using the
+  camera mount offset (cam_tx, cam_ty) and the robot's current odom pose,
+  producing an absolute (target_x, target_y, target_yaw) — mirrors the sim's
+  `camera_frame_to_reference_frame()` / `set_target_pose()`.
 
-  ey = msg.center.y * ey_sign
-      Camera Y centering error — heading error signal.
-      msg.center.y = 0 means bush is centered in camera Y axis.
-      Since camera is backward-facing, camera Y centered on bush means
-      robot heading is parallel to the row — correct harvesting position.
-      msg.center.y sign depends on robot map-frame heading (see ey_sign below).
+  This is a manual 2-D rigid-body transform, not a TF lookup — matches the
+  sim and drive_v2.py, both of which avoid TF for this calculation.
 
--------------------------------------------------------------------------------
-Dynamic ey_sign
--------------------------------------------------------------------------------
-
-  Bush is always physically to the robot's right (arm mounting constraint).
-  Camera Y = base_link Y (both left). Bush to the right = -Y base_link.
-  msg.center.y sign depends on robot map-frame heading:
-
-    right_y_map = -cos(yaw)   [robot's right vector, Y component in map frame]
-
-    If right_y_map >= 0: bush appears at positive center.y → ey_sign = -1.0
-    If right_y_map <  0: bush appears at negative center.y → ey_sign = +1.0
-
-  East/West boundary (right_y_map ≈ 0): resolved via right_x_map = sin(yaw).
-
-  Verified against all 4 cardinals:
-    North (+0°):   right_y_map=-1.0 → ey_sign=+1.0
-    East  (+90°):  right_y_map=0.0  → right_x_map=+1.0 → ey_sign=-1.0
-    South (+180°): right_y_map=+1.0 → ey_sign=-1.0
-    West  (-90°):  right_y_map=0.0  → right_x_map=-1.0 → ey_sign=+1.0
-
-  Computed once at scan() from live odom yaw. Stable for the entire approach
-  since the robot's map-frame heading does not change significantly during
-  a single bush approach.
+  NOTE: the sim declares an ARM_TX_OFFSET (0.214 m — arm_0_base_link.tx
+  relative to base_link) documented as "the arm-stop goal is placed past
+  the bush along the row", but the sim code never actually applies it —
+  the target pose is the bush position itself. Reproduced faithfully here
+  (arm_tx_offset is carried in DriveConfig but unused), not fixed.
 
 -------------------------------------------------------------------------------
 Controller
 -------------------------------------------------------------------------------
 
-  Activated on first valid detection of each new bush (ex < 0 only).
-  Resets on scan() call and on DEPARTING → SCANNING transition.
+  Runs on a fixed-rate control timer (1 / config.cmd_vel_rate), consuming
+  the latest cached odom + detection each tick — mirrors the sim's
+  `update_loop_10hz()` cadence, rather than being driven off the detection
+  callback directly (as in drive_v2.py).
 
-  Forward speed scaling (linear_x):
-    Starts at v_linear_max when bush is first detected (lookahead_distance).
-    Reduces linearly to v_linear_min as ex approaches zero.
-    lookahead_distance = abs(ex) at first detection — set once per bush.
+  Phase 1 (distance_error > ex_tolerance): PD drive-to-point.
+    heading_error = atan2(dy, dx) - theta
+    Reverse motion allowed if distance_error < backward_distance_threshold
+    and |heading_error| > pi/2.
+    v = K_v_p * distance_error + K_v_d * d(distance_error)/dt
+    omega = K_omega_p * heading_error + K_omega_d * d(heading_error)/dt
 
-    linear_x = v_linear_min + (v_linear_max - v_linear_min) * (abs(ex) / lookahead_distance)
-    linear_x = clamp(linear_x, v_linear_min, v_linear_max)
+  Phase 2 (position reached, final heading not yet within ang_tol): PD
+  final-orientation correction.
+    omega = K_beta_p * final_heading_error + K_beta_d * d(...)/dt
 
-  Heading correction (angular_z):
-    angular_z = clamp(k_rho * ey, -v_angular_max, +v_angular_max)
-
-    k_rho: single gain on camera Y centering error (heading error signal).
-    Gated off when |ex| <= ex_angular_gate — robot drives straight for
-    final approach segment, preventing yaw at the stop point.
-    Gated off when ex >= 0 — bush is level or passed, no correction needed.
-
-  Stop condition:
-    |ex| <= ex_tolerance → STOPPED, zero velocity published.
-
-  Overshoot detection:
-    ex sign change negative → positive → hard stop (STOPPED), logged as WARNING.
+  Both phases clamped to [v_linear_min/max?, v_linear_max] / [-omega_max,
+  omega_max] then accel-limited to ±a_max*dt / ±alpha_max*dt around the
+  previous command.
 
 -------------------------------------------------------------------------------
 State Machine
 -------------------------------------------------------------------------------
 
   IDLE
-    └─► scan() → SCANNING  (forward drive, controller inactive)
-          ├─► first valid detection (ex < 0) → controller activates
-          ├─► |ex| <= ex_tolerance + stop_lookahead → STOPPED
-          ├─► ex sign flip (overshoot) → STOPPED  (WARNING logged)
-          ├─► no detection for no_detection_timeout → STOPPED  (row end)
-          └─► cancel() → CANCELED
+    └─► scan() → SCANNING  (forward at v_linear_min, no target yet)
+          ├─► valid detection → set target pose → CONTROLLING
+          └─► no detection for no_detection_timeout → STOPPED  (row end)
+
+  CONTROLLING
+    ├─► valid detection → update target pose (re-locks every tick)
+    ├─► PD goal reached (position + final heading) → STOPPED
+    └─► (no explicit timeout — mirrors sim, which has none in this state)
 
   STOPPED
-    └─► resume() → DEPARTING  (detections ignored, drive past bush)
-          └─► clearance elapsed → SCANNING  (controller reset for next bush)
-
-  Any active state: cancel() → CANCELED | reset() → IDLE
+    └─► resume() → DEPARTING  (drive at v_linear_min, no detection handling)
+          └─► departure_clearance elapsed → SCANNING  (via scan())
 
 -------------------------------------------------------------------------------
 Notes
 -------------------------------------------------------------------------------
 
-  - cmd_vel is republished at cmd_vel_rate between detections using last
-    computed (linear_x, angular_z). Prevents robot stopping due to cmd_vel
-    timeout between ~5Hz detection messages.
-  - _cmd_vel_timer is the sole ROS2 timer. No-detection timeout and departure
-    clearance are implemented as absolute deadlines checked inside
-    _cmd_vel_repeat_callback. Resolution = 1 / cmd_vel_rate (100ms at 10Hz).
-    Worst-case departure overshoot at v_linear_max=0.1m/s: 1cm — acceptable.
-  - Odom subscription uses qos_profile_sensor_data (BEST_EFFORT).
-  - DriveConfig has no default values — all fields must be explicitly supplied.
-  - TF lookup is NOT used — ex/ey derived directly from msg.center with
-    ey_sign correction from odom yaw.
+  - Detection subscription uses the real ImageDetectionPose message
+    (status_interfaces) — msg.detection_valid, msg.center.x, msg.center.y.
+    msg.center.x/y are the raw camera-frame bush offsets consumed directly
+    by the target-pose transform, NOT the ex/ey pre-computed error signal
+    used in drive_v2.py.
+  - ey_sign (present in the sim and drive_v2.py) is intentionally omitted:
+    it is computed in the sim but never consumed by the PD math — the
+    camera→odom transform already accounts for heading via the robot's
+    actual odom yaw. Dropping it changes nothing behaviorally.
+  - Odom and detection subscriptions use qos_profile_sensor_data
+    (BEST_EFFORT), matching drive_v2.py's convention for sensor topics.
+  - cmd_vel is published as TwistStamped every control tick — this doubles
+    as the "republish between detections" behavior drive_v2.py implements
+    with a separate timer, since here the control timer itself is the
+    sole driver of both the state machine and the publish rate.
 """
 
 import math
@@ -144,19 +121,20 @@ from tf_transformations import euler_from_quaternion
 from geometry_msgs.msg import TwistStamped
 from status_interfaces.msg import ImageDetectionPose
 
+
 class DriveClient:
     """
-    Component class for camera-guided forward drive with heading correction.
+    Component class for camera-guided PD target-pose drive control.
 
     Instantiated and owned by the parent harvesting node.
     Uses the parent node reference for all ROS2 primitives.
 
     Lifecycle:
-      1. scan()    — start SCANNING forward, controller inactive
-      2. (auto)    — first valid detection (ex < 0) activates controller
-      3. (auto)    — |ex| <= ex_tolerance → STOPPED
+      1. scan()    — start SCANNING forward, no target locked
+      2. (auto)    — first valid detection locks a target pose → CONTROLLING
+      3. (auto)    — PD goal reached (position + final heading) → STOPPED
       4. resume()  — called by parent after harvest → DEPARTING
-      5. (auto)    — departure clearance met → SCANNING, controller reset
+      5. (auto)    — departure clearance met → SCANNING (via scan())
     """
 
     def __init__(self, node: Node, config: DriveConfig) -> None:
@@ -165,44 +143,65 @@ class DriveClient:
         self._ns     = self._node.get_namespace().rstrip('/')
 
         # --- Config ---
-        self._base_frame            = config.base_frame
-        self._ex_tolerance          = config.ex_tolerance
-        self._stop_lookahead        = config.stop_lookahead
-        self._ex_coast_gate         = config.ex_coast_gate
-        self._ex_angular_gate       = config.ex_angular_gate
-        self._k_rho                 = config.k_rho
-        self._v_linear_min          = config.v_linear_min
-        self._v_linear_max          = config.v_linear_max
-        self._v_angular_max         = config.v_angular_max
-        self._departure_clearance   = config.departure_clearance
+        self._base_frame          = config.base_frame
+        self._stop_threshold      = config.ex_tolerance
+        self._ang_tol             = config.ang_tol
+        self._v_linear_min        = config.v_linear_min
+        self._v_linear_max        = config.v_linear_max
+        self._omega_max           = config.v_angular_max
+        self._k_v_p               = config.k_v_p
+        self._k_v_d               = config.k_v_d
+        self._k_omega_p           = config.k_omega_p
+        self._k_omega_d           = config.k_omega_d
+        self._k_beta_p            = config.k_beta_p
+        self._k_beta_d            = config.k_beta_d
+        self._a_max                = config.a_max
+        self._alpha_max            = config.alpha_max
+        self._backward_dist_thresh = config.backward_distance_threshold
+        self._cam_pose: tuple[float, float, float] = (
+            config.cam_tx,
+            config.cam_ty,
+            math.pi,  # camera faces backward
+        )
+        self._bushrow_theta       = config.bushrow_theta
 
-        # Convert no_detection_distance to timeout using v_linear_max
+        self._dt = 1.0 / config.cmd_vel_rate
+
+        # Convert distance-based config fields to time, matching the
+        # derivation already established for DriveConfig by drive_v2.py.
         self._no_detection_timeout: float = (
             config.no_detection_distance / max(config.v_linear_max, 0.01)
         )
+        self._departure_duration: float = (
+            config.departure_clearance / max(config.v_linear_max, 0.01)
+        )
 
         # --- Odom state ---
-        # ey_sign is computed once at scan() from live odom yaw.
-        # Determines correct angular_z direction for camera Y centering.
-        self._current_yaw:   float = 0.0
-        self._odom_received: bool  = False
-        self._ey_sign:       float = 0.0   # set at scan() time
+        self._odom_received: bool = False
+        self._current_pose: list[float] = [0.0, 0.0, 0.0]     # x, y, yaw
+        self._current_velocity: list[float] = [0.0, 0.0]      # v, omega
 
-        # --- Controller state ---
-        self._controller_active:  bool         = False
-        self._lookahead_distance: float | None = None  # set on first detection
-        self._last_ex:            float | None = None  # overshoot detection
-
-        # --- Deadline state ---
-        # Absolute wall-clock timestamps (nanoseconds / 1e9) checked inside
-        # _cmd_vel_repeat_callback. None means the respective feature is inactive.
-        self._no_detection_deadline: float | None = None
-        self._departure_deadline:    float | None = None
+        # --- Latest cached detection ---
+        # (detected, bush_x, bush_y) in camera frame — consumed once per
+        # control tick, same as the sim's camera_data input.
+        self._latest_detection: tuple[bool, float, float] = (False, 0.0, 0.0)
 
         # --- Drive state ---
-        self._status:           DriveStatus = DriveStatus.IDLE
-        self._current_linear_x: float       = 0.0
-        self._current_angular_z: float      = 0.0
+        self._status: DriveStatus = DriveStatus.IDLE
+        self._state_timer: float = 0.0
+
+        # --- Target pose (odom frame) ---
+        self._target_pose: tuple[float, float, float] | None = None
+
+        # --- PD state memory ---
+        self._v_prev: float = 0.0
+        self._omega_prev: float = 0.0
+        self._prev_distance_error: float | None = None
+        self._prev_heading_error: float | None = None
+        self._prev_final_heading_error: float | None = None
+
+        self._cmd_linear_x: float = 0.0
+        self._cmd_angular_z: float = 0.0
 
         # --- Odom subscription ---
         self._odom_sub = self._node.create_subscription(
@@ -227,23 +226,21 @@ class DriveClient:
             10,
         )
 
-        # --- cmd_vel repeat timer ---
-        self._cmd_vel_timer = self._node.create_timer(
-            1.0 / config.cmd_vel_rate,
-            self._cmd_vel_repeat_callback,
+        # --- Control timer — sole driver of the state machine + cmd_vel ---
+        self._control_timer = self._node.create_timer(
+            self._dt,
+            self._control_callback,
         )
 
         self._logger.info(
-            f'DriveClient v2 initialized | '
+            f'DriveClient (PD) initialized | '
             f'v_linear=[{self._v_linear_min}, {self._v_linear_max}]m/s | '
-            f'v_angular_max={self._v_angular_max}rad/s | '
-            f'k_rho={self._k_rho} | '
-            f'ex_tolerance={self._ex_tolerance}m | '
-            f'stop_lookahead={self._stop_lookahead}m | '
-            f'ex_coast_gate={self._ex_coast_gate}m | '
-            f'ex_angular_gate={self._ex_angular_gate}m | '
-            f'departure_clearance={self._departure_clearance}m | '
-            f'no_detection_timeout={self._no_detection_timeout:.1f}s'
+            f'omega_max={self._omega_max}rad/s | '
+            f'stop_threshold={self._stop_threshold}m | '
+            f'ang_tol={self._ang_tol}rad | '
+            f'control_rate={config.cmd_vel_rate}Hz | '
+            f'no_detection_timeout={self._no_detection_timeout:.1f}s | '
+            f'departure_duration={self._departure_duration:.1f}s'
         )
 
     # =========================================================================
@@ -252,43 +249,28 @@ class DriveClient:
 
     def scan(self) -> None:
         """
-        Start forward scanning drive.
-
-        Computes ey_sign from current odom yaw. Guards against starting
-        if odom has not yet been received. Controller is inactive until
-        the first valid detection with ex < 0.
+        Start forward scanning drive. No target is locked until the first
+        valid detection arrives on the control timer.
         """
         if not self._odom_received:
             self._logger.error(
-                'scan() called but odom not yet received — '
-                'cannot compute ey_sign, aborting scan'
+                'scan() called but odom not yet received — aborting scan'
             )
             return
 
-        self._ey_sign = self._compute_ey_sign()
-        self._logger.info(
-            f'SCANNING | '
-            f'yaw={math.degrees(self._current_yaw):+.2f}deg | '
-            f'ey_sign={self._ey_sign:+.1f} | '
-            f'v_max={self._v_linear_max}m/s | '
-            f'controller inactive until first detection'
-        )
-
         self._status = DriveStatus.SCANNING
-        self._reset_controller()
-        self._current_linear_x      = self._v_linear_max
-        self._current_angular_z     = 0.0
-        self._no_detection_deadline = None
-        self._departure_deadline    = None
-        self._publish_cmd_vel(self._v_linear_max, 0.0)
+        self._state_timer = 0.0
+        self._target_pose = None
+        self._reset_pd_state()
+
+        self._logger.info('SCANNING — controller inactive until first detection')
 
     def resume(self) -> None:
         """
         Called by the parent node after harvest activity completes.
 
-        Transitions to DEPARTING. Detections are ignored until the robot
-        has moved departure_clearance metres past the bush. Controller is
-        reset at the DEPARTING → SCANNING transition via scan().
+        Transitions STOPPED → DEPARTING. Departure duration is derived
+        from config.departure_clearance (m) / v_linear_max.
         """
         if self._status != DriveStatus.STOPPED:
             self._logger.warning(
@@ -296,44 +278,11 @@ class DriveClient:
             )
             return
 
-        departure_duration = self._departure_clearance / max(self._v_linear_max, 0.01)
-        self._departure_deadline = (
-            self._node.get_clock().now().nanoseconds / 1e9 + departure_duration
-        )
-
+        self._status = DriveStatus.DEPARTING
+        self._state_timer = 0.0
         self._logger.info(
-            f'DEPARTING | '
-            f'clearance={self._departure_clearance}m | '
-            f'estimated_duration={departure_duration:.1f}s'
+            f'DEPARTING — clearing bush area | duration={self._departure_duration:.1f}s'
         )
-
-        self._status            = DriveStatus.DEPARTING
-        self._current_linear_x  = self._v_linear_max
-        self._current_angular_z = 0.0
-        self._publish_cmd_vel(self._v_linear_max, 0.0)
-
-    def cancel(self) -> None:
-        """Cancel active drive and publish zero velocity."""
-        if self._status in (DriveStatus.IDLE, DriveStatus.CANCELED):
-            return
-        self._status                = DriveStatus.CANCELED
-        self._current_linear_x      = 0.0
-        self._current_angular_z     = 0.0
-        self._no_detection_deadline = None
-        self._departure_deadline    = None
-        self._reset_controller()
-        self._publish_cmd_vel(0.0, 0.0)
-        self._logger.info('Drive CANCELED')
-
-    def reset(self) -> None:
-        """Reset to IDLE — clears all state."""
-        self._status                = DriveStatus.IDLE
-        self._current_linear_x      = 0.0
-        self._current_angular_z     = 0.0
-        self._no_detection_deadline = None
-        self._departure_deadline    = None
-        self._reset_controller()
-        self._logger.info('DriveClient reset to IDLE')
 
     def get_status(self) -> DriveStatus:
         """Return the current DriveStatus."""
@@ -341,7 +290,11 @@ class DriveClient:
 
     def is_active(self) -> bool:
         """Return True if the robot is currently moving."""
-        return self._status in (DriveStatus.SCANNING, DriveStatus.DEPARTING)
+        return self._status in (
+            DriveStatus.SCANNING,
+            DriveStatus.CONTROLLING,
+            DriveStatus.DEPARTING,
+        )
 
     def is_ready(self) -> bool:
         """Return True if odom has been received and scan() can be safely called."""
@@ -352,310 +305,224 @@ class DriveClient:
     # =========================================================================
 
     def _odom_callback(self, msg: Odometry) -> None:
-        """
-        Extract yaw from odom quaternion and store as _current_yaw.
-
-        Called continuously. _current_yaw is only consumed at scan() time
-        to compute ey_sign — not used during the approach itself.
-
-        Throttled debug log at 5s — once per bush approach, not per message.
-        """
         q = msg.pose.pose.orientation
-        _, _, self._current_yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self._current_pose = [msg.pose.pose.position.x, msg.pose.pose.position.y, yaw]
+        self._current_velocity = [msg.twist.twist.linear.x, msg.twist.twist.angular.z]
         self._odom_received = True
 
-        self._logger.debug(
-            f'Odom | '
-            f'position=({msg.pose.pose.position.x:.3f}, {msg.pose.pose.position.y:.3f}) | '
-            f'yaw={math.degrees(self._current_yaw):+.2f}deg',
-            throttle_duration_sec=5.0,
-        )
-
     # =========================================================================
-    # ey_sign computation
-    # =========================================================================
-
-    def _compute_ey_sign(self) -> float:
-        """
-        Compute ey_sign from current robot map-frame yaw.
-
-        Bush is always physically to the robot's right (arm mounting constraint).
-        Camera Y = base_link Y (both left). Bush to right = -Y base_link = -Y camera.
-        msg.center.y sign depends on robot map-frame heading:
-
-          right_y_map = -cos(yaw)   [Y component of robot's right vector in map]
-
-          right_y_map >= 0: bush appears at positive center.y → ey_sign = -1.0
-          right_y_map <  0: bush appears at negative center.y → ey_sign = +1.0
-
-        East/West boundary (right_y_map ≈ 0):
-          Resolved via right_x_map = sin(yaw) [X component of robot's right vector]
-          right_x_map > 0 → ey_sign = -1.0
-          right_x_map < 0 → ey_sign = +1.0
-
-        Verified against all 4 cardinals:
-          North (0°):   right_y_map=-1.0          → ey_sign=+1.0
-          East  (+90°): right_y_map=0 boundary,   right_x_map=+1.0 → ey_sign=-1.0
-          South (+180°): right_y_map=+1.0         → ey_sign=-1.0
-          West  (-90°): right_y_map=0 boundary,   right_x_map=-1.0 → ey_sign=+1.0
-        """
-        right_y_map = -math.cos(self._current_yaw)
-
-        if abs(right_y_map) > 0.01:
-            # Clear case — use Y component directly
-            sign = -1.0 if right_y_map >= 0.0 else +1.0
-        else:
-            # East/West boundary — resolve via X component
-            right_x_map = math.sin(self._current_yaw)
-            sign = -1.0 if right_x_map > 0.0 else +1.0
-
-        self._logger.debug(
-            f'_compute_ey_sign | '
-            f'yaw={math.degrees(self._current_yaw):+.2f}deg | '
-            f'right_y_map={right_y_map:+.4f} | '
-            f'ey_sign={sign:+.1f}'
-        )
-        return sign
-
-    # =========================================================================
-    # Detection callback
+    # Detection callback — caches only, state machine runs on control timer
     # =========================================================================
 
     def _detection_callback(self, msg: ImageDetectionPose) -> None:
-        """
-        Fires on every ImageDetectionPose message.
-
-        SCANNING:
-          Invalid detection within ex_coast_gate → zero linear_x to hold
-            position. Prevents coasting past stop point during detection drops.
-          Invalid detection outside ex_coast_gate → no-op (deadline keeps running).
-          First valid detection with ex < 0 → activate controller,
-            set lookahead_distance = abs(ex).
-          First valid detection with ex >= 0 → trailing edge of previous
-            bush after DEPARTING — skip, not a new bush.
-          Subsequent valid detections → compute velocity, check stop/overshoot.
-
-        DEPARTING:
-          All detections → ignored, clearance handled by _cmd_vel_repeat_callback.
-
-        All other states: no-op.
-        """
-        self._logger.debug(
-            f'Detection | valid={msg.detection_valid} | '
-            f'center=({msg.center.x:.3f}, {msg.center.y:.3f}, {msg.center.z:.3f}) | '
-            f'status={self._status.name}'
-        )
-
-        if self._status == DriveStatus.DEPARTING:
-            return
-
-        if self._status != DriveStatus.SCANNING:
-            return
-
-        if not msg.detection_valid:
-            # Within coast gate — hold position to prevent coasting past stop point
-            if (
-                self._controller_active
-                and self._last_ex is not None
-                and abs(self._last_ex) <= self._ex_coast_gate
-            ):
-                self._current_linear_x = 0.0
-                self._logger.debug(
-                    f'Invalid detection within coast gate | '
-                    f'last_ex={self._last_ex:+.3f}m — holding position'
-                )
-            return
-
-        # Valid detection in SCANNING state — reset no-detection deadline
-        # (only if controller already active; deadline starts on first detection)
-
-        ex = msg.center.x
-        ey = msg.center.y * self._ey_sign
-
-        # --- Controller activation ---
-        if not self._controller_active:
-            if ex >= 0.0:
-                self._logger.debug(
-                    f'Skipping activation — trailing edge detected | ex={ex:+.3f}m'
-                )
-                return
-
-            # First valid detection of new bush (ex < 0) — activate controller
-            self._lookahead_distance    = abs(ex)
-            self._controller_active     = True
-            self._last_ex               = ex
-            self._no_detection_deadline = (
-                self._node.get_clock().now().nanoseconds / 1e9 + self._no_detection_timeout
-            )
-            self._logger.info(
-                f'Controller activated | '
-                f'lookahead_distance={self._lookahead_distance:.3f}m | '
-                f'ex={ex:+.3f}m ey={ey:+.3f}m | '
-                f'ey_sign={self._ey_sign:+.1f}'
-            )
-
-        # Controller active — reset no-detection deadline on every valid detection
-        self._no_detection_deadline = (
-            self._node.get_clock().now().nanoseconds / 1e9 + self._no_detection_timeout
-        )
-
-        # --- Overshoot detection ---
-        if self._last_ex is not None and self._last_ex < 0.0 and ex > 0.0:
-            self._logger.warning(
-                f'Overshoot | '
-                f'ex crossed zero: last={self._last_ex:+.3f}m current={ex:+.3f}m — '
-                f'hard stop'
-            )
-            self._hard_stop()
-            return
-
-        self._last_ex = ex
-
-        # --- Stop condition ---
-        stop_threshold = self._ex_tolerance + self._stop_lookahead
-        if abs(ex) <= stop_threshold:
-            self._logger.info(
-                f'Bush level with arm | '
-                f'ex={ex:+.4f}m within threshold={stop_threshold}m '
-                f'(tolerance={self._ex_tolerance}m + lookahead={self._stop_lookahead}m) | '
-                f'ey={ey:+.4f}m — STOPPED'
-            )
-            self._hard_stop()
-            return
-
-        # --- Compute and apply velocity ---
-        linear_x, angular_z = self._compute_velocity(ex, ey)
-        self._current_linear_x  = linear_x
-        self._current_angular_z = angular_z
-        self._publish_cmd_vel(linear_x, angular_z)
-
-        self._logger.debug(
-            f'Controller | '
-            f'ex={ex:+.4f}m ey={ey:+.4f}m | '
-            f'linear_x={linear_x:.4f}m/s angular_z={angular_z:+.4f}rad/s'
+        self._latest_detection = (
+            bool(msg.detection_valid),
+            msg.center.x,
+            msg.center.y,
         )
 
     # =========================================================================
-    # Controller
+    # Control timer — sole driver of the state machine + cmd_vel
     # =========================================================================
 
-    def _compute_velocity(self, ex: float, ey: float) -> tuple[float, float]:
+    def _control_callback(self) -> None:
+        """Fixed-rate tick — mirrors the sim's update_loop_10hz()."""
+        if not self._odom_received:
+            return
+
+        self._state_timer += self._dt
+        curr_yaw = self._current_pose[2]
+        img_detected, bush_x, bush_y = self._latest_detection
+
+        if self._status == DriveStatus.IDLE:
+            self._cmd_linear_x = 0.0
+            self._cmd_angular_z = 0.0
+
+        elif self._status == DriveStatus.SCANNING:
+            self._cmd_linear_x = self._v_linear_min
+            self._cmd_angular_z = 0.0
+
+            if self._state_timer >= self._no_detection_timeout:
+                self._logger.warning(
+                    f'No-detection timeout ({self._no_detection_timeout:.1f}s) '
+                    '— row end or gap. Stopping.'
+                )
+                self._hard_stop()
+
+            elif img_detected:
+                self._set_target_pose(bush_x, bush_y)
+                self._status = DriveStatus.CONTROLLING
+                self._state_timer = 0.0
+                tx, ty, tyaw = self._target_pose
+                self._logger.info(
+                    f'Target locked — bush cam=({bush_x:.3f}, {bush_y:.3f}) '
+                    f'target odom=({tx:.3f}, {ty:.3f}, {math.degrees(tyaw):.1f}deg)'
+                )
+
+        elif self._status == DriveStatus.CONTROLLING:
+            if img_detected:
+                self._set_target_pose(bush_x, bush_y)
+
+            cmd_v, cmd_w, goal_reached = self._compute_commands_pd()
+            self._cmd_linear_x = cmd_v
+            self._cmd_angular_z = cmd_w
+
+            if goal_reached:
+                self._logger.info('Goal reached — STOPPED (awaiting resume())')
+                self._hard_stop()
+
+        elif self._status == DriveStatus.STOPPED:
+            self._cmd_linear_x = 0.0
+            self._cmd_angular_z = 0.0
+
+        elif self._status == DriveStatus.DEPARTING:
+            self._cmd_linear_x = self._v_linear_min
+            self._cmd_angular_z = 0.0
+
+            if self._state_timer >= self._departure_duration:
+                self._logger.info('Departure complete — re-scanning')
+                self.scan()
+
+        self._publish_cmd_vel(self._cmd_linear_x, self._cmd_angular_z)
+
+    # =========================================================================
+    # Target pose (camera frame → odom frame)
+    # =========================================================================
+
+    def _camera_frame_to_odom(self, local_x: float, local_y: float) -> tuple[float, float]:
+        """Manual 2-D rigid-body transform — matches the sim, no TF lookup."""
+        cx, cy, cyaw = self._cam_pose
+        base_x = cx + local_x * math.cos(cyaw) + local_y * math.sin(cyaw)
+        base_y = cy + local_x * math.sin(cyaw) - local_y * math.cos(cyaw)
+
+        rx, ry, ryaw = self._current_pose
+        odom_x = rx + base_x * math.cos(ryaw) - base_y * math.sin(ryaw)
+        odom_y = ry + base_x * math.sin(ryaw) + base_y * math.cos(ryaw)
+        return odom_x, odom_y
+
+    def _set_target_pose(self, bush_x: float, bush_y: float) -> None:
         """
-        Compute (linear_x, angular_z) from forward and heading errors.
+        Convert camera-frame bush offsets into an odom-frame target pose.
 
-        Forward speed scaling:
-          linear_x scales linearly from v_linear_max at first detection
-          (lookahead_distance) down to v_linear_min as ex → 0.
-          Clamped to [v_linear_min, v_linear_max].
-
-        Heading correction:
-          angular_z = clamp(k_rho * ey, -v_angular_max, +v_angular_max)
-          ey = msg.center.y * ey_sign = camera Y centering error.
-          ey = 0 → bush centered in camera Y → robot heading parallel to row.
-          Zeroed when |ex| <= ex_angular_gate (final approach, drive straight)
-          or when ex >= 0 (bush level or passed, no correction).
+        NOTE: arm_tx_offset is intentionally NOT applied — matches the
+        sim, which declares but never uses it.
         """
-        # --- Forward speed scaling ---
-        lookahead = self._lookahead_distance if self._lookahead_distance else abs(ex)
-        if lookahead > 0.0:
-            fraction = abs(ex) / lookahead
+        cam_x, cam_y = self._camera_frame_to_odom(bush_x, bush_y)
+        cam_yaw = self._bushrow_theta + self._cam_pose[2]
+
+        target_x = cam_x + self._cam_pose[0] * math.cos(cam_yaw) - self._cam_pose[1] * math.sin(cam_yaw)
+        target_y = cam_y + self._cam_pose[0] * math.sin(cam_yaw) + self._cam_pose[1] * math.cos(cam_yaw)
+        target_yaw = cam_yaw - self._cam_pose[2]
+
+        self._target_pose = (target_x, target_y, target_yaw)
+
+    # =========================================================================
+    # PD controller
+    # =========================================================================
+
+    def _compute_commands_pd(self) -> tuple[float, float, bool]:
+        """PD position + heading controller. Returns (v, omega, goal_reached)."""
+        x, y, theta = self._current_pose
+        x_d, y_d, theta_d = self._target_pose if self._target_pose is not None else (0.0, 0.0, 0.0)
+
+        self._v_prev = self._current_velocity[0]
+        self._omega_prev = self._current_velocity[1]
+
+        dx = x_d - x
+        dy = y_d - y
+        distance_error = math.hypot(dx, dy)
+
+        v_raw = 0.0
+        omega_raw = 0.0
+        reached_goal = False
+
+        if distance_error > self._stop_threshold:
+            target_heading = math.atan2(dy, dx)
+            heading_error = self._normalize_angle(target_heading - theta)
+
+            allow_backward = distance_error < self._backward_dist_thresh
+            if allow_backward and abs(heading_error) > math.pi / 2.0:
+                heading_error = self._normalize_angle(heading_error - math.pi)
+                direction = -1.0
+            else:
+                direction = 1.0
+
+            if self._prev_distance_error is None:
+                self._prev_distance_error = distance_error
+                self._prev_heading_error = heading_error
+
+            d_distance = (distance_error - self._prev_distance_error) / self._dt
+            d_heading = self._normalize_angle(heading_error - self._prev_heading_error) / self._dt
+
+            pd_v = self._k_v_p * distance_error + self._k_v_d * d_distance
+            v_raw = direction * pd_v * math.cos(heading_error)
+            if direction == 1.0 and v_raw < 0:
+                v_raw = 0.0
+
+            omega_raw = self._k_omega_p * heading_error + self._k_omega_d * d_heading
+
+            self._prev_distance_error = distance_error
+            self._prev_heading_error = heading_error
+            self._prev_final_heading_error = None
+
         else:
-            fraction = 0.0
+            final_heading_error = self._normalize_angle(theta_d - theta)
 
-        linear_x = self._v_linear_min + (self._v_linear_max - self._v_linear_min) * fraction
-        linear_x = max(self._v_linear_min, min(self._v_linear_max, linear_x))
+            if abs(final_heading_error) > self._ang_tol:
+                if self._prev_final_heading_error is None:
+                    self._prev_final_heading_error = final_heading_error
 
-        # --- Heading correction ---
-        if abs(ex) <= self._ex_angular_gate or ex >= 0.0:
-            # Final approach segment or bush passed — drive straight
-            angular_z = 0.0
-        else:
-            raw_angular = self._k_rho * ey
-            angular_z   = max(-self._v_angular_max, min(self._v_angular_max, raw_angular))
+                d_final = self._normalize_angle(
+                    final_heading_error - self._prev_final_heading_error
+                ) / self._dt
 
-        self._logger.debug(
-            f'_compute_velocity | '
-            f'ex={ex:+.4f}m ey={ey:+.4f}m | '
-            f'linear_x={linear_x:.4f}m/s angular_z={angular_z:+.4f}rad/s | '
-            f'lookahead={lookahead:.3f}m fraction={fraction:.3f}'
-        )
+                v_raw = 0.0
+                omega_raw = self._k_beta_p * final_heading_error + self._k_beta_d * d_final
+                self._prev_final_heading_error = final_heading_error
+            else:
+                v_raw = 0.0
+                omega_raw = 0.0
+                reached_goal = True
+                self._reset_pd_state()
 
-        return linear_x, angular_z
+        v_limited = self._clamp(v_raw, -self._v_linear_max, self._v_linear_max)
+        omega_limited = self._clamp(omega_raw, -self._omega_max, self._omega_max)
+
+        max_dv = self._a_max * self._dt
+        max_domega = self._alpha_max * self._dt
+
+        v_cmd = self._clamp(v_limited, self._v_prev - max_dv, self._v_prev + max_dv)
+        omega_cmd = self._clamp(omega_limited, self._omega_prev - max_domega, self._omega_prev + max_domega)
+
+        return v_cmd, omega_cmd, reached_goal
 
     # =========================================================================
     # Internal helpers
     # =========================================================================
 
     def _hard_stop(self) -> None:
-        """Publish zero velocity and transition to STOPPED."""
-        self._status                = DriveStatus.STOPPED
-        self._current_linear_x      = 0.0
-        self._current_angular_z     = 0.0
-        self._no_detection_deadline = None
-        self._publish_cmd_vel(0.0, 0.0)
+        self._status = DriveStatus.STOPPED
+        self._cmd_linear_x = 0.0
+        self._cmd_angular_z = 0.0
 
-    def _reset_controller(self) -> None:
-        """
-        Reset all per-bush controller state.
+    def _reset_pd_state(self) -> None:
+        self._prev_distance_error = None
+        self._prev_heading_error = None
+        self._prev_final_heading_error = None
 
-        Called on scan() (new row start or post-departure) and cancel()/reset().
-        Each new bush gets a fresh lookahead_distance and ey_sign is already
-        set by scan() before this is called.
-        """
-        self._controller_active  = False
-        self._lookahead_distance = None
-        self._last_ex            = None
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
-    def _cmd_vel_repeat_callback(self) -> None:
-        """
-        Fires at cmd_vel_rate. Serves three purposes:
-
-        1. SCANNING — republish last linear_x to prevent cmd_vel timeout between
-           ~5Hz detections. Check no_detection_deadline; on expiry → hard stop
-           (row end signal).
-
-        2. DEPARTING — republish v_linear_max. Check departure_deadline; on expiry
-           → call scan() to reset controller and resume SCANNING.
-
-        3. Both — angular_z is always zeroed. Publishing stale angular_z between
-           detections causes yaw drift when the detection pipeline drops out.
-
-        Deadline resolution = 1 / cmd_vel_rate (100ms at 10Hz).
-        Worst-case departure overshoot at v_linear_max=0.1m/s: ~1cm.
-        """
-        if self._status == DriveStatus.SCANNING:
-            if (
-                self._no_detection_deadline is not None
-                and self._node.get_clock().now().nanoseconds / 1e9 >= self._no_detection_deadline
-            ):
-                self._no_detection_deadline = None
-                self._logger.info(
-                    f'No detection for {self._no_detection_timeout:.1f}s — '
-                    f'row end assumed, stopping'
-                )
-                self._hard_stop()
-                return
-            self._publish_cmd_vel(self._current_linear_x, 0.0)
-
-        elif self._status == DriveStatus.DEPARTING:
-            if (
-                self._departure_deadline is not None
-                and self._node.get_clock().now().nanoseconds / 1e9 >= self._departure_deadline
-            ):
-                self._departure_deadline = None
-                self._logger.info(
-                    'Departure clearance met — resuming SCANNING | '
-                    'controller reset for next bush'
-                )
-                self.scan()
-                return
-            self._publish_cmd_vel(self._current_linear_x, 0.0)
+    @staticmethod
+    def _clamp(value: float, lo: float, hi: float) -> float:
+        return max(lo, min(value, hi))
 
     def _publish_cmd_vel(self, linear_x: float, angular_z: float) -> None:
-        """Wrap velocity in TwistStamped and publish to cmd_vel."""
-        msg                  = TwistStamped()
-        msg.header.stamp     = self._node.get_clock().now().to_msg()
-        msg.header.frame_id  = self._base_frame
-        msg.twist.linear.x   = linear_x
-        msg.twist.angular.z  = angular_z
+        msg = TwistStamped()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        msg.header.frame_id = self._base_frame
+        msg.twist.linear.x = linear_x
+        msg.twist.angular.z = angular_z
         self._cmd_vel_pub.publish(msg)

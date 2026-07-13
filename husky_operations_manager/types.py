@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from geometry_msgs.msg import PoseStamped
 
 
@@ -41,6 +41,27 @@ class DriveConfig:
     v_angular_max: float
     departure_clearance: float
     no_detection_distance: float
+
+    # --- PD target-pose controller (drive.py) ---
+    ang_tol: float  # rad — final-heading tolerance (~3deg)
+    k_v_p: float
+    k_v_d: float
+    k_omega_p: float
+    k_omega_d: float
+    k_beta_p: float
+    k_beta_d: float
+    a_max: float  # m/s^2
+    alpha_max: float  # rad/s^2
+    backward_distance_threshold: float  # m — allow reverse approach below this distance
+
+    # --- Camera mount / row geometry (drive.py) ---
+    cam_tx: float  # m — camera behind base_link
+    cam_ty: float  # m — camera right of base_link
+    bushrow_theta: float  # rad — row orientation in odom frame
+    # TF-derived: arm_0_base_link.tx = -0.214 m relative to base_link.
+    # Declared for parity with the reference sim, which documents this offset
+    # but never applies it in the target-pose calc — kept unused here too.
+    arm_tx_offset: float
 
 
 @dataclass
@@ -104,7 +125,7 @@ class ManipulatorTaskFeedback:
     feedback_message: str
     execution_time: float
     num_retries: int
-    arm_pose: PoseStamped = field(default_factory=PoseStamped)
+    arm_pose: PoseStamped
 
 
 @dataclass

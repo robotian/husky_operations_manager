@@ -64,6 +64,22 @@ DRIVE_CONFIG = DriveConfig(
     # --- No-detection timeout ---
     # Converted to time: 1.0m / 0.1m/s = 10s
     no_detection_distance=1.0,  # m — row end assumed after this distance
+    # --- PD target-pose controller (drive.py) ---
+    ang_tol=0.05,  # rad — final-heading tolerance (~3deg)
+    k_v_p=0.2,
+    k_v_d=0.2,
+    k_omega_p=0.4,
+    k_omega_d=0.1,
+    k_beta_p=1.0,
+    k_beta_d=1.0,
+    a_max=0.05,  # m/s^2
+    alpha_max=0.3,  # rad/s^2
+    backward_distance_threshold=1.0,  # m
+    # --- Camera mount / row geometry (drive.py) ---
+    cam_tx=-0.239,  # m — camera behind base_link
+    cam_ty=-0.500,  # m — camera right of base_link
+    bushrow_theta=0.0,  # rad — row orientation in odom frame
+    arm_tx_offset=0.214,  # m — unused, kept for parity with reference sim
 )
 
 HARVEST_SIMULATION_DURATION_SEC = 10.0  # seconds — simulated harvest activity

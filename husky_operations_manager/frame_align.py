@@ -1,22 +1,21 @@
 """
-detection_alignment_node.py
+frame_align.py
 
-Computes alignment error (ex, ey) on every valid ImageDetectionPose message.
+Computes desired robot pose to center arm_0 detection in camera FOV.
 
-TF lookup: camera_1_color_optical_frame <- camera_1_detections
-  — shortest possible chain (direct parent-child)
-  — eliminates static arm chain offset from ey
-  — near-zero baseline from calibration (Section 3: Y=-0.017m)
+TF lookups:
+  1. arm_0_camera_color_frame -> arm_0_detections  : detection offset in camera frame
+  2. base_link -> arm_0_camera_color_frame          : rotate offset into base_link axes
+  3. odom -> base_link (optional)                   : current robot pose in world frame
 
-  ex = translation.x  (forward/backward error)
-  ey = translation.y * ey_sign  (lateral error)
-       ey_sign=+1.0 (default) or -1.0 (flip) — set via YAML after testing
+Desired pose:
+  odom available  : x = odom_x + ex_bl, y = odom_y + ey_bl, yaw = current heading (odom frame)
+  odom broken     : x = ex_bl, y = ey_bl, yaw = 0.0 (relative to base_link)
 
-Logic:
-  |ex| <= ex_tolerance  → STOP
-  ey > +ey_tolerance    → TURN RIGHT (or LEFT if sign flipped)
-  ey < -ey_tolerance    → TURN LEFT  (or RIGHT if sign flipped)
+Switches to odom automatically when odom -> base_link becomes available. No code change needed.
 """
+
+import math
 
 import rclpy
 import rclpy.duration
@@ -26,46 +25,34 @@ from rclpy.node import Node
 import tf2_ros
 from tf2_ros import TransformException
 
+from rclpy.qos import QoSPresetProfiles
 from status_interfaces.msg import ImageDetectionPose
 
 
 class DetectionAlignmentNode(Node):
-    """
-    Subscribes to ImageDetectionPose and on every valid detection:
-      1. Looks up camera_1_detections in camera_1_color_optical_frame
-         (direct parent-child — shortest chain, no arm offset)
-      2. Computes ex (forward error) and ey (lateral error)
-      3. Logs STOP or TURN direction based on error values
-    """
-
     def __init__(self):
         super().__init__('detection_alignment_node')
-
-        self.namespace = self.get_namespace().rstrip('/')
 
         self._declare_parameters()
         self._read_parameters()
 
-        # --- TF ---
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
-        # --- Subscription ---
         self._detection_sub = self.create_subscription(
             ImageDetectionPose,
-            "/j100_0921/sensors/camera_1/detection/image_annotated/detection_pose",
+            self._detection_topic,
             self._detection_callback,
-            10,
+            QoSPresetProfiles.SENSOR_DATA.value,
         )
 
         self.get_logger().info(
             f'DetectionAlignmentNode ready | '
-            f"source='{self._source_frame}' | "
+            f"topic='{self._detection_topic}' | "
+            f"camera='{self._camera_frame}' | "
             f"detection='{self._detection_frame}' | "
-            f'ex_tolerance={self._ex_tolerance:.4f}m | '
-            f'ey_tolerance={self._ey_tolerance:.4f}m | '
-            f'ey_sign={self._ey_sign:+.1f} | '
-            f'subscribed to: {self._detection_sub.topic_name}'
+            f"robot='{self._robot_frame}' | "
+            f"odom='{self._odom_frame}'"
         )
 
     # =========================================================================
@@ -73,118 +60,121 @@ class DetectionAlignmentNode(Node):
     # =========================================================================
 
     def _declare_parameters(self):
-        # Option B: direct parent-child lookup eliminates arm chain offset
-        self.declare_parameter('source_frame', 'camera_1_color_optical_frame')
-        self.declare_parameter('detection_frame', 'camera_1_detections')
+        self.declare_parameter(
+            'detection_topic',
+            '/a200_0284/manipulators/arm_0_detection/image_annotated/detection_pose',
+        )
+        self.declare_parameter('camera_frame', 'arm_0_camera_color_frame')
+        self.declare_parameter('detection_frame', 'arm_0_camera_detections')
+        self.declare_parameter('robot_frame', 'base_link')
+        self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('ex_tolerance', 0.01)  # metres
         self.declare_parameter('ey_tolerance', 0.02)  # metres
-        # +1.0 = default convention, -1.0 = flip if steering is inverted on robot
-        self.declare_parameter('ey_sign', -1.0)
 
     def _read_parameters(self):
-        self._source_frame = str(self.get_parameter('source_frame').value)
+        self._detection_topic = str(self.get_parameter('detection_topic').value)
+        self._camera_frame = str(self.get_parameter('camera_frame').value)
         self._detection_frame = str(self.get_parameter('detection_frame').value)
+        self._robot_frame = str(self.get_parameter('robot_frame').value)
+        self._odom_frame = str(self.get_parameter('odom_frame').value)
         self._ex_tolerance = float(self.get_parameter('ex_tolerance').value)
         self._ey_tolerance = float(self.get_parameter('ey_tolerance').value)
-        self._ey_sign = float(self.get_parameter('ey_sign').value)
-
-        self.get_logger().info(
-            f'Parameters loaded | '
-            f"source='{self._source_frame}' | "
-            f"detection='{self._detection_frame}' | "
-            f'ex_tolerance={self._ex_tolerance:.4f}m | '
-            f'ey_tolerance={self._ey_tolerance:.4f}m | '
-            f'ey_sign={self._ey_sign:+.1f}'
-        )
 
     # =========================================================================
     # DETECTION CALLBACK
     # =========================================================================
 
     def _detection_callback(self, msg: ImageDetectionPose):
-        """
-        Fires on every ImageDetectionPose message.
-        Ignores invalid detections. Computes ex/ey on valid ones.
-        """
         if not msg.detection_valid:
             return
 
-        tf = self._lookup_detection()
-        if tf is None:
+        # 1. Detection offset in camera frame
+        tf_cam = self._lookup_tf(self._camera_frame, self._detection_frame)
+        if tf_cam is None:
             return
+        ex_cam = tf_cam.transform.translation.x
+        ey_cam = tf_cam.transform.translation.y
 
-        ex = tf.transform.translation.x
-        # Apply sign convention — determined by testing on robot
-        ey = tf.transform.translation.y * self._ey_sign
+        # 2. Rotate offset into base_link axes
+        tf_base_to_cam = self._lookup_tf(self._robot_frame, self._camera_frame)
+        if tf_base_to_cam is None:
+            return
+        ex_bl, ey_bl = self._rotate_2d(ex_cam, ey_cam, tf_base_to_cam.transform.rotation)
 
-        self.get_logger().info(f'Detection alignment | ex={ex:+.4f}m  ey={ey:+.4f}m (sign={self._ey_sign:+.1f})')
+        # 3. Desired pose — use odom if available, fall back to base_link
+        tf_odom = self._try_lookup_tf(self._odom_frame, self._robot_frame)
 
-        self._evaluate_ex(ex)
-        self._evaluate_ey(ey)
-
-    # =========================================================================
-    # ALIGNMENT EVALUATION
-    # =========================================================================
-
-    def _evaluate_ex(self, ex: float):
-        """
-        Log STOP if ex is within tolerance of zero.
-        ex ≈ 0 → detection frame is aligned with source frame on X axis.
-        """
-        if abs(ex) <= self._ex_tolerance:
-            self.get_logger().info(
-                f'STOP | ex={ex:+.4f}m within tolerance={self._ex_tolerance:.4f}m — aligned on X axis'
-            )
+        if tf_odom is not None:
+            desired_x = tf_odom.transform.translation.x + ex_bl
+            desired_y = tf_odom.transform.translation.y + ey_bl
+            desired_yaw = self._yaw_from_quat(tf_odom.transform.rotation)
+            frame_label = self._odom_frame
         else:
-            self.get_logger().debug(f'Moving | ex={ex:+.4f}m exceeds tolerance={self._ex_tolerance:.4f}m')
-
-    def _evaluate_ey(self, ey: float):
-        """
-        Log turn direction based on signed ey.
-
-        Convention (with ey_sign=+1.0, adjust via YAML if inverted):
-          ey > +ey_tolerance → TURN RIGHT
-          ey < -ey_tolerance → TURN LEFT
-          |ey| <= ey_tolerance → LATERAL ALIGNED
-        """
-        if abs(ey) <= self._ey_tolerance:
-            self.get_logger().info(f'LATERAL ALIGNED | ey={ey:+.4f}m within tolerance={self._ey_tolerance:.4f}m')
-        elif ey > 0:
-            self.get_logger().info(f'TURN RIGHT | ey={ey:+.4f}m — bush is to the right')
-        else:
-            self.get_logger().info(f'TURN LEFT  | ey={ey:+.4f}m — bush is to the left')
-
-    # =========================================================================
-    # TF LOOKUP
-    # =========================================================================
-
-    def _lookup_detection(self):
-        """
-        Direct parent-child lookup:
-          camera_1_detections expressed in camera_1_color_optical_frame.
-
-        Equivalent to: tf2_echo camera_1_color_optical_frame camera_1_detections
-          → lookup_transform(
-                target_frame='camera_1_detections',
-                source_frame='camera_1_color_optical_frame',
+            self.get_logger().warn(
+                f"'{self._odom_frame}' → '{self._robot_frame}' unavailable — "
+                f"desired pose in '{self._robot_frame}' frame",
+                throttle_duration_sec=5.0,
             )
+            desired_x = ex_bl
+            desired_y = ey_bl
+            desired_yaw = 0.0
+            frame_label = self._robot_frame
 
-        Shortest possible chain — eliminates static arm offset from ey.
-        Returns TransformStamped or None on failure.
-        """
+        self.get_logger().info(
+            f'Desired pose [{frame_label}] | '
+            f'x={desired_x:.4f}m  '
+            f'y={desired_y:.4f}m  '
+            f'yaw={math.degrees(desired_yaw):.2f}deg'
+        )
+
+    # =========================================================================
+    # TF HELPERS
+    # =========================================================================
+
+    def _lookup_tf(self, target: str, source: str):
+        """Lookup TF, log warn on failure."""
         try:
             return self._tf_buffer.lookup_transform(
-                self._detection_frame,  # target_frame
-                self._source_frame,  # source_frame
+                target,
+                source,
                 rclpy.time.Time(),
                 timeout=rclpy.duration.Duration(seconds=0.1),
             )
         except TransformException as e:
             self.get_logger().warn(
-                f"TF lookup failed | '{self._detection_frame}' ← '{self._source_frame}': {e}",
+                f"TF lookup failed | '{target}' ← '{source}': {e}",
                 throttle_duration_sec=5.0,
             )
             return None
+
+    def _try_lookup_tf(self, target: str, source: str):
+        """Lookup TF silently — returns None without warning on failure."""
+        try:
+            return self._tf_buffer.lookup_transform(
+                target,
+                source,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.05),
+            )
+        except TransformException:
+            return None
+
+    # =========================================================================
+    # MATH HELPERS
+    # =========================================================================
+
+    @staticmethod
+    def _rotate_2d(x: float, y: float, q) -> tuple:
+        """Rotate 2D vector (x, y) by quaternion. Z ignored (downward camera)."""
+        qx, qy, qz, qw = q.x, q.y, q.z, q.w
+        rx = (1 - 2 * (qy * qy + qz * qz)) * x + (2 * (qx * qy - qw * qz)) * y
+        ry = (2 * (qx * qy + qw * qz)) * x + (1 - 2 * (qx * qx + qz * qz)) * y
+        return rx, ry
+
+    @staticmethod
+    def _yaw_from_quat(q) -> float:
+        """Extract yaw (Z rotation) from quaternion."""
+        return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 
 def main(args=None):

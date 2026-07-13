@@ -29,32 +29,33 @@ POLL_INTERVAL_SEC = 0.2
 
 class _Step:
     """Ordered harvesting sequence steps."""
-    GO_STOW      = 0
-    GO_READY     = 1
+
+    GO_STOW = 0
+    GO_READY = 1
     START_HARVEST = 2
-    DONE         = 3
+    DONE = 3
 
 
 # Human-readable labels for logging
 _STEP_LABELS = {
-    _Step.GO_STOW:       "GO STOW",
-    _Step.GO_READY:      "GO READY",
-    _Step.START_HARVEST: "START HARVEST",
-    _Step.DONE:          "DONE",
+    _Step.GO_STOW: 'GO STOW',
+    _Step.GO_READY: 'GO READY',
+    _Step.START_HARVEST: 'START HARVEST',
+    _Step.DONE: 'DONE',
 }
 
 # Map each step to the ArmCommand string it sends
 _STEP_COMMANDS = {
-    _Step.GO_STOW:       ArmCommand.GO_STOW,
-    _Step.GO_READY:      ArmCommand.GO_READY,
+    _Step.GO_STOW: ArmCommand.GO_STOW,
+    _Step.GO_READY: ArmCommand.GO_READY,
     _Step.START_HARVEST: ArmCommand.START_HARVEST,
 }
 
 # Map each step to a SubTask description used in feedback reporting
 _STEP_DESCRIPTIONS = {
-    _Step.GO_STOW:       "Moving arm to stow position",
-    _Step.GO_READY:      "Moving arm to ready position",
-    _Step.START_HARVEST: "Executing harvest sequence",
+    _Step.GO_STOW: 'Moving arm to stow position',
+    _Step.GO_READY: 'Moving arm to ready position',
+    _Step.START_HARVEST: 'Executing harvest sequence',
 }
 
 
@@ -76,13 +77,10 @@ class TestHarvestNode(Node):
         self._step_result_success: bool = False
 
         # Poll timer — drives the entire state machine
-        self._poll_timer = self.create_timer(
-            POLL_INTERVAL_SEC,
-            self._poll_callback
-        )
+        self._poll_timer = self.create_timer(POLL_INTERVAL_SEC, self._poll_callback)
 
-        self.get_logger().info("TestHarvestNode started — beginning sequence from UNKNOWN pose.")
-        self.get_logger().info(f"Step 1/{_Step.DONE}: {_STEP_LABELS[_Step.GO_STOW]}")
+        self.get_logger().info('TestHarvestNode started — beginning sequence from UNKNOWN pose.')
+        self.get_logger().info(f'Step 1/{_Step.DONE}: {_STEP_LABELS[_Step.GO_STOW]}')
 
     # ------------------------------------------------------------------
     # Poll Timer — State Machine
@@ -92,7 +90,8 @@ class TestHarvestNode(Node):
         """Called every POLL_INTERVAL_SEC to drive the step sequence."""
 
         # ── Finished ────────────────────────────────────────────────────
-        if self._step == _Step.DONE: return
+        if self._step == _Step.DONE:
+            return
 
         # ── Send goal for current step ───────────────────────────────────
         if not self._goal_sent:
@@ -104,7 +103,8 @@ class TestHarvestNode(Node):
         robot_status = self._client.get_status()
 
         # Goal sent but no feedback yet — keep waiting
-        if feedback is None: return
+        if feedback is None:
+            return
 
         current_feedback_state = feedback.feedback_message
 
@@ -112,32 +112,25 @@ class TestHarvestNode(Node):
         if current_feedback_state != self._last_feedback_state:
             self._last_feedback_state = current_feedback_state
             self.get_logger().info(
-                f"[{_STEP_LABELS[self._step]}] "
-                f"feedback={current_feedback_state} | "
-                f"robot_status={robot_status.name}"
+                f'[{_STEP_LABELS[self._step]}] feedback={current_feedback_state} | robot_status={robot_status.name}'
             )
 
         # ── Error guard ──────────────────────────────────────────────────
         if robot_status == RobotStatusEnum.ERROR:
-            self.get_logger().error(
-                f"[{_STEP_LABELS[self._step]}] ERROR reported — aborting test."
-            )
+            self.get_logger().error(f'[{_STEP_LABELS[self._step]}] ERROR reported — aborting test.')
             self._shutdown()
             return
 
         # ── Step complete condition ──────────────────────────────────────
         # Complete when feedback_message is SUCCEEDED (result callback fired)
         # AND robot_status has returned to IDLE or DONE_HARVESTING
-        step_complete = (
-            current_feedback_state == "SUCCEEDED"
-            and robot_status in (
-                RobotStatusEnum.IDLE,
-                RobotStatusEnum.DONE_HARVESTING,
-            )
+        step_complete = current_feedback_state == 'SUCCEEDED' and robot_status in (
+            RobotStatusEnum.IDLE,
+            RobotStatusEnum.DONE_HARVESTING,
         )
 
         if step_complete:
-            self.get_logger().info(f"[{_STEP_LABELS[self._step]}] complete ✓")
+            self.get_logger().info(f'[{_STEP_LABELS[self._step]}] complete ✓')
             self._advance_step()
 
     # ------------------------------------------------------------------
@@ -153,8 +146,7 @@ class TestHarvestNode(Node):
         arm_cmd = _STEP_COMMANDS[step]
 
         self.get_logger().info(
-            f"[{_STEP_LABELS[step]}] Sending arm_task='{arm_cmd}' | "
-            f"description='{subtask.description}'"
+            f"[{_STEP_LABELS[step]}] Sending arm_task='{arm_cmd}' | description='{subtask.description}'"
         )
 
         # For GO_STOW and GO_READY we need to send a custom arm command
@@ -163,7 +155,7 @@ class TestHarvestNode(Node):
         success = self._dispatch_goal(subtask, arm_cmd)
 
         if not success:
-            self.get_logger().error(f"[{_STEP_LABELS[step]}] Failed to send goal — aborting test.")
+            self.get_logger().error(f'[{_STEP_LABELS[step]}] Failed to send goal — aborting test.')
             self._shutdown()
             return
 
@@ -197,21 +189,22 @@ class TestHarvestNode(Node):
         self._client.reset()
 
         if self._step == _Step.DONE:
-            self.get_logger().info("All steps completed successfully — shutting down test node.")
+            self.get_logger().info('All steps completed successfully — shutting down test node.')
             self._shutdown()
         else:
-            self.get_logger().info(f"Step {self._step + 1}/{_Step.DONE}: {_STEP_LABELS[self._step]}")
+            self.get_logger().info(f'Step {self._step + 1}/{_Step.DONE}: {_STEP_LABELS[self._step]}')
 
     def _shutdown(self):
         """Cancel poll timer and request node shutdown."""
         self._poll_timer.cancel()
-        self.get_logger().info("TestHarvestNode shutting down.")
+        self.get_logger().info('TestHarvestNode shutting down.')
         raise SystemExit
 
 
 # ----------------------------------------------------------------------
 # Entry Point
 # ----------------------------------------------------------------------
+
 
 def main(args=None):
     rclpy.init(args=args)

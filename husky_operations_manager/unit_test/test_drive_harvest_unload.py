@@ -64,6 +64,22 @@ DRIVE_CONFIG = DriveConfig(
     departure_clearance=0.2,
     # --- No-detection timeout ---
     no_detection_distance=1.0,
+    # --- PD target-pose controller (drive.py) ---
+    ang_tol=0.05,
+    k_v_p=0.2,
+    k_v_d=0.2,
+    k_omega_p=0.4,
+    k_omega_d=0.1,
+    k_beta_p=1.0,
+    k_beta_d=1.0,
+    a_max=0.05,
+    alpha_max=0.3,
+    backward_distance_threshold=1.0,
+    # --- Camera mount / row geometry (drive.py) ---
+    cam_tx=-0.239,
+    cam_ty=-0.500,
+    bushrow_theta=0.0,
+    arm_tx_offset=0.214,
 )
 
 TOTAL_BUSHES = 3

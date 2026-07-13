@@ -201,21 +201,19 @@ class ReverseDriveClient:
 
         if dist < self._lin_tol and abs(yaw_err) < self._ang_tol:
             return True
-        
+
         # Linear goal reached but yaw not settled — stop and rotate in place.
         # Without this the robot keeps reversing through the goal while heading
         # correction spins it into a widening spiral.
         if dist < self._lin_tol:
-            cmd.linear.x  = 0.0
-            cmd.angular.z = max(-self._ang_speed,
-                                min(self._ang_speed,
-                                    self._ang_speed * (yaw_err / (math.pi / 4))))
+            cmd.linear.x = 0.0
+            cmd.angular.z = max(-self._ang_speed, min(self._ang_speed, self._ang_speed * (yaw_err / (math.pi / 4))))
             robot_yaw = _yaw_from_quaternion(robot_pose.pose.orientation)
             self.logger.info(
-                f"[STOP+ROTATE] robot=({robot_pose.pose.position.x:.3f}, "
-                f"{robot_pose.pose.position.y:.3f}, {math.degrees(robot_yaw):.1f}deg) | "
-                f"dist={dist:.3f}m | yaw_err={math.degrees(yaw_err):.1f}deg | "
-                f"cmd=(lin=0.000, ang={cmd.angular.z:.4f})",
+                f'[STOP+ROTATE] robot=({robot_pose.pose.position.x:.3f}, '
+                f'{robot_pose.pose.position.y:.3f}, {math.degrees(robot_yaw):.1f}deg) | '
+                f'dist={dist:.3f}m | yaw_err={math.degrees(yaw_err):.1f}deg | '
+                f'cmd=(lin=0.000, ang={cmd.angular.z:.4f})',
                 throttle_duration_sec=1.0,
             )
             return False

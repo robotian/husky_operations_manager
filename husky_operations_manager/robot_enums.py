@@ -104,10 +104,11 @@ class DriveStatus(Enum):
 
     IDLE = 0
     SCANNING = 1
-    STOPPED = 2
-    DEPARTING = 3
-    CANCELED = 4
-    ERROR = 5
+    CONTROLLING = 2
+    STOPPED = 3
+    DEPARTING = 4
+    CANCELED = 5
+    ERROR = 6
 
 
 class ReverseDriveStatus(Enum):
