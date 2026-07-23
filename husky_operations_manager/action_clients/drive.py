@@ -329,6 +329,35 @@ class DriveClient:
         self._reset_pd_state()
         self._logger.info(f'DEPARTING — clearing bush area | duration={self._departure_duration:.1f}s')
 
+    def cancel(self) -> None:
+        """
+        Force-stop mid-motion (parent error recovery / task interruption).
+
+        Distinct from reset(): CANCELED marks an aborted-in-flight state,
+        vs. reset()'s clean return to IDLE after a natural STOPPED row-end.
+        """
+        self._status = DriveFeedback.CANCELED
+        self._state_timer = 0.0
+        self._target_pose = None
+        self._latest_detection = (False, 0.0, 0.0)
+        self._reset_pd_state()
+        self._cmd_linear_x = 0.0
+        self._cmd_angular_z = 0.0
+        self._publish_cmd_vel(0.0, 0.0, publish_to_topic=True)
+        self._logger.warning('CANCELED — forced stop by parent node')
+
+    def reset(self) -> None:
+        """
+        Clear back to IDLE — called by the parent after a natural STOPPED
+        row-end (robot already stopped, no forced cancel needed).
+        """
+        self._status = DriveFeedback.IDLE
+        self._state_timer = 0.0
+        self._target_pose = None
+        self._latest_detection = (False, 0.0, 0.0)
+        self._reset_pd_state()
+        self._logger.info('DriveClient reset to IDLE')
+
     def get_status(self) -> DriveFeedback:
         """Return the current full feedback state as a DriveFeedback message."""
         return self._build_feedback_msg()
@@ -458,7 +487,6 @@ class DriveClient:
                     f'current pose=({cx:.3f}, {cy:.3f}, {math.degrees(cyaw):.1f}deg)'
                 )
 
-
             cmd_v, cmd_w, goal_reached = self._compute_commands_pd()
             self._cmd_linear_x = cmd_v
             self._cmd_angular_z = cmd_w
@@ -469,6 +497,10 @@ class DriveClient:
                 self._hard_stop()
 
         elif self._status == DriveFeedback.STOPPED:
+            self._cmd_linear_x = 0.0
+            self._cmd_angular_z = 0.0
+
+        elif self._status == DriveFeedback.CANCELED:
             self._cmd_linear_x = 0.0
             self._cmd_angular_z = 0.0
 
@@ -485,7 +517,7 @@ class DriveClient:
         self._publish_cmd_vel(self._cmd_linear_x, self._cmd_angular_z, publish_to_topic)
         if publish_to_topic:
             self._last_published_status = self._status
-            
+
         self._publish_feedback()
 
     # =========================================================================
