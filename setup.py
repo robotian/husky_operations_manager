@@ -36,6 +36,7 @@ setup(
             # Unit Test nodes
             'test_navigation_client = husky_operations_manager.unit_test.test_navigation_client:main',
             'test_drive_client = husky_operations_manager.unit_test.test_drive_client:main',
+            'test_drive_client_lab = husky_operations_manager.unit_test.test_drive_client_lab:main',
             'test_reverse_navigation = husky_operations_manager.unit_test.test_reverse_navigation:main',            
             'test_docking_client = husky_operations_manager.unit_test.test_docking_client:main',
             'test_undocking_client = husky_operations_manager.unit_test.test_undocking_client:main',            
