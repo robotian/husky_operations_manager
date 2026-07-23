@@ -32,10 +32,6 @@ class DriveConfig:
     base_frame: str
     cmd_vel_rate: float
     ex_tolerance: float
-    stop_lookahead: float
-    ex_coast_gate: float
-    ex_angular_gate: float
-    k_rho: float
     v_linear_min: float
     v_linear_max: float
     v_angular_max: float
@@ -53,8 +49,11 @@ class DriveConfig:
     a_max: float  # m/s^2
     alpha_max: float  # rad/s^2
     backward_distance_threshold: float  # m — allow reverse approach below this distance
-
+    
     # --- Camera mount / row geometry (drive.py) ---
+    # cam_tx/cam_ty/arm_tx_offset are resolved via TF by the owning node
+    # (base_link -> camera frame / arm frame) before DriveConfig is built —
+    # DriveClient itself has no TF dependency, just consumes the floats.
     cam_tx: float  # m — camera behind base_link
     cam_ty: float  # m — camera right of base_link
     bushrow_theta: float  # rad — row orientation in odom frame

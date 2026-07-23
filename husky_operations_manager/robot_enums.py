@@ -107,8 +107,9 @@ class DriveStatus(Enum):
     CONTROLLING = 2
     STOPPED = 3
     DEPARTING = 4
-    CANCELED = 5
-    ERROR = 6
+    ABORT = 5
+    CANCELED = 6
+    ERROR = 7
 
 
 class ReverseDriveStatus(Enum):
