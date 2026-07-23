@@ -119,10 +119,7 @@ class LavenderHarvestNode(Node):
                 a_max=self.drive_a_max,
                 alpha_max=self.drive_alpha_max,
                 backward_distance_threshold=self.drive_backward_distance_threshold,
-                cam_tx=self.drive_cam_tx,
-                cam_ty=self.drive_cam_ty,
                 bushrow_theta=self.drive_bushrow_theta,
-                arm_tx_offset=self.drive_arm_tx_offset,
             ),
         )
 
@@ -208,10 +205,8 @@ class LavenderHarvestNode(Node):
         self.declare_parameter('drive.alpha_max', 0.3)
         self.declare_parameter('drive.backward_distance_threshold', 1.0)
         # --- Camera mount / row geometry (drive.py) ---
-        self.declare_parameter('drive.cam_tx', -0.239)
-        self.declare_parameter('drive.cam_ty', -0.500)
+        # cam_tx/cam_ty/arm_tx_offset resolved via TF at DriveClient startup.
         self.declare_parameter('drive.bushrow_theta', 0.0)
-        self.declare_parameter('drive.arm_tx_offset', 0.214)
 
         # Task trigger
         self.declare_parameter('task.trigger_topic', 'job/trigger')
@@ -292,10 +287,7 @@ class LavenderHarvestNode(Node):
         self.drive_alpha_max = float(self.get_parameter('drive.alpha_max').value)
         self.drive_backward_distance_threshold = float(self.get_parameter('drive.backward_distance_threshold').value)
         # --- Camera mount / row geometry (drive.py) ---
-        self.drive_cam_tx = float(self.get_parameter('drive.cam_tx').value)
-        self.drive_cam_ty = float(self.get_parameter('drive.cam_ty').value)
         self.drive_bushrow_theta = float(self.get_parameter('drive.bushrow_theta').value)
-        self.drive_arm_tx_offset = float(self.get_parameter('drive.arm_tx_offset').value)
 
         self.task_trigger_topic = str(self.get_parameter('task.trigger_topic').value)
 

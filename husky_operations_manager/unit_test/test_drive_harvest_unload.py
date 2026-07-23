@@ -76,10 +76,9 @@ DRIVE_CONFIG = DriveConfig(
     alpha_max=0.3,
     backward_distance_threshold=1.0,
     # --- Camera mount / row geometry (drive.py) ---
-    cam_tx=-0.239,
-    cam_ty=-0.500,
+    # cam_tx/cam_ty/arm_tx_offset resolved via TF at DriveClient startup
+    # (base_link -> arm_0_camera_detections / arm_0_base_link).
     bushrow_theta=0.0,
-    arm_tx_offset=0.214,
 )
 
 TOTAL_BUSHES = 3
