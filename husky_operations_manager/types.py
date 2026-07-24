@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+
 from geometry_msgs.msg import PoseStamped
 
 
@@ -49,6 +50,7 @@ class DriveConfig:
     a_max: float  # m/s^2
     alpha_max: float  # rad/s^2
     backward_distance_threshold: float  # m — allow reverse approach below this distance
+    same_bush_threshold: float  # m — CONTROLLING re-lock accepted only within this of the currently locked target
     
     # --- Camera mount / row geometry (drive.py) ---
     # cam_tx/cam_ty/arm_tx_offset are resolved via TF by the owning node

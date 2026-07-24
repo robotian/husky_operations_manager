@@ -34,9 +34,9 @@ import rclpy
 from rclpy.node import Node
 from tf2_ros import Buffer, TransformListener
 
-from status_interfaces.msg import DriveFeedback
-from husky_operations_manager.types import DriveConfig
 from husky_operations_manager.action_clients.drive import DriveClient
+from husky_operations_manager.types import DriveConfig
+from status_interfaces.msg import DriveFeedback
 
 # Human-readable names for DriveFeedback's status constants — used for logging
 # the plain int status value (get_status().status), since it's not an enum.
@@ -62,44 +62,45 @@ ARM_FRAME = 'arm_base_link'
 
 # Everything except cam_tx/cam_ty/arm_tx_offset — those are resolved from TF
 # in TestDriveV2Node._wait_for_tf and merged in before DriveClient is built.
-STATIC_DRIVE_PARAMS = dict(
+STATIC_DRIVE_PARAMS = {
     # --- Subscriptions ---
-    detection_topic='manipulators/arm_detection/image_annotated/detection_pose',
-    odom_topic='ground_truth/odom',
+    'detection_topic': 'manipulators/arm_detection/image_annotated/detection_pose',
+    'odom_topic': 'ground_truth/odom',
     # --- cmd_vel ---
-    base_frame=BASE_FRAME,
-    cmd_vel_rate=5.0,  # Hz — republish rate between detections
+    'base_frame': BASE_FRAME,
+    'cmd_vel_rate': 5.0,  # Hz — republish rate between detections
     # --- Stop condition ---
-    ex_tolerance=0.02,  # m — bush level with arm tolerance
+    'ex_tolerance': 0.02,  # m — bush level with arm tolerance
     # --- Speed limits ---
     # Husky A200 speed floors (empirical, this unit):
     #   Deadband (zero-motion threshold): 0.05 m/s — commands below this
     #   produce no physical motion. Locked value, do not go below.
     #   Accurate-tracking floor: 0.1 m/s — control loops track reliably
     #   at/above this; between deadband and floor, robot may move but
-    v_linear_min=0.05,  # m/s — minimum speed near stop point
-    v_linear_max=0.125,  # m/s — speed at first detection
-    v_angular_max=0.15,  # rad/s — angular correction clamp
+    'v_linear_min': 0.05,  # m/s — minimum speed near stop point
+    'v_linear_max': 0.125,  # m/s — speed at first detection
+    'v_angular_max': 0.15,  # rad/s — angular correction clamp
     # Turn radius floor: 0.02/0.15 = 0.13m
     # --- Departure ---
-    departure_clearance=0.2,  # m — distance past bush before next scan
+    'departure_clearance': 0.2,  # m — distance past bush before next scan
     # --- No-detection timeout ---
     # Converted to time: 1.0m / 0.1m/s = 10s
-    no_detection_distance=1.0,  # m — row end assumed after this distance
+    'no_detection_distance': 0.60,  # m — row end assumed after this distance
     # --- PD target-pose controller (drive.py) ---
-    ang_tol=0.05,  # rad — final-heading tolerance (~3deg)
-    k_v_p=0.2,
-    k_v_d=0.07,
-    k_omega_p=0.4,
-    k_omega_d=0.1,
-    k_beta_p=1.0,
-    k_beta_d=0.4,
-    a_max=0.05,  # m/s^2
-    alpha_max=0.3,  # rad/s^2
-    backward_distance_threshold=1.0,  # m
+    'ang_tol': 0.05,  # rad — final-heading tolerance (~3deg)
+    'k_v_p': 0.2,
+    'k_v_d': 0.07,
+    'k_omega_p': 0.4,
+    'k_omega_d': 0.1,
+    'k_beta_p': 1.0,
+    'k_beta_d': 0.4,
+    'a_max': 0.05,  # m/s^2
+    'alpha_max': 0.3,  # rad/s^2
+    'backward_distance_threshold': 1.0,  # m
+    'same_bush_threshold': 0.25,  # m — CONTROLLING re-lock accepted only within this of the currently locked target
     # --- Row geometry (drive.py) ---
-    bushrow_theta=0.0,  # rad — row orientation in odom frame
-)
+    'bushrow_theta': 0.0,  # rad — row orientation in odom frame
+}
 
 TOTAL_BUSHES = 3  # LAB ONLY — known bush count for this test row
 HARVEST_SIMULATION_DURATION_SEC = 30.0  # seconds — simulated harvest activity

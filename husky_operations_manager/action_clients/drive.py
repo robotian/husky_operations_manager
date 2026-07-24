@@ -116,17 +116,17 @@ Notes
 """
 
 import math
-from collections import deque
 import statistics
+from collections import deque
 
-from husky_operations_manager.types import DriveConfig
+from geometry_msgs.msg import TwistStamped
 from nav_msgs.msg import Odometry
 from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from tf_transformations import euler_from_quaternion
 
-from geometry_msgs.msg import TwistStamped
+from husky_operations_manager.types import DriveConfig
 from status_interfaces.msg import DriveFeedback, ImageDetectionPose
 
 # Human-readable names for DriveFeedback's status constants — used for logging
@@ -178,6 +178,7 @@ class DriveClient:
         self._a_max = config.a_max
         self._alpha_max = config.alpha_max
         self._backward_dist_thresh = config.backward_distance_threshold
+        self._same_bush_threshold = config.same_bush_threshold
 
         self._cam_pose: tuple[float, float, float] = (
             config.cam_tx,
@@ -229,6 +230,7 @@ class DriveClient:
 
         # --- Target pose (odom frame) ---
         self._target_pose: tuple[float, float, float] | None = None
+        self._lock_anchor: tuple[float, float] | None = None
 
         # --- PD state memory ---
         self._v_prev: float = 0.0
@@ -304,6 +306,7 @@ class DriveClient:
         self._status = DriveFeedback.SCANNING
         self._state_timer = 0.0
         self._target_pose = None
+        self._lock_anchor = None
         self._latest_detection = (False, 0.0, 0.0)
         self._reset_pd_state()
 
@@ -325,6 +328,7 @@ class DriveClient:
         self._status = DriveFeedback.DEPARTING
         self._state_timer = 0.0
         self._target_pose = None
+        self._lock_anchor = None
         self._latest_detection = (False, 0.0, 0.0)
         self._reset_pd_state()
         self._logger.info(f'DEPARTING — clearing bush area | duration={self._departure_duration:.1f}s')
@@ -496,11 +500,7 @@ class DriveClient:
                 self._logger.info(f'Goal reached STOPPED (awaiting resume()) at {self._current_pose} ')
                 self._hard_stop()
 
-        elif self._status == DriveFeedback.STOPPED:
-            self._cmd_linear_x = 0.0
-            self._cmd_angular_z = 0.0
-
-        elif self._status == DriveFeedback.CANCELED:
+        elif self._status == DriveFeedback.STOPPED or self._status == DriveFeedback.CANCELED:
             self._cmd_linear_x = 0.0
             self._cmd_angular_z = 0.0
 
@@ -548,6 +548,18 @@ class DriveClient:
         target_x = cam_x + self._cam_pose[0] * math.cos(cam_yaw) - self._cam_pose[1] * math.sin(cam_yaw)
         target_y = cam_y + self._cam_pose[0] * math.sin(cam_yaw) + self._cam_pose[1] * math.cos(cam_yaw)
         target_yaw = cam_yaw - self._cam_pose[2]
+
+        if self._target_pose is not None:
+            shift = math.hypot(target_x - self._lock_anchor[0], target_y - self._lock_anchor[1])
+            if shift > self._same_bush_threshold:
+                self._logger.info(
+                    f'Re-lock rejected — candidate odom=({target_x:.3f}, {target_y:.3f}) is {shift:.3f}m from '
+                    f'original lock ({self._lock_anchor[0]:.3f}, {self._lock_anchor[1]:.3f}) > '
+                    f'same_bush_threshold={self._same_bush_threshold:.3f}m — likely a different bush, keeping current lock'
+                )
+                return
+        else:
+            self._lock_anchor = (target_x, target_y)
 
         self._target_pose = (target_x, target_y, target_yaw)
         self._logger.info(f'Target Pose as {self._target_pose}')
