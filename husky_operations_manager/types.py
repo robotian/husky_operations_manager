@@ -51,6 +51,9 @@ class DriveConfig:
     alpha_max: float  # rad/s^2
     backward_distance_threshold: float  # m — allow reverse approach below this distance
     same_bush_threshold: float  # m — CONTROLLING re-lock accepted only within this of the currently locked target
+    controlling_timeout: float  # s — no goal reached within this long -> reset lock, retry same bush
+    max_controlling_retries: int  # retry attempts on same bush before giving up (-> ERROR)
+    controlling_retry_delay: float  # s — stopped wait between ABORTED and re-entering CONTROLLING
     
     # --- Camera mount / row geometry (drive.py) ---
     # cam_tx/cam_ty/arm_tx_offset are resolved via TF by the owning node

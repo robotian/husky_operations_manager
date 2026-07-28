@@ -48,6 +48,7 @@ _STATUS_NAMES = {
     DriveFeedback.DEPARTING: 'DEPARTING',
     DriveFeedback.CANCELED: 'CANCELED',
     DriveFeedback.ERROR: 'ERROR',
+    DriveFeedback.ABORTED: 'ABORTED',
 }
 
 
@@ -68,7 +69,7 @@ STATIC_DRIVE_PARAMS = {
     'odom_topic': 'ground_truth/odom',
     # --- cmd_vel ---
     'base_frame': BASE_FRAME,
-    'cmd_vel_rate': 5.0,  # Hz — republish rate between detections
+    'cmd_vel_rate': 10.0,  # Hz — republish rate between detections
     # --- Stop condition ---
     'ex_tolerance': 0.02,  # m — bush level with arm tolerance
     # --- Speed limits ---
@@ -98,6 +99,9 @@ STATIC_DRIVE_PARAMS = {
     'alpha_max': 0.3,  # rad/s^2
     'backward_distance_threshold': 1.0,  # m
     'same_bush_threshold': 0.25,  # m — CONTROLLING re-lock accepted only within this of the currently locked target
+    'controlling_timeout': 30.0,  # s — no goal reached within this long -> reset lock, retry same bush
+    'max_controlling_retries': 3,  # retry attempts on same bush before giving up (-> ERROR)
+    'controlling_retry_delay': 5.0,  # s — stopped wait between ABORTED and re-entering CONTROLLING
     # --- Row geometry (drive.py) ---
     'bushrow_theta': 0.0,  # rad — row orientation in odom frame
 }
@@ -235,6 +239,8 @@ class TestDriveNodeLab(Node):
 
         if status != DriveFeedback.STOPPED or self._harvest_pending:
             return
+        elif status == DriveFeedback.ERROR:
+            self._auto_shutdown()
 
         if self._bush_count >= TOTAL_BUSHES:
             self.get_logger().warning(

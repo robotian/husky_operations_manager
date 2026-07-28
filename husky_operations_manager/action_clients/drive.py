@@ -139,6 +139,7 @@ _STATUS_NAMES = {
     DriveFeedback.DEPARTING: 'DEPARTING',
     DriveFeedback.CANCELED: 'CANCELED',
     DriveFeedback.ERROR: 'ERROR',
+    DriveFeedback.ABORTED: 'ABORTED',
 }
 
 
@@ -179,6 +180,9 @@ class DriveClient:
         self._alpha_max = config.alpha_max
         self._backward_dist_thresh = config.backward_distance_threshold
         self._same_bush_threshold = config.same_bush_threshold
+        self._controlling_timeout = config.controlling_timeout
+        self._max_controlling_retries = config.max_controlling_retries
+        self._controlling_retry_delay = config.controlling_retry_delay
 
         self._cam_pose: tuple[float, float, float] = (
             config.cam_tx,
@@ -202,14 +206,14 @@ class DriveClient:
         self._current_velocity: list[float] = [0.0, 0.0]  # v, omega
 
         # --- Latest cached detection ---
-        # (detected, bush_x, bush_y) in camera frame — consumed once per
-        # control tick, same as the sim's camera_data input.
+        # (detected, bush_x, bush_y) in camera frame — consumed once per control tick.
         self._latest_detection: tuple[bool, float, float] = (False, 0.0, 0.0)
 
+        # --- Detection staleness guard ---
+        self._latest_detection_stamp: tuple[int, int] | None = None
+        self._last_used_detection_stamp: tuple[int, int] | None = None
+
         # --- Odom-frame positions of already-harvested bushes ---
-        # Appended on each goal-reached stop. Used to reject a SCANNING
-        # lock that lands on an already-harvested bush (no bush ID in
-        # ImageDetectionPose, so this is a position-based stand-in).
         self._harvested_positions: list[tuple[float, float]] = []
 
         # maxlen=50 assumes ~10Hz detection publish rate → 5s rolling window.
@@ -222,15 +226,14 @@ class DriveClient:
         self._state_timer: float = 0.0
 
         # --- Tracks the status cmd_vel was last published under ---
-        # IDLE/STOPPED publish exactly once on the tick they're entered (a
-        # confirming zero), then go silent — no point re-publishing the same
-        # zero at full control rate while sitting idle. Active driving
-        # states (SCANNING/CONTROLLING/DEPARTING) always publish every tick.
         self._last_published_status: DriveFeedback | None = None
 
         # --- Target pose (odom frame) ---
         self._target_pose: tuple[float, float, float] | None = None
         self._lock_anchor: tuple[float, float] | None = None
+
+        # --- CONTROLLING timeout retry count — reset on fresh lock (scan()/resume()) ---
+        self._controlling_retry_count: int = 0
 
         # --- PD state memory ---
         self._v_prev: float = 0.0
@@ -308,6 +311,7 @@ class DriveClient:
         self._target_pose = None
         self._lock_anchor = None
         self._latest_detection = (False, 0.0, 0.0)
+        self._controlling_retry_count = 0
         self._reset_pd_state()
 
         self._logger.info('SCANNING - controller inactive until first detection')
@@ -330,6 +334,9 @@ class DriveClient:
         self._target_pose = None
         self._lock_anchor = None
         self._latest_detection = (False, 0.0, 0.0)
+        self._latest_detection_stamp = None
+        self._last_used_detection_stamp = None
+        self._controlling_retry_count = 0
         self._reset_pd_state()
         self._logger.info(f'DEPARTING — clearing bush area | duration={self._departure_duration:.1f}s')
 
@@ -344,6 +351,8 @@ class DriveClient:
         self._state_timer = 0.0
         self._target_pose = None
         self._latest_detection = (False, 0.0, 0.0)
+        self._latest_detection_stamp = None
+        self._last_used_detection_stamp = None
         self._reset_pd_state()
         self._cmd_linear_x = 0.0
         self._cmd_angular_z = 0.0
@@ -359,6 +368,8 @@ class DriveClient:
         self._state_timer = 0.0
         self._target_pose = None
         self._latest_detection = (False, 0.0, 0.0)
+        self._latest_detection_stamp = None
+        self._last_used_detection_stamp = None
         self._reset_pd_state()
         self._logger.info('DriveClient reset to IDLE')
 
@@ -414,6 +425,7 @@ class DriveClient:
         self._logger.info(f'Received Detection - Valid:{msg.detection_valid} at {bush_x, bush_y}')
 
         self._latest_detection = (detected, bush_x, bush_y)
+        self._latest_detection_stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
 
         # NOTE: Below simple detection check code and will be remove once testing is done
         if detected:
@@ -442,6 +454,7 @@ class DriveClient:
         self._state_timer += self._dt
         curr_yaw = self._current_pose[2]
         img_detected, bush_x, bush_y = self._latest_detection
+        is_new_detection = img_detected and self._latest_detection_stamp != self._last_used_detection_stamp
 
         if self._status == DriveFeedback.IDLE:
             self._cmd_linear_x = 0.0
@@ -457,7 +470,7 @@ class DriveClient:
                 )
                 self._hard_stop()
 
-            elif img_detected and bush_x < 0:
+            elif is_new_detection and bush_x < 0:
                 self._set_target_pose(bush_x, bush_y)
                 self._status = DriveFeedback.CONTROLLING
                 self._state_timer = 0.0
@@ -468,20 +481,18 @@ class DriveClient:
                 )
 
             elif img_detected:
-                # bush_x >= 0 → bush already reached/behind (docstring: "bush
-                # ahead → negative center.x"). Most likely the just-departed
-                # bush still lingering in frame at end of row — not a new
-                # lock candidate. Ignore and keep scanning; state_timer keeps
-                # counting toward no_detection_timeout, which stops the robot
-                # once nothing new shows up ahead.
+                # bush_x >= 0 → bush already reached/behind. Most likely the just-departed bush still lingering in 
+                # the frame at end of row not a new lock candidate. Ignore and keep scanning; state_timer keeps
+                # counting toward no_detection_timeout, which stops the robot once nothing new shows up ahead.
                 self._logger.info(
                     f'Ignoring detection at bush_x={bush_x:.3f} (not ahead) — '
                     f'likely the departed bush, continuing SCANNING'
                 )
 
         elif self._status == DriveFeedback.CONTROLLING:
-            if img_detected:
+            if is_new_detection:
                 self._set_target_pose(bush_x, bush_y)
+                self._last_used_detection_stamp = self._latest_detection_stamp
 
                 # Only for logging
                 tx, ty, tyaw = self._target_pose
@@ -500,6 +511,38 @@ class DriveClient:
                 self._logger.info(f'Goal reached STOPPED (awaiting resume()) at {self._current_pose} ')
                 self._hard_stop()
 
+            elif self._state_timer >= self._controlling_timeout:
+                if self._controlling_retry_count >= self._max_controlling_retries:
+                    self._logger.error(
+                        f'ERROR: CONTROLLING timeout ({self._controlling_timeout:.1f}s) retries exhausted '
+                        f'({self._controlling_retry_count}/{self._max_controlling_retries}).'
+                    )
+                    self._error_stop()
+                else:
+                    self._logger.warning(
+                        f' ABORTED: CONTROLLING timeout ({self._controlling_timeout:.1f}s), retrying in '
+                        f'{self._controlling_retry_delay:.1f}s ({self._controlling_retry_count + 1}/{self._max_controlling_retries})'
+                    )
+                    self._status = DriveFeedback.ABORTED
+                    self._state_timer = 0.0
+                    self._cmd_linear_x = 0.0
+                    self._cmd_angular_z = 0.0
+                    self._reset_pd_state()
+
+        elif self._status == DriveFeedback.ABORTED:
+            self._cmd_linear_x = 0.0
+            self._cmd_angular_z = 0.0
+
+            if self._state_timer >= self._controlling_retry_delay:
+                self._controlling_retry_count += 1
+                self._logger.info(
+                    f'Retry {self._controlling_retry_count}/{self._max_controlling_retries} '
+                    'resuming CONTROLLING on same target'
+                )
+                self._status = DriveFeedback.CONTROLLING
+                self._state_timer = 0.0
+                self._reset_pd_state()
+
         elif self._status == DriveFeedback.STOPPED or self._status == DriveFeedback.CANCELED:
             self._cmd_linear_x = 0.0
             self._cmd_angular_z = 0.0
@@ -509,10 +552,16 @@ class DriveClient:
             self._cmd_angular_z = 0.0
 
             if self._state_timer >= self._departure_duration:
-                self._logger.info('Departure complete — re-scanning')
+                self._logger.info('Departure complete re-scanning')
                 self.scan()
 
-        idle_states = (DriveFeedback.IDLE, DriveFeedback.STOPPED)
+        idle_states = (
+            DriveFeedback.IDLE,
+            DriveFeedback.STOPPED,
+            DriveFeedback.CANCELED,
+            DriveFeedback.ERROR,
+            DriveFeedback.ABORTED,
+        )
         publish_to_topic = self._status not in idle_states or self._status != self._last_published_status
         self._publish_cmd_vel(self._cmd_linear_x, self._cmd_angular_z, publish_to_topic)
         if publish_to_topic:
@@ -573,8 +622,14 @@ class DriveClient:
         x, y, theta = self._current_pose
         x_d, y_d, theta_d = self._target_pose if self._target_pose is not None else (0.0, 0.0, 0.0)
 
-        self._v_prev = self._current_velocity[0]
-        self._omega_prev = self._current_velocity[1]
+        # self._v_prev = self._current_velocity[0]
+        # self._omega_prev = self._current_velocity[1]
+        # Bug: anchored accel/jerk limiter to MEASURED odom velocity, not last
+        # COMMANDED velocity. Measured lags/stalls (stiction, deadband, slip),
+        # causing false decel injection and, near the 0.01m/s move threshold,
+        # a self-locking stall where commanded value never climbs past it.
+        self._v_prev = self._cmd_linear_x
+        self._omega_prev = self._cmd_angular_z
 
         dx = x_d - x
         dy = y_d - y
@@ -596,6 +651,7 @@ class DriveClient:
                 direction = -1.0
             else:
                 direction = 1.0
+
 
             if self._prev_distance_error is None:
                 self._prev_distance_error = distance_error
@@ -650,6 +706,12 @@ class DriveClient:
     # =========================================================================
     def _hard_stop(self) -> None:
         self._status = DriveFeedback.STOPPED
+        self._cmd_linear_x = 0.0
+        self._cmd_angular_z = 0.0
+
+    def _error_stop(self) -> None:
+        """Gave up, distinct from STOPPED, which callers treat as success."""
+        self._status = DriveFeedback.ERROR
         self._cmd_linear_x = 0.0
         self._cmd_angular_z = 0.0
 
