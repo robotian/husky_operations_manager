@@ -69,7 +69,7 @@ STATIC_DRIVE_PARAMS = {
     'odom_topic': 'ground_truth/odom',
     # --- cmd_vel ---
     'base_frame': BASE_FRAME,
-    'cmd_vel_rate': 10.0,  # Hz — republish rate between detections
+    'cmd_vel_rate': 5.0,  # Hz — republish rate between detections
     # --- Stop condition ---
     'ex_tolerance': 0.02,  # m — bush level with arm tolerance
     # --- Speed limits ---
@@ -104,6 +104,7 @@ STATIC_DRIVE_PARAMS = {
     'controlling_retry_delay': 5.0,  # s — stopped wait between ABORTED and re-entering CONTROLLING
     # --- Row geometry (drive.py) ---
     'bushrow_theta': 0.0,  # rad — row orientation in odom frame
+    # 'bushrow_theta': math.pi,  # rad — row orientation in odom frame
 }
 
 TOTAL_BUSHES = 3  # LAB ONLY — known bush count for this test row
@@ -237,10 +238,17 @@ class TestDriveNodeLab(Node):
         status = self._drive_client.get_status().status
         self.get_logger().info(f'DriveClient status: {_STATUS_NAMES.get(status, status)}')
 
+        if status == DriveFeedback.ERROR:
+            feedback = self._drive_client.get_status()
+            self.get_logger().info(
+                f'ERROR shutdown, shutting down node | '
+                f'final pose=({feedback.current_x:.3f}, {feedback.current_y:.3f}, '
+                f'{math.degrees(feedback.current_yaw):.1f}deg)'
+            )
+            rclpy.shutdown()
+
         if status != DriveFeedback.STOPPED or self._harvest_pending:
             return
-        elif status == DriveFeedback.ERROR:
-            self._auto_shutdown()
 
         if self._bush_count >= TOTAL_BUSHES:
             self.get_logger().warning(

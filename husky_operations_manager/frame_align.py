@@ -1,32 +1,40 @@
 """
 frame_align.py
 
-Computes desired robot pose to center arm_0 detection in camera FOV.
+Standalone dev/test script for the TF-based target-pose calc. Build
+and validate cam_tx/cam_ty/target-pose math here in isolation, without
+spinning up the full DriveClient state machine — once validated, copy
+_camera_frame_to_odom_tf / _set_target_pose_tf into drive.py.
 
-TF lookups:
-  1. arm_0_camera_color_frame -> arm_0_detections  : detection offset in camera frame
-  2. base_link -> arm_0_camera_color_frame          : rotate offset into base_link axes
-  3. odom -> base_link (optional)                   : current robot pose in world frame
+cam_tx/cam_ty resolved from TF at startup (base_link -> camera_frame). 
+bushrow_theta is a hardcoded constant here, not a ROS param — edit BUSHROW_THETA below
+for row-angle testing.
 
-Desired pose:
-  odom available  : x = odom_x + ex_bl, y = odom_y + ey_bl, yaw = current heading (odom frame)
-  odom broken     : x = ex_bl, y = ey_bl, yaw = 0.0 (relative to base_link)
-
-Switches to odom automatically when odom -> base_link becomes available. No code change needed.
+Run:
+  ros2 run husky_operations_manager frame_align \
+    --ros-args -r __ns:=/a200_0284 -r /tf:=tf -r /tf_static:=tf_static
 """
 
 import math
 
 import rclpy
-import rclpy.duration
-import rclpy.time
-from rclpy.node import Node
-
 import tf2_ros
-from tf2_ros import TransformException
-
+from geometry_msgs.msg import PointStamped
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
 from rclpy.qos import QoSPresetProfiles
+from rclpy.time import Time
+from tf2_geometry_msgs import do_transform_point
+from tf2_ros import TransformException
+from tf_transformations import euler_from_quaternion
+
 from status_interfaces.msg import ImageDetectionPose
+
+# =============================================================================
+# Hardcoded parameters — edit here for testing
+# =============================================================================
+
+BUSHROW_THETA = 0.0  # rad — row orientation, hardcoded for now
 
 
 class DetectionAlignmentNode(Node):
@@ -39,21 +47,15 @@ class DetectionAlignmentNode(Node):
         self._tf_buffer = tf2_ros.Buffer()
         self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
-        self._detection_sub = self.create_subscription(
-            ImageDetectionPose,
-            self._detection_topic,
-            self._detection_callback,
-            QoSPresetProfiles.SENSOR_DATA.value,
-        )
+        self._bushrow_theta = BUSHROW_THETA
+        self._cam_pose: tuple[float, float, float] | None = None
+        self._odom_received: bool = False
+        self._current_pose: list[float] = [0.0, 0.0, 0.0]  # x, y, yaw
+        self._target_pose_tf: tuple[float, float, float] | None = None
+        self._detection_sub = None
 
-        self.get_logger().info(
-            f'DetectionAlignmentNode ready | '
-            f"topic='{self._detection_topic}' | "
-            f"camera='{self._camera_frame}' | "
-            f"detection='{self._detection_frame}' | "
-            f"robot='{self._robot_frame}' | "
-            f"odom='{self._odom_frame}'"
-        )
+        self._tf_wait_timer = self.create_timer(0.2, self._wait_for_tf)
+        self.get_logger().info(f'Waiting for TF: {self._base_frame} -> {self._camera_frame}...')
 
     # =========================================================================
     # PARAMETERS
@@ -62,23 +64,73 @@ class DetectionAlignmentNode(Node):
     def _declare_parameters(self):
         self.declare_parameter(
             'detection_topic',
-            '/a200_0284/manipulators/arm_0_detection/image_annotated/detection_pose',
+            'manipulators/arm_detection/image_annotated/detection_pose',
         )
-        self.declare_parameter('camera_frame', 'arm_0_camera_color_frame')
-        self.declare_parameter('detection_frame', 'arm_0_camera_detections')
-        self.declare_parameter('robot_frame', 'base_link')
-        self.declare_parameter('odom_frame', 'odom')
+        self.declare_parameter('odom_topic', 'ground_truth/odom')
+        self.declare_parameter('camera_frame', 'arm_camera_color_frame')
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('odom_frame', 'base_mocap')
         self.declare_parameter('ex_tolerance', 0.01)  # metres
         self.declare_parameter('ey_tolerance', 0.02)  # metres
 
     def _read_parameters(self):
         self._detection_topic = str(self.get_parameter('detection_topic').value)
+        self._odom_topic = str(self.get_parameter('odom_topic').value)
         self._camera_frame = str(self.get_parameter('camera_frame').value)
-        self._detection_frame = str(self.get_parameter('detection_frame').value)
-        self._robot_frame = str(self.get_parameter('robot_frame').value)
+        self._base_frame = str(self.get_parameter('base_frame').value)
         self._odom_frame = str(self.get_parameter('odom_frame').value)
         self._ex_tolerance = float(self.get_parameter('ex_tolerance').value)
         self._ey_tolerance = float(self.get_parameter('ey_tolerance').value)
+
+    # =========================================================================
+    # Startup — resolve cam_pose from TF before subscribing to detections
+    # =========================================================================
+
+    def _wait_for_tf(self) -> None:
+        """Poll at 0.2s until the camera static transform is available, then resolve cam_pose and start the detection subscription."""
+        now = Time()
+        if not self._tf_buffer.can_transform(self._base_frame, self._camera_frame, now):
+            self.get_logger().info('Waiting for TF...', throttle_duration_sec=1.0)
+            return
+
+        self._tf_wait_timer.cancel()
+        self._tf_wait_timer = None
+
+        cam_tf = self._tf_buffer.lookup_transform(self._base_frame, self._camera_frame, now)
+        cam_tx, cam_ty = cam_tf.transform.translation.x, cam_tf.transform.translation.y
+        self._cam_pose = (cam_tx, cam_ty, math.pi)  # camera faces backward
+        self.get_logger().info(f'TF resolved | cam_pose={self._cam_pose}')
+
+        # --- Odom subscription ---
+        self._odom_sub = self.create_subscription(
+            Odometry,
+            self._odom_topic,
+            self._odom_callback,
+            QoSPresetProfiles.SENSOR_DATA.value,
+        )
+
+        self._detection_sub = self.create_subscription(
+            ImageDetectionPose,
+            self._detection_topic,
+            self._detection_callback,
+            QoSPresetProfiles.SENSOR_DATA.value,
+        )
+
+    # =========================================================================
+    # Odom callback
+    # =========================================================================
+
+    def _odom_callback(self, msg: Odometry) -> None:
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self._current_pose = [msg.pose.pose.position.x, msg.pose.pose.position.y, yaw]
+        self._odom_received = True
+        
+        self.get_logger().info(
+            f'ODOM| pose=({self._current_pose[0]:.3f}, '
+            f'{self._current_pose[1]:.3f}, {math.degrees(self._current_pose[2]):.1f}deg)',
+            throttle_duration_sec=2.0
+        )
 
     # =========================================================================
     # DETECTION CALLBACK
@@ -88,93 +140,88 @@ class DetectionAlignmentNode(Node):
         if not msg.detection_valid:
             return
 
-        # 1. Detection offset in camera frame
-        tf_cam = self._lookup_tf(self._camera_frame, self._detection_frame)
-        if tf_cam is None:
-            return
-        ex_cam = tf_cam.transform.translation.x
-        ey_cam = tf_cam.transform.translation.y
-
-        # 2. Rotate offset into base_link axes
-        tf_base_to_cam = self._lookup_tf(self._robot_frame, self._camera_frame)
-        if tf_base_to_cam is None:
-            return
-        ex_bl, ey_bl = self._rotate_2d(ex_cam, ey_cam, tf_base_to_cam.transform.rotation)
-
-        # 3. Desired pose — use odom if available, fall back to base_link
-        tf_odom = self._try_lookup_tf(self._odom_frame, self._robot_frame)
-
-        if tf_odom is not None:
-            desired_x = tf_odom.transform.translation.x + ex_bl
-            desired_y = tf_odom.transform.translation.y + ey_bl
-            desired_yaw = self._yaw_from_quat(tf_odom.transform.rotation)
-            frame_label = self._odom_frame
+        if self._odom_received:
+            self._set_target_pose(msg.center.x, msg.center.y)
+            self._set_target_pose_tf(msg.center.x, msg.center.y)
         else:
             self.get_logger().warn(
-                f"'{self._odom_frame}' → '{self._robot_frame}' unavailable — "
-                f"desired pose in '{self._robot_frame}' frame",
-                throttle_duration_sec=5.0,
+                'Skipping, no odom received yet',
+                throttle_duration_sec=2.0,
             )
-            desired_x = ex_bl
-            desired_y = ey_bl
-            desired_yaw = 0.0
-            frame_label = self._robot_frame
-
-        self.get_logger().info(
-            f'Desired pose [{frame_label}] | '
-            f'x={desired_x:.4f}m  '
-            f'y={desired_y:.4f}m  '
-            f'yaw={math.degrees(desired_yaw):.2f}deg'
-        )
 
     # =========================================================================
-    # TF HELPERS
+    # Target pose (camera frame -> odom frame, TF-based)
     # =========================================================================
 
-    def _lookup_tf(self, target: str, source: str):
-        """Lookup TF, log warn on failure."""
+    def _camera_frame_to_odom(self, local_x: float, local_y: float) -> tuple[float, float]:
+        """Manual 2-D rigid-body transform — matches the sim, no TF lookup."""
+        cx, cy, cyaw = self._cam_pose
+        base_x = cx + local_x * math.cos(cyaw) + local_y * math.sin(cyaw)
+        base_y = cy + local_x * math.sin(cyaw) - local_y * math.cos(cyaw)
+
+        rx, ry, ryaw = self._current_pose
+        odom_x = rx + base_x * math.cos(ryaw) - base_y * math.sin(ryaw)
+        odom_y = ry + base_x * math.sin(ryaw) + base_y * math.cos(ryaw)
+        return odom_x, odom_y
+
+    def _camera_frame_to_odom_tf(self, local_x: float, local_y: float) -> tuple[float, float] | None:
+        """TF-based camera->odom transform — single lookup + do_transform_point. Returns None on TF failure."""
+        point = PointStamped()
+        point.header.frame_id = self._camera_frame
+        point.header.stamp = Time().to_msg()
+        point.point.x = local_x
+        point.point.y = local_y
+        point.point.z = 0.0
+
         try:
-            return self._tf_buffer.lookup_transform(
-                target,
-                source,
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=0.1),
-            )
+            transform = self._tf_buffer.lookup_transform(self._odom_frame, self._camera_frame, Time())
         except TransformException as e:
             self.get_logger().warn(
-                f"TF lookup failed | '{target}' ← '{source}': {e}",
-                throttle_duration_sec=5.0,
+                f"TF lookup failed ('{self._odom_frame}' <- '{self._camera_frame}'): {e}",
+                throttle_duration_sec=2.0,
             )
             return None
 
-    def _try_lookup_tf(self, target: str, source: str):
-        """Lookup TF silently — returns None without warning on failure."""
-        try:
-            return self._tf_buffer.lookup_transform(
-                target,
-                source,
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=0.05),
-            )
-        except TransformException:
-            return None
+        odom_point = do_transform_point(point, transform)
+        return odom_point.point.x, odom_point.point.y
 
-    # =========================================================================
-    # MATH HELPERS
-    # =========================================================================
+    def _set_target_pose(self, bush_x: float, bush_y: float) -> None:
+        """
+        Convert camera-frame bush offsets into an odom-frame target pose.
 
-    @staticmethod
-    def _rotate_2d(x: float, y: float, q) -> tuple:
-        """Rotate 2D vector (x, y) by quaternion. Z ignored (downward camera)."""
-        qx, qy, qz, qw = q.x, q.y, q.z, q.w
-        rx = (1 - 2 * (qy * qy + qz * qz)) * x + (2 * (qx * qy - qw * qz)) * y
-        ry = (2 * (qx * qy + qw * qz)) * x + (1 - 2 * (qx * qx + qz * qz)) * y
-        return rx, ry
+        NOTE: arm_tx_offset is intentionally NOT applied — matches the
+        sim, which declares but never uses it.
+        """
+        cam_x, cam_y = self._camera_frame_to_odom(bush_x, bush_y)
+        cam_yaw = self._bushrow_theta + self._cam_pose[2]
 
-    @staticmethod
-    def _yaw_from_quat(q) -> float:
-        """Extract yaw (Z rotation) from quaternion."""
-        return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        target_x = cam_x + self._cam_pose[0] * math.cos(cam_yaw) - self._cam_pose[1] * math.sin(cam_yaw)
+        target_y = cam_y + self._cam_pose[0] * math.sin(cam_yaw) + self._cam_pose[1] * math.cos(cam_yaw)
+        target_yaw = cam_yaw - self._cam_pose[2]
+
+        self._target_pose = (target_x, target_y, target_yaw)
+        self.get_logger().info(
+            'Manual Target Pose | '
+            f'x={target_x:.4f}m  y={target_y:.4f}m  yaw={math.degrees(target_yaw):.2f}deg'
+        )
+
+    def _set_target_pose_tf(self, bush_x: float, bush_y: float) -> None:
+        """Convert camera-frame bush offsets into an odom-frame target pose — ported from drive.py, no re-lock guard."""
+        result = self._camera_frame_to_odom_tf(bush_x, bush_y)
+        if result is None:
+            return
+        cam_x, cam_y = result
+        cam_yaw = self._bushrow_theta + self._cam_pose[2]
+
+        target_x = cam_x + self._cam_pose[0] * math.cos(cam_yaw) - self._cam_pose[1] * math.sin(cam_yaw)
+        target_y = cam_y + self._cam_pose[0] * math.sin(cam_yaw) + self._cam_pose[1] * math.cos(cam_yaw)
+        target_yaw = cam_yaw - self._cam_pose[2]
+
+        self._target_pose_tf = (target_x, target_y, target_yaw)
+        self.get_logger().info(
+            f'TF Target pose [{self._odom_frame}] | '
+            f'x={target_x:.4f}m  y={target_y:.4f}m  yaw={math.degrees(target_yaw):.2f}deg'
+        )
 
 
 def main(args=None):
@@ -186,7 +233,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
