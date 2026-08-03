@@ -17,11 +17,10 @@ On any ERROR the node logs the failure and shuts down.
 import rclpy
 from rclpy.node import Node
 
+from husky_operations_manager.action_clients.manipulator import ArmCommand, ManipulatorTaskActionClient
+from husky_operations_manager.robot_enums import RobotStatusEnum
 from status_interfaces.action import ManipulatorTask
 from status_interfaces.msg import SubTask
-from husky_operations_manager.robot_enums import RobotStatusEnum
-from husky_operations_manager.action_clients.manipulator import ArmCommand, ManipulatorTaskActionClient
-
 
 # Seconds between each poll of get_feedback()
 POLL_INTERVAL_SEC = 0.2

@@ -31,6 +31,8 @@ class DriveConfig:
     detection_topic: str
     odom_topic: str
     base_frame: str
+    camera_frame: str  # TF frame id — camera source frame
+    odom_frame: str  # TF frame id — lookup_transform target frame
     cmd_vel_rate: float
     ex_tolerance: float
     v_linear_min: float

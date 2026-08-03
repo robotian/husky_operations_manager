@@ -119,11 +119,14 @@ import math
 import statistics
 from collections import deque
 
-from geometry_msgs.msg import TwistStamped
+from geometry_msgs.msg import PointStamped, TwistStamped
 from nav_msgs.msg import Odometry
 from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+from tf2_geometry_msgs import do_transform_point
+from tf2_ros import Buffer, TransformException, TransformListener
 from tf_transformations import euler_from_quaternion
 
 from husky_operations_manager.types import DriveConfig
@@ -165,6 +168,8 @@ class DriveClient:
 
         # --- Config ---
         self._base_frame = config.base_frame
+        self._camera_frame = config.camera_frame
+        self._odom_frame = config.odom_frame
         self._stop_threshold = config.ex_tolerance
         self._ang_tol = config.ang_tol
         self._v_linear_min = config.v_linear_min
@@ -231,6 +236,11 @@ class DriveClient:
         # --- Target pose (odom frame) ---
         self._target_pose: tuple[float, float, float] | None = None
         self._lock_anchor: tuple[float, float] | None = None
+
+        # --- TF (camera->odom lookup) ---
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self._node)
+
 
         # --- CONTROLLING timeout retry count — reset on fresh lock (scan()/resume()) ---
         self._controlling_retry_count: int = 0
@@ -471,7 +481,7 @@ class DriveClient:
                 self._hard_stop()
 
             elif is_new_detection and bush_x < 0:
-                self._set_target_pose(bush_x, bush_y)
+                self._set_target_pose_tf(bush_x, bush_y)
                 self._status = DriveFeedback.CONTROLLING
                 self._state_timer = 0.0
                 tx, ty, tyaw = self._target_pose
@@ -491,7 +501,7 @@ class DriveClient:
 
         elif self._status == DriveFeedback.CONTROLLING:
             if is_new_detection:
-                self._set_target_pose(bush_x, bush_y)
+                self._set_target_pose_tf(bush_x, bush_y)
                 self._last_used_detection_stamp = self._latest_detection_stamp
 
                 # Only for logging
@@ -592,6 +602,54 @@ class DriveClient:
         sim, which declares but never uses it.
         """
         cam_x, cam_y = self._camera_frame_to_odom(bush_x, bush_y)
+        cam_yaw = self._bushrow_theta + self._cam_pose[2]
+
+        target_x = cam_x + self._cam_pose[0] * math.cos(cam_yaw) - self._cam_pose[1] * math.sin(cam_yaw)
+        target_y = cam_y + self._cam_pose[0] * math.sin(cam_yaw) + self._cam_pose[1] * math.cos(cam_yaw)
+        target_yaw = cam_yaw - self._cam_pose[2]
+
+        if self._target_pose is not None:
+            shift = math.hypot(target_x - self._lock_anchor[0], target_y - self._lock_anchor[1])
+            if shift > self._same_bush_threshold:
+                self._logger.info(
+                    f'Re-lock rejected — candidate odom=({target_x:.3f}, {target_y:.3f}) is {shift:.3f}m from '
+                    f'original lock ({self._lock_anchor[0]:.3f}, {self._lock_anchor[1]:.3f}) > '
+                    f'same_bush_threshold={self._same_bush_threshold:.3f}m — likely a different bush, keeping current lock'
+                )
+                return
+        else:
+            self._lock_anchor = (target_x, target_y)
+
+        self._target_pose = (target_x, target_y, target_yaw)
+        self._logger.info(f'Target Pose as {self._target_pose}')
+
+    def _camera_frame_to_odom_tf(self, local_x: float, local_y: float) -> tuple[float, float] | None:
+        """TF-based camera->odom transform. Returns None on TF failure."""
+        point = PointStamped()
+        point.header.frame_id = 'arm_camera_color_frame'
+        point.header.stamp = Time().to_msg()
+        point.point.x = local_x
+        point.point.y = local_y
+        point.point.z = 0.0
+
+        try:
+            transform = self._tf_buffer.lookup_transform(self._odom_frame, self._camera_frame, Time())
+        except TransformException as e:
+            self._logger.warning(
+                f'TF lookup failed (odom <- arm_camera_color_frame): {e}',
+                throttle_duration_sec=2.0,
+            )
+            return None
+
+        odom_point = do_transform_point(point, transform)
+        return odom_point.point.x, odom_point.point.y
+
+    def _set_target_pose_tf(self, bush_x: float, bush_y: float) -> None:
+        """TF-based convesion for camera-frame bush offsets into an odom-frame target pose."""
+        result = self._camera_frame_to_odom_tf(bush_x, bush_y)
+        if result is None:
+            return
+        cam_x, cam_y = result
         cam_yaw = self._bushrow_theta + self._cam_pose[2]
 
         target_x = cam_x + self._cam_pose[0] * math.cos(cam_yaw) - self._cam_pose[1] * math.sin(cam_yaw)

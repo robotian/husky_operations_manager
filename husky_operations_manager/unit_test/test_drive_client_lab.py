@@ -60,6 +60,7 @@ _STATUS_NAMES = {
 BASE_FRAME = 'base_link'
 CAMERA_FRAME = 'arm_camera_color_frame'
 ARM_FRAME = 'arm_base_link'
+ODOM_FRAME = 'base_mocap'  # TF frame for drive.py's TF-based target-pose lookup
 
 # Everything except cam_tx/cam_ty/arm_tx_offset — those are resolved from TF
 # in TestDriveV2Node._wait_for_tf and merged in before DriveClient is built.
@@ -190,6 +191,8 @@ class TestDriveNodeLab(Node):
 
         drive_config = DriveConfig(
             **STATIC_DRIVE_PARAMS,
+            camera_frame=CAMERA_FRAME,
+            odom_frame=ODOM_FRAME,
             cam_tx=cam_tx,
             cam_ty=cam_ty,
             arm_tx_offset=arm_tx_offset,
