@@ -1,118 +1,106 @@
 """
 drive.py
 
-Camera-guided PD drive controller for lavender row harvesting.
+Drives the robot toward lavender bushes using camera detections, then
+stops the robot next to each bush so the arm can harvest it.
 
-Ported from the reference simulation (`DriveClientSimulatorV1.ipynb`,
-`ROS2DriveClientNode`) — a target-pose + PD position/heading controller,
-as opposed to the direct ex/ey proportional controller in drive_v2.py.
-
-Owned by a parent harvesting node which provides the ROS2 node handle
-and drives the lifecycle via the public API (scan / resume).
+Owned by a parent node, which starts the driving with scan() and tells
+it to keep going after each bush with resume().
 
 -------------------------------------------------------------------------------
 Coordinate Frames
 -------------------------------------------------------------------------------
 
-  camera_1_detections (= camera_1_color_optical_frame orientation):
+  A "frame" is just a coordinate system with its own origin and axis
+  directions. The camera and the robot body (base_link) don't share the
+  same one, so positions have to be converted between them.
+
+  Camera frame (config.camera_frame, e.g. arm_camera_color_frame):
     +X → backward  (bush ahead → negative center.x)
     +Y → left
     +Z → down
 
-  base_link:
+  base_link (the robot's own frame):
     +X → forward
     +Y → left
     +Z → up
 
-  Camera is mounted upside-down and backward-facing (~179° roll + ~179° yaw).
+  The camera is mounted upside-down and facing backward, which is why its
+  axes look flipped compared to the robot's.
 
 -------------------------------------------------------------------------------
 Target Pose Calculation
 -------------------------------------------------------------------------------
 
-  On every valid detection, the bush position (msg.center.x, msg.center.y —
-  camera-frame local offsets) is rotated into the odom frame using the
-  camera mount offset (cam_tx, cam_ty) and the robot's current odom pose,
-  producing an absolute (target_x, target_y, target_yaw) — mirrors the sim's
-  `camera_frame_to_reference_frame()` / `set_target_pose()`.
+  Every time the camera detects a bush (msg.center.x/y, in the camera's
+  own frame), the code converts that position into the odom frame (the
+  robot's fixed starting-point frame) using TF — ROS2's built-in system
+  for looking up how frames relate to each other. See
+  _camera_frame_to_odom.
 
-  This is a manual 2-D rigid-body transform, not a TF lookup — matches the
-  sim and drive_v2.py, both of which avoid TF for this calculation.
+  _set_target_pose then nudges that point slightly further along the
+  row (using cam_tx/cam_ty and bushrow_theta) to get the final target
+  the robot will drive to: (target_x, target_y, target_yaw).
 
-  NOTE: the sim declares an ARM_TX_OFFSET (arm_0_base_link.tx relative to
-  base_link) documented as "the arm-stop goal is placed past the bush
-  along the row", but the sim code never actually applies it — the target
-  pose is the bush position itself. Reproduced faithfully here — resolved
-  (arm_tx_offset is carried in DriveConfig but unused), not fixed.
+  NOTE: arm_tx_offset is defined in DriveConfig but never used. Left in
+  on purpose, not a bug.
 
 -------------------------------------------------------------------------------
 Controller
 -------------------------------------------------------------------------------
 
-  Runs on a fixed-rate control timer (1 / config.cmd_vel_rate), consuming
-  the latest cached odom + detection each tick — mirrors the sim's
-  `update_loop_10hz()` cadence, rather than being driven off the detection
-  callback directly (as in drive_v2.py).
+  Runs on a timer, checking the latest odom + detection every tick.
 
-  Phase 1 (distance_error > ex_tolerance): PD drive-to-point.
-    heading_error = atan2(dy, dx) - theta
-    Reverse motion allowed if distance_error < backward_distance_threshold
-    and |heading_error| > pi/2.
-    v = K_v_p * distance_error + K_v_d * d(distance_error)/dt
-    omega = K_omega_p * heading_error + K_omega_d * d(heading_error)/dt
+  Phase 1 — drive to the bush: while still far away, drive toward it
+  (backing up instead, if it's close but facing the wrong way), turning
+  to face it as it goes.
 
-  Phase 2 (position reached, final heading not yet within ang_tol): PD
-  final-orientation correction.
-    omega = K_beta_p * final_heading_error + K_beta_d * d(...)/dt
+  Phase 2 — final turn: once close enough, stop moving forward and just
+  turn in place until facing the bush correctly.
 
-  Both phases clamped to [v_linear_min/max?, v_linear_max] / [-omega_max,
-  omega_max] then accel-limited to ±a_max*dt / ±alpha_max*dt around the
-  previous command.
+  Speed and turn commands are capped, and can only change gradually
+  tick-to-tick, so the robot doesn't jerk around.
 
 -------------------------------------------------------------------------------
 State Machine
 -------------------------------------------------------------------------------
 
+  The robot moves through these stages one at a time:
+
   IDLE
-    └─► scan() → SCANNING  (forward at v_linear_min, no target yet)
-          ├─► valid detection → set target pose → CONTROLLING
-          └─► no detection for no_detection_timeout → STOPPED  (row end)
+    └─► scan() → SCANNING  (drives forward slowly, no bush picked yet)
+          ├─► sees a bush → locks it as the target → CONTROLLING
+          └─► sees nothing for a while → STOPPED  (assumes it's the row's end)
 
   CONTROLLING
-    ├─► valid detection → update target pose (re-locks every tick)
-    ├─► PD goal reached (position + final heading) → STOPPED
-    └─► (no explicit timeout — mirrors sim, which has none in this state)
+    ├─► sees the bush again → updates the locked target
+    ├─► reaches the bush (position + facing it) → STOPPED
+    └─► takes too long without reaching it →
+          ├─► under the retry limit → ABORTED
+          └─► retry limit hit → ERROR  (gives up on this bush)
+
+  ABORTED  (stopped, target kept, ignores new detections)
+    └─► after a short wait → CONTROLLING  (tries the same bush again)
 
   STOPPED
-    └─► resume() → DEPARTING  (drive at v_linear_min, no detection handling)
-          └─► departure_clearance elapsed → SCANNING  (via scan())
+    └─► resume() → DEPARTING  (drives forward a bit, ignoring detections)
+          └─► far enough clear → SCANNING  (via scan())
 
 -------------------------------------------------------------------------------
 Notes
 -------------------------------------------------------------------------------
 
-  - Detection subscription uses the real ImageDetectionPose message
-    (status_interfaces) — msg.detection_valid, msg.center.x, msg.center.y.
-    msg.center.x/y are the raw camera-frame bush offsets consumed directly
-    by the target-pose transform, NOT the ex/ey pre-computed error signal
-    used in drive_v2.py.
-  - ey_sign (present in the sim and drive_v2.py) is intentionally omitted:
-    it is computed in the sim but never consumed by the PD math — the
-    camera→odom transform already accounts for heading via the robot's
-    actual odom yaw. Dropping it changes nothing behaviorally.
-  - Odom and detection subscriptions use qos_profile_sensor_data
-    (BEST_EFFORT), matching drive_v2.py's convention for sensor topics.
-  - cmd_vel is published as TwistStamped every control tick — this doubles
-    as the "republish between detections" behavior drive_v2.py implements
-    with a separate timer, since here the control timer itself is the
-    sole driver of both the state machine and the publish rate.
-  - Husky A200 speed floors (empirical, this unit):
-      Deadband (zero-motion threshold): 0.05 m/s — commands below this
-      produce no physical motion (static friction / breakaway torque not
-      overcome). Locked value — v_linear_min must never be set below this.
-      Accurate-tracking floor: 0.1 m/s — PID velocity control tracks
-      reliably at/above this. Between deadband and this floor, robot may
-      move but jerky/inaccurate.
+  - Detections come in as ImageDetectionPose messages — detection_valid
+    tells you if a bush was actually seen, center.x/y is where it is in
+    the camera frame.
+  - Odom and detection topics use BEST_EFFORT QoS, matching how sensor
+    topics are usually configured in ROS2.
+  - cmd_vel is sent out every tick, whether or not anything changed — this
+    keeps the robot's speed controller fed even if no new bush shows up.
+  - Husky A200 speed floors (measured on this specific robot):
+      Below 0.05 m/s, the robot doesn't move at all (friction). Above
+      0.1 m/s, it tracks speed commands reliably. In between, it might
+      move, but jerkily.
 """
 
 import math
@@ -132,8 +120,6 @@ from tf_transformations import euler_from_quaternion
 from husky_operations_manager.types import DriveConfig
 from status_interfaces.msg import DriveFeedback, ImageDetectionPose
 
-# Human-readable names for DriveFeedback's status constants — used for logging
-# now that self._status is a plain int (DriveFeedback.SCANNING etc.), not an enum.
 _STATUS_NAMES = {
     DriveFeedback.IDLE: 'IDLE',
     DriveFeedback.SCANNING: 'SCANNING',
@@ -150,8 +136,8 @@ class DriveClient:
     """
     Component class for camera-guided PD target-pose drive control.
 
-    Instantiated and owned by the parent harvesting node.
-    Uses the parent node reference for all ROS2 primitives.
+    Instantiated and owned by the parent harvesting node, which supplies
+    the ROS2 node handle and drives the lifecycle via scan()/resume().
 
     Lifecycle:
       1. scan()    — start SCANNING forward, no target locked
@@ -162,6 +148,7 @@ class DriveClient:
     """
 
     def __init__(self, node: Node, config: DriveConfig) -> None:
+        """Build DriveClient from node + config: state, TF buffer, subs/pubs, control timer."""
         self._node = node
         self._logger = RcutilsLogger(self.__class__.__name__)
         self._ns = self._node.get_namespace().rstrip('/')
@@ -208,10 +195,8 @@ class DriveClient:
         # --- Odom state ---
         self._odom_received: bool = False
         self._current_pose: list[float] = [0.0, 0.0, 0.0]  # x, y, yaw
-        self._current_velocity: list[float] = [0.0, 0.0]  # v, omega
 
         # --- Latest cached detection ---
-        # (detected, bush_x, bush_y) in camera frame — consumed once per control tick.
         self._latest_detection: tuple[bool, float, float] = (False, 0.0, 0.0)
 
         # --- Detection staleness guard ---
@@ -221,9 +206,6 @@ class DriveClient:
         # --- Odom-frame positions of already-harvested bushes ---
         self._harvested_positions: list[tuple[float, float]] = []
 
-        # maxlen=50 assumes ~10Hz detection publish rate → 5s rolling window.
-        # Check actual detection topic rate first (ros2 topic hz) — camera pipeline
-        # may publish slower than cmd_vel_rate, window won't be 5s if so.
         self._detection_window: deque[tuple[float, float]] = deque(maxlen=50)
 
         # --- Drive state ---
@@ -240,7 +222,6 @@ class DriveClient:
         # --- TF (camera->odom lookup) ---
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self._node)
-
 
         # --- CONTROLLING timeout retry count — reset on fresh lock (scan()/resume()) ---
         self._controlling_retry_count: int = 0
@@ -308,10 +289,7 @@ class DriveClient:
     # =========================================================================
 
     def scan(self) -> None:
-        """
-        Start forward scanning drive. No target is locked until the first
-        valid detection arrives on the control timer.
-        """
+        """Start SCANNING forward from a fresh (unlocked) state; no-op with an error log if odom isn't ready."""
         if not self._odom_received:
             self._logger.error('scan() called but odom not yet received — aborting scan')
             return
@@ -327,12 +305,7 @@ class DriveClient:
         self._logger.info('SCANNING - controller inactive until first detection')
 
     def resume(self) -> None:
-        """
-        Called by the parent node after harvest activity completes.
-
-        Transitions STOPPED → DEPARTING. Departure duration is derived
-        from config.departure_clearance (m) / v_linear_max.
-        """
+        """Transition STOPPED to DEPARTING after harvest completes; warns and no-ops from any other state."""
         if self._status != DriveFeedback.STOPPED:
             self._logger.warning(
                 f'resume() called in unexpected state: {_STATUS_NAMES.get(self._status, self._status)} — ignoring'
@@ -351,12 +324,7 @@ class DriveClient:
         self._logger.info(f'DEPARTING — clearing bush area | duration={self._departure_duration:.1f}s')
 
     def cancel(self) -> None:
-        """
-        Force-stop mid-motion (parent error recovery / task interruption).
-
-        Distinct from reset(): CANCELED marks an aborted-in-flight state,
-        vs. reset()'s clean return to IDLE after a natural STOPPED row-end.
-        """
+        """Force-stop immediately into CANCELED, publishing a zero cmd_vel regardless of current state."""
         self._status = DriveFeedback.CANCELED
         self._state_timer = 0.0
         self._target_pose = None
@@ -370,10 +338,7 @@ class DriveClient:
         self._logger.warning('CANCELED — forced stop by parent node')
 
     def reset(self) -> None:
-        """
-        Clear back to IDLE — called by the parent after a natural STOPPED
-        row-end (robot already stopped, no forced cancel needed).
-        """
+        """Clear back to IDLE after a natural STOPPED row-end (robot already stopped)."""
         self._status = DriveFeedback.IDLE
         self._state_timer = 0.0
         self._target_pose = None
@@ -388,7 +353,7 @@ class DriveClient:
         return self._build_feedback_msg()
 
     def is_active(self) -> bool:
-        """Return True if the robot is currently moving."""
+        """Return True if status is SCANNING, CONTROLLING, or DEPARTING."""
         return self._status in (
             DriveFeedback.SCANNING,
             DriveFeedback.CONTROLLING,
@@ -404,10 +369,11 @@ class DriveClient:
     # =========================================================================
 
     def _odom_callback(self, msg: Odometry) -> None:
+        """Update current pose/velocity of the robot."""
         q = msg.pose.pose.orientation
         _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
         self._current_pose = [msg.pose.pose.position.x, msg.pose.pose.position.y, yaw]
-        self._current_velocity = [msg.twist.twist.linear.x, msg.twist.twist.angular.z]
+        current_velocity = [msg.twist.twist.linear.x, msg.twist.twist.angular.z]
 
         if not self._odom_received:
             self._logger.info(
@@ -420,7 +386,7 @@ class DriveClient:
         self._logger.debug(
             f'Odom | pose=({self._current_pose[0]:.3f}, {self._current_pose[1]:.3f}, '
             f'{math.degrees(self._current_pose[2]):.1f}deg) | '
-            f'velocity=(v={self._current_velocity[0]:.3f}, omega={self._current_velocity[1]:.3f})',
+            f'velocity=(v={current_velocity[0]:.3f}, omega={current_velocity[1]:.3f})',
             throttle_duration_sec=2.0,
         )
 
@@ -429,6 +395,7 @@ class DriveClient:
     # =========================================================================
 
     def _detection_callback(self, msg: ImageDetectionPose) -> None:
+        """The latest detection and stamp for the control timer."""
         detected = bool(msg.detection_valid)
         bush_x, bush_y = msg.center.x, msg.center.y
 
@@ -457,7 +424,7 @@ class DriveClient:
     # =========================================================================
 
     def _control_callback(self) -> None:
-        """Fixed-rate tick — mirrors the sim's update_loop_10hz()."""
+        """Drive the state machine, PD controller, and cmd_vel/feedback publishing on a fixed-rate tick."""
         if not self._odom_received:
             return
 
@@ -482,18 +449,21 @@ class DriveClient:
 
             elif is_new_detection and bush_x < 0:
                 self._set_target_pose(bush_x, bush_y)
-                self._status = DriveFeedback.CONTROLLING
-                self._state_timer = 0.0
-                tx, ty, tyaw = self._target_pose
-                self._logger.info(
-                    f'Target locked — bush cam=({bush_x:.3f}, {bush_y:.3f}) '
-                    f'target odom=({tx:.3f}, {ty:.3f}, {math.degrees(tyaw):.1f}deg)'
-                )
+                if self._target_pose is None:
+                    self._logger.warning(
+                        'Target lock skipped — TF unavailable, continuing SCANNING',
+                        throttle_duration_sec=2.0,
+                    )
+                else:
+                    self._status = DriveFeedback.CONTROLLING
+                    self._state_timer = 0.0
+                    tx, ty, tyaw = self._target_pose
+                    self._logger.info(
+                        f'Target locked — bush cam=({bush_x:.3f}, {bush_y:.3f}) '
+                        f'target odom=({tx:.3f}, {ty:.3f}, {math.degrees(tyaw):.1f}deg)'
+                    )
 
             elif img_detected:
-                # bush_x >= 0 → bush already reached/behind. Most likely the just-departed bush still lingering in 
-                # the frame at end of row not a new lock candidate. Ignore and keep scanning; state_timer keeps
-                # counting toward no_detection_timeout, which stops the robot once nothing new shows up ahead.
                 self._logger.info(
                     f'Ignoring detection at bush_x={bush_x:.3f} (not ahead) — '
                     f'likely the departed bush, continuing SCANNING'
@@ -581,11 +551,11 @@ class DriveClient:
 
     # =========================================================================
     # Target pose (camera frame → odom frame)
-    # =========================================================================    
+    # =========================================================================
     def _camera_frame_to_odom(self, local_x: float, local_y: float) -> tuple[float, float] | None:
-        """TF-based camera->odom transform. Returns None on TF failure."""
+        """TF-lookup camera-to-odom point transform for (local_x, local_y); returns None on TF failure."""
         point = PointStamped()
-        point.header.frame_id = 'arm_camera_color_frame'
+        point.header.frame_id = self._camera_frame
         point.header.stamp = Time().to_msg()
         point.point.x = local_x
         point.point.y = local_y
@@ -595,7 +565,7 @@ class DriveClient:
             transform = self._tf_buffer.lookup_transform(self._odom_frame, self._camera_frame, Time())
         except TransformException as e:
             self._logger.warning(
-                f'TF lookup failed (odom <- arm_camera_color_frame): {e}',
+                f'TF lookup failed ({self._odom_frame} <- {self._camera_frame}): {e}',
                 throttle_duration_sec=2.0,
             )
             return None
@@ -604,13 +574,11 @@ class DriveClient:
         return odom_point.point.x, odom_point.point.y
 
     def _set_target_pose(self, bush_x: float, bush_y: float) -> None:
-        """
-        Convert camera-frame bush offsets into an odom-frame target pose.
-        """
+        """Lock or re-lock target pose from a camera-frame bush offset, rejecting re-locks past same_bush_threshold."""
         result = self._camera_frame_to_odom(bush_x, bush_y)
         if result is None:
             return
-        cam_x, cam_y = result        
+        cam_x, cam_y = result
         cam_yaw = self._bushrow_theta + self._cam_pose[2]
 
         target_x = cam_x + self._cam_pose[0] * math.cos(cam_yaw) - self._cam_pose[1] * math.sin(cam_yaw)
@@ -637,16 +605,12 @@ class DriveClient:
     # =========================================================================
 
     def _compute_commands_pd(self) -> tuple[float, float, bool]:
-        """PD position + heading controller. Returns (v, omega, goal_reached)."""
+        """Compute PD position and heading commands; return (v_cmd, omega_cmd, goal_reached)."""
         x, y, theta = self._current_pose
         x_d, y_d, theta_d = self._target_pose if self._target_pose is not None else (0.0, 0.0, 0.0)
 
         # self._v_prev = self._current_velocity[0]
         # self._omega_prev = self._current_velocity[1]
-        # Bug: anchored accel/jerk limiter to MEASURED odom velocity, not last
-        # COMMANDED velocity. Measured lags/stalls (stiction, deadband, slip),
-        # causing false decel injection and, near the 0.01m/s move threshold,
-        # a self-locking stall where commanded value never climbs past it.
         self._v_prev = self._cmd_linear_x
         self._omega_prev = self._cmd_angular_z
 
@@ -670,7 +634,6 @@ class DriveClient:
                 direction = -1.0
             else:
                 direction = 1.0
-
 
             if self._prev_distance_error is None:
                 self._prev_distance_error = distance_error
@@ -724,30 +687,35 @@ class DriveClient:
     # Internal helpers
     # =========================================================================
     def _hard_stop(self) -> None:
+        """Force status to STOPPED and zero cmd_vel."""
         self._status = DriveFeedback.STOPPED
         self._cmd_linear_x = 0.0
         self._cmd_angular_z = 0.0
 
     def _error_stop(self) -> None:
-        """Gave up, distinct from STOPPED, which callers treat as success."""
+        """Force status to ERROR and zero cmd_vel; distinct from STOPPED, which callers treat as success."""
         self._status = DriveFeedback.ERROR
         self._cmd_linear_x = 0.0
         self._cmd_angular_z = 0.0
 
     def _reset_pd_state(self) -> None:
+        """Clear PD error-history state so the next tick's derivative terms start fresh."""
         self._prev_distance_error = None
         self._prev_heading_error = None
         self._prev_final_heading_error = None
 
     @staticmethod
     def _normalize_angle(angle: float) -> float:
+        """Wrap an angle to [-pi, pi]."""
         return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
     @staticmethod
     def _clamp(value: float, lo: float, hi: float) -> float:
+        """Clamp value to the closed interval [lo, hi]."""
         return max(lo, min(value, hi))
 
     def _publish_cmd_vel(self, linear_x: float, angular_z: float, publish_to_topic: bool = True) -> None:
+        """Publish a TwistStamped cmd_vel; publish_to_topic=False suppresses the actual topic publish."""
         msg = TwistStamped()
         msg.header.stamp = self._node.get_clock().now().to_msg()
         msg.header.frame_id = self._base_frame
@@ -761,6 +729,7 @@ class DriveClient:
         self._logger.debug(f'Published command velocity: {msg.twist}')
 
     def _build_feedback_msg(self) -> DriveFeedback:
+        """Assemble the current DriveFeedback message from target/current pose and PD/status state."""
         tx, ty, tyaw = self._target_pose if self._target_pose is not None else (0.0, 0.0, 0.0)
         cx, cy, cyaw = self._current_pose
 
@@ -783,4 +752,5 @@ class DriveClient:
         return feedback
 
     def _publish_feedback(self) -> None:
+        """Publish the current DriveFeedback message."""
         self._drive_feedback_pub.publish(self._build_feedback_msg())
