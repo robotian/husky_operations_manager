@@ -1,33 +1,42 @@
 """
 test_drive_harvest_unload.py
 
-Test node combining DriveClient bush harvesting with a full dock → unload → undock
-sequence after all bushes in the row are done.
+Runs a Husky through one full row: harvest 3 bushes, dock, unload, undock.
 
-Sequence:
-  STARTUP_HOMING   — send unloader HOME at boot; wait for AT_HOME confirmation
-  HARVESTING_ROW   — DriveClient scans row; each STOPPED fires a simulated harvest
-                     timer; after TOTAL_BUSHES harvests the row is complete
-  DOCKING          — DockingActionClient navigates to and docks at unloading_station
-  UNLOADING        — UnloaderActionClient drives carriage to END
-  UNLOAD_WAIT      — one-shot timer holds for POST_UNLOAD_DELAY_SEC
-  RETURNING_HOME   — UnloaderActionClient drives carriage back to HOME
-  UNDOCKING        — UndockingActionClient departs from dock
-  DONE             — logs outcome, node exits
+The node moves through these phases in order:
+    STARTUP_HOMING   - send the unloader carriage HOME and wait for it to arrive
+    HARVESTING_ROW   - for each of 3 bushes: confirm the arm is READY, drive
+                        to the bush, run the harvest, then repeat
+    DOCKING          - navigate to and dock at unloading_station
+    UNLOADING        - drive the unloader carriage to END
+    UNLOAD_WAIT      - wait a few seconds before returning the carriage
+    RETURNING_HOME   - drive the unloader carriage back to HOME
+    UNDOCKING        - leave the dock
+    DONE             - log the result and stop
 
-No startup undocking sequence.
+Before the robot drives anywhere, the arm must be confirmed READY. The
+node checks this every time before scan() or resume() and sends a
+GO_READY command first if it isn't, so the arm is never mid-harvest
+while the robot is moving.
+
+On startup, the unloader is sent HOME even if the row hasn't started
+yet. The unloader action server finishes immediately when the carriage
+is already at the home limit switch, so this check is safe to run
+unconditionally.
 
 Run:
   ros2 run husky_operations_manager test_drive_harvest_unload \\
-    --ros-args -r __ns:=/j100_0921 -r /tf:=tf -r /tf_static:=tf_static
+    --ros-args -r __ns:=/a200_0284 -r /tf:=tf -r /tf_static:=tf_static
 """
 
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 from tf2_ros import Buffer, TransformListener
 
 from husky_operations_manager.action_clients.docking import DockingActionClient
 from husky_operations_manager.action_clients.drive import DriveClient
+from husky_operations_manager.action_clients.manipulator import ArmCommand, ManipulatorTaskActionClient
 from husky_operations_manager.action_clients.undocking import UndockingActionClient
 from husky_operations_manager.action_clients.unloader import UnloaderActionClient
 from husky_operations_manager.robot_enums import RobotStatusEnum
@@ -35,8 +44,6 @@ from husky_operations_manager.types import DriveConfig
 from status_interfaces.action import OperateUnloader
 from status_interfaces.msg import DockGoal, DriveFeedback, SubTask, UndockGoal
 
-# Human-readable names for DriveFeedback's status constants — used for logging
-# the plain int status value (get_status().status), since it's not an enum.
 _STATUS_NAMES = {
     DriveFeedback.IDLE: 'IDLE',
     DriveFeedback.SCANNING: 'SCANNING',
@@ -45,6 +52,7 @@ _STATUS_NAMES = {
     DriveFeedback.DEPARTING: 'DEPARTING',
     DriveFeedback.CANCELED: 'CANCELED',
     DriveFeedback.ERROR: 'ERROR',
+    DriveFeedback.ABORTED: 'ABORTED',
 }
 
 
@@ -55,35 +63,25 @@ _STATUS_NAMES = {
 # --- TF frames resolved at startup, merged into DriveConfig once available ---
 BASE_FRAME = 'base_link'
 CAMERA_FRAME = 'arm_camera_color_frame'
-ARM_FRAME = 'arm_0_base_link'
+ODOM_FRAME = 'base_mocap'  # TF frame for drive.py's TF-based target-pose lookup
 
-# Everything except cam_tx/cam_ty/arm_tx_offset — those are resolved from TF
-# in TestDriveHarvestUnloadNode._wait_for_tf and merged in before DriveClient
-# is built.
 STATIC_DRIVE_PARAMS = {
     # --- Subscriptions ---
     'detection_topic': 'manipulators/arm_detection/image_annotated/detection_pose',
     'odom_topic': 'ground_truth/odom',
     # --- cmd_vel ---
     'base_frame': BASE_FRAME,
-    'cmd_vel_rate': 5.0,  # Hz — republish rate between detections
+    'cmd_vel_rate': 10.0,  # Hz — republish rate between detections
     # --- Stop condition ---
     'ex_tolerance': 0.02,  # m — bush level with arm tolerance
     # --- Speed limits ---
-    # Husky A200 speed floors (empirical, this unit):
-    #   Deadband (zero-motion threshold): 0.05 m/s — commands below this
-    #   produce no physical motion. Locked value, do not go below.
-    #   Accurate-tracking floor: 0.1 m/s — control loops track reliably
-    #   at/above this; between deadband and floor, robot may move but
     'v_linear_min': 0.05,  # m/s — minimum speed near stop point
     'v_linear_max': 0.125,  # m/s — speed at first detection
     'v_angular_max': 0.15,  # rad/s — angular correction clamp
-    # Turn radius floor: 0.02/0.15 = 0.13m
     # --- Departure ---
     'departure_clearance': 0.2,  # m — distance past bush before next scan
     # --- No-detection timeout ---
-    # Converted to time: 1.0m / 0.1m/s = 10s
-    'no_detection_distance': 1.0,  # m — row end assumed after this distance
+    'no_detection_distance': 0.60,  # m — row end assumed after this distance
     # --- PD target-pose controller (drive.py) ---
     'ang_tol': 0.05,  # rad — final-heading tolerance (~3deg)
     'k_v_p': 0.2,
@@ -95,12 +93,17 @@ STATIC_DRIVE_PARAMS = {
     'a_max': 0.05,  # m/s^2
     'alpha_max': 0.3,  # rad/s^2
     'backward_distance_threshold': 1.0,  # m
+    'same_bush_threshold': 0.25,  # m — CONTROLLING re-lock accepted only within this of the currently locked target
+    'controlling_timeout': 30.0,  # s — no goal reached within this long -> reset lock, retry same bush
+    'max_controlling_retries': 3,  # retry attempts on same bush before giving up (-> ERROR)
+    'controlling_retry_delay': 5.0,  # s — stopped wait between ABORTED and re-entering CONTROLLING
     # --- Row geometry (drive.py) ---
     'bushrow_theta': 0.0,  # rad — row orientation in odom frame
 }
 
 TOTAL_BUSHES = 3
-HARVEST_SIMULATION_DURATION_SEC = 10.0
+MAX_HARVEST_RETRIES = 3
+MAX_DOCKING_RETRIES = 3
 
 # Unloading dock
 DOCK_ID = 'unloading_station'
@@ -129,47 +132,42 @@ _PHASE_DONE = 'DONE'
 
 class TestDriveHarvestUnloadNode(Node):
     """
-    Drives 3 lavender bushes then docks, unloads, and undocks.
-
-    Startup safety: unconditionally homes the unloader carriage before
-    starting DriveClient — the action server completes immediately if the
-    carriage is already at the home limit switch.
+    Test node for one full harvest row on a real robot: drive to each bush,
+    harvest it, then dock, unload, and undock.
     """
 
     def __init__(self):
+        """Set up TF listening and action clients, then start the unloader HOME check."""
         super().__init__('test_drive_harvest_unload')
 
         self._namespace = self.get_namespace().rstrip('/')
         self.get_logger().info(f'Node namespace: {self._namespace}')
 
-        # --- State ---
         self._phase = _PHASE_STARTUP_HOMING
         self._bush_count = 0
         self._harvest_pending = False
-        self._harvest_timer = None
+        self._harvest_retry_count = 0
+        self._harvest_poll_timer = None
+        self._docking_retry_count = 0
         self._unload_wait_timer = None
-        self._start_timer = None  # odom poll — created after HOME confirmed
+        self._start_timer = None
 
-        # DriveClient isn't constructed yet — cam_tx/cam_ty/arm_tx_offset come
-        # from TF, resolved via a timer poll (see _wait_for_tf) since a
-        # blocking lookup here in __init__ runs before rclpy.spin() ever
-        # starts and would never see any /tf or /tf_static callbacks fire.
-        # _poll_startup_homing gates the HARVESTING_ROW transition on this
-        # being ready, in addition to the unloader HOME confirmation.
+        self._last_confirmed_arm_command: str = ArmCommand.UNKNOWN
+        self._arm_ready_wait_timer = None
+        self._arm_ready_callback = None
+
         self._drive_client: DriveClient | None = None
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
         self._tf_wait_timer = self.create_timer(0.2, self._wait_for_tf)
 
-        # --- Action clients ---
         self._docking_client = DockingActionClient(self)
         self._unloader_client = UnloaderActionClient(self)
         self._undocking_client = UndockingActionClient(self)
+        self._manipulator_client = ManipulatorTaskActionClient(self)
 
-        # --- 1 Hz monitor ---
         self._monitor_timer = self.create_timer(1.0, self._monitor_callback)
 
-        # --- Startup safety: home the unloader before anything else ---
         self.get_logger().info('Startup safety check — sending unloader HOME')
         if not self._unloader_client.send_goal(OperateUnloader.Goal.HOME):
             self.get_logger().error('Startup HOME goal failed — aborting')
@@ -180,35 +178,21 @@ class TestDriveHarvestUnloadNode(Node):
     # =========================================================================
 
     def _wait_for_tf(self) -> None:
-        """
-        Poll at 0.2s until both the camera and arm static transforms are
-        available, then build the full DriveConfig and construct DriveClient.
-        Runs as a timer callback so it only executes once rclpy.spin() is
-        actually running and servicing the TransformListener's subscriptions.
-        """
-        now = rclpy.time.Time()
-        if not (
-            self._tf_buffer.can_transform(BASE_FRAME, CAMERA_FRAME, now)
-            and self._tf_buffer.can_transform(BASE_FRAME, ARM_FRAME, now)
-        ):
+        """Poll until camera TF is available, then build DriveClient."""
+        now = Time()
+        if not self._tf_buffer.can_transform(BASE_FRAME, CAMERA_FRAME, now):
             self.get_logger().info('Waiting for TF...', throttle_duration_sec=1.0)
             return
 
         self._tf_wait_timer.cancel()
         self._tf_wait_timer = None
 
-        cam_tf = self._tf_buffer.lookup_transform(BASE_FRAME, CAMERA_FRAME, now)
-        arm_tf = self._tf_buffer.lookup_transform(BASE_FRAME, ARM_FRAME, now)
-        cam_tx, cam_ty = cam_tf.transform.translation.x, cam_tf.transform.translation.y
-        arm_tx_offset = arm_tf.transform.translation.x
-
-        self.get_logger().info(f'TF resolved | cam=({cam_tx:.3f}, {cam_ty:.3f}) | arm_tx_offset={arm_tx_offset:.3f}')
+        self.get_logger().info('Camera TF resolved — building DriveClient')
 
         drive_config = DriveConfig(
             **STATIC_DRIVE_PARAMS,
-            cam_tx=cam_tx,
-            cam_ty=cam_ty,
-            arm_tx_offset=arm_tx_offset,
+            camera_frame=CAMERA_FRAME,
+            odom_frame=ODOM_FRAME,
         )
         self._drive_client = DriveClient(self, drive_config)
 
@@ -220,14 +204,64 @@ class TestDriveHarvestUnloadNode(Node):
 
         self._start_timer.cancel()
         self._start_timer = None
-        self.get_logger().info('Odom received — calling DriveClient scan()')
-        self._drive_client.scan()
+        self.get_logger().info('Odom received — gating on arm READY before scan()')
+        self._ensure_arm_ready(self._drive_client.scan)
+
+    # =========================================================================
+    # Arm gating — must be confirmed READY before any scan()/resume()
+    # =========================================================================
+
+    def _ensure_arm_ready(self, on_ready) -> None:
+        """Run on_ready now if the arm is already READY, otherwise send GO_READY first."""
+        if self._last_confirmed_arm_command == ArmCommand.GO_READY:
+            on_ready()
+            return
+
+        subtask = SubTask()
+        subtask.type = SubTask.HARVESTING
+        subtask.description = 'Arm ready before DriveClient move'
+
+        self.get_logger().info('Arm not confirmed READY — sending GO_READY')
+        if not self._manipulator_client.send_ready_goal(subtask):
+            self.get_logger().error('Failed to send GO_READY goal — aborting')
+            self._phase = _PHASE_DONE
+            rclpy.shutdown()
+            return
+
+        self._arm_ready_callback = on_ready
+        self._arm_ready_wait_timer = self.create_timer(0.2, self._wait_for_arm_ready)
+
+    def _wait_for_arm_ready(self) -> None:
+        """Poll at 0.2s until GO_READY completes, then fire the stashed callback."""
+        status = self._manipulator_client.get_status()
+        feedback = self._manipulator_client.get_feedback()
+        self.get_logger().info(f'[ARM_READY] feedback={feedback.feedback_message if feedback else None}')
+
+        if feedback and feedback.arm_task == ArmCommand.GO_READY and feedback.feedback_message == 'SUCCEEDED':
+            self._arm_ready_wait_timer.cancel()
+            self._arm_ready_wait_timer = None
+            self._manipulator_client.reset()
+            self._last_confirmed_arm_command = ArmCommand.GO_READY
+            self.get_logger().info('Arm READY confirmed')
+
+            callback = self._arm_ready_callback
+            self._arm_ready_callback = None
+            callback()
+            return
+
+        if status == RobotStatusEnum.ERROR:
+            self._arm_ready_wait_timer.cancel()
+            self._arm_ready_wait_timer = None
+            self.get_logger().error('Arm READY goal failed — aborting')
+            self._phase = _PHASE_DONE
+            rclpy.shutdown()
 
     # =========================================================================
     # Main 1 Hz monitor
     # =========================================================================
 
     def _monitor_callback(self) -> None:
+        """Run the poll method for whichever phase the node is currently in."""
         if self._phase == _PHASE_STARTUP_HOMING:
             self._poll_startup_homing()
 
@@ -247,13 +281,14 @@ class TestDriveHarvestUnloadNode(Node):
             self._poll_undocking()
 
         elif self._phase == _PHASE_DONE:
-            pass  # terminal — monitor keeps running but does nothing
+            pass
 
     # =========================================================================
     # Phase: STARTUP_HOMING
     # =========================================================================
 
     def _poll_startup_homing(self) -> None:
+        """Wait for the unloader HOME goal to finish, then start the harvesting phase."""
         status = self._unloader_client.get_status()
         self.get_logger().info(f'[STARTUP_HOMING] unloader status: {status.name}')
 
@@ -273,18 +308,14 @@ class TestDriveHarvestUnloadNode(Node):
         elif status == RobotStatusEnum.ERROR:
             self.get_logger().error('Startup HOME check failed — aborting')
             self._phase = _PHASE_DONE
+            rclpy.shutdown()
 
     # =========================================================================
     # Phase: HARVESTING_ROW
     # =========================================================================
 
     def _poll_harvesting_row(self) -> None:
-        """
-        On STOPPED (and no harvest already pending) — starts the one-shot
-        harvest simulation timer, up to TOTAL_BUSHES times. Count-based cap
-        only works here because this is a fixed-row test setup with a known
-        bush count (see test_drive_client_lab.py for the same pattern).
-        """
+        """Send a START_HARVEST goal each time DriveClient stops at a bush, up to TOTAL_BUSHES times."""
         status = self._drive_client.get_status().status
         self.get_logger().info(
             f'[HARVESTING_ROW] drive={_STATUS_NAMES.get(status, status)} | '
@@ -297,39 +328,91 @@ class TestDriveHarvestUnloadNode(Node):
 
         self._bush_count += 1
         self._harvest_pending = True
-        self.get_logger().info(
-            f'Bush {self._bush_count}/{TOTAL_BUSHES} reached — '
-            f'starting simulated harvest | duration={HARVEST_SIMULATION_DURATION_SEC:.0f}s'
-        )
-        self._harvest_timer = self.create_timer(
-            HARVEST_SIMULATION_DURATION_SEC,
-            self._on_harvest_complete,
-        )
+        self._harvest_retry_count = 0
+
+        self.get_logger().info(f'Bush {self._bush_count}/{TOTAL_BUSHES} reached — sending START_HARVEST')
+        if not self._send_harvest_goal():
+            self.get_logger().error('Failed to send START_HARVEST goal — aborting')
+            self._phase = _PHASE_DONE
+            rclpy.shutdown()
+            return
+
+        self._harvest_poll_timer = self.create_timer(0.2, self._poll_harvest)
 
     # =========================================================================
-    # Harvest simulation
+    # Harvest
     # =========================================================================
+
+    def _send_harvest_goal(self) -> bool:
+        """Build and send a START_HARVEST goal for the current bush."""
+        subtask = SubTask()
+        subtask.type = SubTask.HARVESTING
+        subtask.description = 'Executing harvest sequence'
+        return self._manipulator_client.send_harvesting_goal(subtask)
+
+    def _poll_harvest(self) -> None:
+        """Poll at 0.2s until START_HARVEST completes, then advance the row."""
+        status = self._manipulator_client.get_status()
+        feedback = self._manipulator_client.get_feedback()
+        self.get_logger().info(f'[HARVEST] feedback={feedback.feedback_message if feedback else None}')
+
+        if status == RobotStatusEnum.ERROR:
+            self._harvest_poll_timer.cancel()
+            self._harvest_poll_timer = None
+            self._manipulator_client.reset()
+
+            if self._harvest_retry_count < MAX_HARVEST_RETRIES:
+                self._harvest_retry_count += 1
+                self.get_logger().warning(
+                    f'Harvest goal failed — retrying ({self._harvest_retry_count}/{MAX_HARVEST_RETRIES})'
+                )
+                if not self._send_harvest_goal():
+                    self.get_logger().error('Retry dispatch failed — aborting')
+                    self._phase = _PHASE_DONE
+                    rclpy.shutdown()
+                    return
+                self._harvest_poll_timer = self.create_timer(0.2, self._poll_harvest)
+                return
+
+            self.get_logger().error(f'Harvest goal failed after {MAX_HARVEST_RETRIES} retries — shutting down')
+            self._phase = _PHASE_DONE
+            rclpy.shutdown()
+            return
+
+        if not (
+            feedback and feedback.arm_task == ArmCommand.START_HARVEST and feedback.feedback_message == 'SUCCEEDED'
+        ):
+            return
+
+        self._harvest_poll_timer.cancel()
+        self._harvest_poll_timer = None
+        self._manipulator_client.reset()
+        self._last_confirmed_arm_command = ArmCommand.START_HARVEST
+        self._on_harvest_complete()
 
     def _on_harvest_complete(self) -> None:
-        """Fires once per bush after HARVEST_SIMULATION_DURATION_SEC."""
-        if self._harvest_timer is not None:
-            self._harvest_timer.cancel()
-            self._harvest_timer = None
-
-        self._harvest_pending = False
-
+        """Fires once per bush after START_HARVEST is confirmed complete."""
         if self._bush_count < TOTAL_BUSHES:
-            self.get_logger().info(f'Harvest {self._bush_count} done — resuming for bush {self._bush_count + 1}')
-            self._drive_client.resume()
+            self.get_logger().info(
+                f'Harvest {self._bush_count} done — gating on arm READY before resume() for bush {self._bush_count + 1}'
+            )
+            self._ensure_arm_ready(self._resume_after_harvest)
         else:
+            self._harvest_pending = False
             self.get_logger().info(f'All {TOTAL_BUSHES} bushes harvested — starting dock sequence')
-            self._send_docking_goal()
+            self._start_docking()
+
+    def _resume_after_harvest(self) -> None:
+        """Clears harvest_pending and resumes DriveClient in the same tick, closing the _poll_harvesting_row race."""
+        self._harvest_pending = False
+        self._drive_client.resume()
 
     # =========================================================================
     # Phase: DOCKING
     # =========================================================================
 
-    def _send_docking_goal(self) -> None:
+    def _send_docking_goal(self) -> bool:
+        """Build and send the docking goal for unloading_station."""
         dock_goal = DockGoal()
         dock_goal.use_dock_id = True
         dock_goal.dock_id = DOCK_ID
@@ -341,14 +424,21 @@ class TestDriveHarvestUnloadNode(Node):
         subtask.dock_goal = dock_goal
 
         self.get_logger().info(f"Sending docking goal | dock_id='{DOCK_ID}'")
-        if not self._docking_client.send_docking_goal(subtask):
+        return self._docking_client.send_docking_goal(subtask)
+
+    def _start_docking(self) -> None:
+        """Reset the docking retry count, send the first docking goal, and switch to the DOCKING phase."""
+        self._docking_retry_count = 0
+        if not self._send_docking_goal():
             self.get_logger().error('Failed to send docking goal — aborting')
             self._phase = _PHASE_DONE
+            rclpy.shutdown()
             return
 
         self._phase = _PHASE_DOCKING
 
     def _poll_docking(self) -> None:
+        """Wait for docking to finish, then start the unloading goal."""
         status = self._docking_client.get_status()
         self.get_logger().info(f'[DOCKING] status={status.name}')
 
@@ -367,23 +457,40 @@ class TestDriveHarvestUnloadNode(Node):
             self._send_unloading_goal()
 
         elif status == RobotStatusEnum.ERROR:
-            self.get_logger().error('Docking failed — aborting sequence')
+            self._docking_client.reset()
+
+            if self._docking_retry_count < MAX_DOCKING_RETRIES:
+                self._docking_retry_count += 1
+                self.get_logger().warning(
+                    f'Docking failed — retrying ({self._docking_retry_count}/{MAX_DOCKING_RETRIES})'
+                )
+                if not self._send_docking_goal():
+                    self.get_logger().error('Retry dispatch failed — aborting')
+                    self._phase = _PHASE_DONE
+                    rclpy.shutdown()
+                return
+
+            self.get_logger().error(f'Docking failed after {MAX_DOCKING_RETRIES} retries — shutting down')
             self._phase = _PHASE_DONE
+            rclpy.shutdown()
 
     # =========================================================================
     # Phase: UNLOADING
     # =========================================================================
 
     def _send_unloading_goal(self) -> None:
+        """Send the unloader END goal and switch to the UNLOADING phase."""
         self.get_logger().info('Sending unloader goal: END')
         if not self._unloader_client.send_goal(OperateUnloader.Goal.END):
             self.get_logger().error('Failed to send unloader END goal — aborting')
             self._phase = _PHASE_DONE
+            rclpy.shutdown()
             return
 
         self._phase = _PHASE_UNLOADING
 
     def _poll_unloading(self) -> None:
+        """Wait for the carriage to reach END, then start the post-unload wait."""
         status = self._unloader_client.get_status()
         self.get_logger().info(f'[UNLOADING] status={status.name}')
 
@@ -403,6 +510,7 @@ class TestDriveHarvestUnloadNode(Node):
         elif status == RobotStatusEnum.ERROR:
             self.get_logger().error('Unloading failed — aborting sequence')
             self._phase = _PHASE_DONE
+            rclpy.shutdown()
 
     # =========================================================================
     # Unload wait
@@ -418,6 +526,7 @@ class TestDriveHarvestUnloadNode(Node):
         if not self._unloader_client.send_goal(OperateUnloader.Goal.HOME):
             self.get_logger().error('Failed to send unloader HOME goal — aborting')
             self._phase = _PHASE_DONE
+            rclpy.shutdown()
             return
 
         self._phase = _PHASE_RETURNING_HOME
@@ -427,6 +536,7 @@ class TestDriveHarvestUnloadNode(Node):
     # =========================================================================
 
     def _poll_returning_home(self) -> None:
+        """Wait for the carriage to reach HOME, then start undocking."""
         status = self._unloader_client.get_status()
         self.get_logger().info(f'[RETURNING_HOME] status={status.name}')
 
@@ -446,12 +556,14 @@ class TestDriveHarvestUnloadNode(Node):
         elif status == RobotStatusEnum.ERROR:
             self.get_logger().error('Unloader HOME return failed — aborting')
             self._phase = _PHASE_DONE
+            rclpy.shutdown()
 
     # =========================================================================
     # Phase: UNDOCKING
     # =========================================================================
 
     def _send_undocking_goal(self) -> None:
+        """Send the undocking goal and switch to the UNDOCKING phase."""
         max_undocking_time = (abs(STAGING_X_OFFSET) / max(V_LINEAR_MIN_UNDOCK, 0.01)) * 2.0
 
         undock_goal = UndockGoal()
@@ -469,11 +581,13 @@ class TestDriveHarvestUnloadNode(Node):
         if not self._undocking_client.send_undocking_goal(subtask):
             self.get_logger().error('Failed to send undocking goal — aborting')
             self._phase = _PHASE_DONE
+            rclpy.shutdown()
             return
 
         self._phase = _PHASE_UNDOCKING
 
     def _poll_undocking(self) -> None:
+        """Wait for undocking to finish and end the sequence, logging success or failure."""
         status = self._undocking_client.get_status()
         self.get_logger().info(f'[UNDOCKING] status={status.name}')
 
@@ -494,6 +608,7 @@ class TestDriveHarvestUnloadNode(Node):
             self.get_logger().error('Undocking failed')
             self._undocking_client.reset()
             self._phase = _PHASE_DONE
+            rclpy.shutdown()
 
 
 # =============================================================================
@@ -502,6 +617,7 @@ class TestDriveHarvestUnloadNode(Node):
 
 
 def main(args=None):
+    """Start the node and spin until shutdown."""
     rclpy.init(args=args)
     node = TestDriveHarvestUnloadNode()
     try:

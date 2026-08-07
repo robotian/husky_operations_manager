@@ -42,8 +42,10 @@ Target Pose Calculation
   row (using cam_tx/cam_ty and bushrow_theta) to get the final target
   the robot will drive to: (target_x, target_y, target_yaw).
 
-  NOTE: arm_tx_offset is defined in DriveConfig but never used. Left in
-  on purpose, not a bug.
+  cam_tx/cam_ty/cam_yaw come from _cam_pose, a base_frame->camera_frame
+  TF lookup refreshed on every scan()/resume() (see _refresh_cam_pose) —
+  none are fixed constants, since the camera rides on the arm and
+  rotates with it, not just translates.
 
 -------------------------------------------------------------------------------
 Controller
@@ -176,17 +178,11 @@ class DriveClient:
         self._max_controlling_retries = config.max_controlling_retries
         self._controlling_retry_delay = config.controlling_retry_delay
 
-        self._cam_pose: tuple[float, float, float] = (
-            config.cam_tx,
-            config.cam_ty,
-            math.pi,  # camera faces backward
-        )
+        self._cam_pose: tuple[float, float, float] | None = None
 
         self._bushrow_theta = config.bushrow_theta
 
         self._dt = 1.0 / config.cmd_vel_rate
-
-        self._logger.info(f'Camera_Pose: {self._cam_pose} | Arm offset in x-axis: {config.arm_tx_offset}')
 
         # Convert distance-based config fields to time
         self._no_detection_timeout: float = config.no_detection_distance / config.v_linear_min
@@ -294,6 +290,10 @@ class DriveClient:
             self._logger.error('scan() called but odom not yet received — aborting scan')
             return
 
+        if not self._refresh_cam_pose():
+            self._logger.error('scan() called but camera TF unavailable — aborting scan')
+            return
+
         self._status = DriveFeedback.SCANNING
         self._state_timer = 0.0
         self._target_pose = None
@@ -310,6 +310,10 @@ class DriveClient:
             self._logger.warning(
                 f'resume() called in unexpected state: {_STATUS_NAMES.get(self._status, self._status)} — ignoring'
             )
+            return
+
+        if not self._refresh_cam_pose():
+            self._logger.error('resume() called but camera TF unavailable — aborting resume')
             return
 
         self._status = DriveFeedback.DEPARTING
@@ -441,13 +445,7 @@ class DriveClient:
             self._cmd_linear_x = self._v_linear_min
             self._cmd_angular_z = 0.0
 
-            if self._state_timer >= self._no_detection_timeout:
-                self._logger.warning(
-                    f'No-detection timeout ({self._no_detection_timeout:.1f}s) - row end or gap. Stopping.'
-                )
-                self._hard_stop()
-
-            elif is_new_detection and bush_x < 0:
+            if is_new_detection and bush_x < 0:
                 self._set_target_pose(bush_x, bush_y)
                 if self._target_pose is None:
                     self._logger.warning(
@@ -462,6 +460,12 @@ class DriveClient:
                         f'Target locked — bush cam=({bush_x:.3f}, {bush_y:.3f}) '
                         f'target odom=({tx:.3f}, {ty:.3f}, {math.degrees(tyaw):.1f}deg)'
                     )
+
+            elif self._state_timer >= self._no_detection_timeout:
+                self._logger.warning(
+                    f'No-detection timeout ({self._no_detection_timeout:.1f}s) - row end or gap. Stopping.'
+                )
+                self._hard_stop()
 
             elif img_detected:
                 self._logger.info(
@@ -552,6 +556,26 @@ class DriveClient:
     # =========================================================================
     # Target pose (camera frame → odom frame)
     # =========================================================================
+    def _refresh_cam_pose(self) -> bool:
+        """TF-lookup base_frame->camera_frame translation and refresh _cam_pose; returns False on TF failure."""
+        try:
+            transform = self._tf_buffer.lookup_transform(self._base_frame, self._camera_frame, Time())
+        except TransformException as e:
+            self._logger.warning(
+                f'TF lookup failed ({self._base_frame} <- {self._camera_frame}): {e}',
+                throttle_duration_sec=2.0,
+            )
+            return False
+
+        cam_tx = transform.transform.translation.x
+        cam_ty = transform.transform.translation.y
+        q = transform.transform.rotation
+        _, _, cam_yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+
+        self._cam_pose = (cam_tx, cam_ty, cam_yaw)  # camera faces backward
+        self._logger.info(f'Camera pose refreshed | cam_pose={self._cam_pose}')
+        return True
+
     def _camera_frame_to_odom(self, local_x: float, local_y: float) -> tuple[float, float] | None:
         """TF-lookup camera-to-odom point transform for (local_x, local_y); returns None on TF failure."""
         point = PointStamped()

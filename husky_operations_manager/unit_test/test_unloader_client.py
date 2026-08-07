@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Test node for UnloaderActionClient.
 
@@ -13,9 +12,9 @@ Usage:
 import rclpy
 from rclpy.node import Node
 
-from status_interfaces.action import OperateUnloader
 from husky_operations_manager.action_clients.unloader import UnloaderActionClient
 from husky_operations_manager.robot_enums import RobotStatusEnum
+from status_interfaces.action import OperateUnloader
 
 _TARGET_MAP = {
     'home': OperateUnloader.Goal.HOME,

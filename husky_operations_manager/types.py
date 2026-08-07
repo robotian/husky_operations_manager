@@ -57,17 +57,10 @@ class DriveConfig:
     max_controlling_retries: int  # retry attempts on same bush before giving up (-> ERROR)
     controlling_retry_delay: float  # s — stopped wait between ABORTED and re-entering CONTROLLING
     
-    # --- Camera mount / row geometry (drive.py) ---
-    # cam_tx/cam_ty/arm_tx_offset are resolved via TF by the owning node
-    # (base_link -> camera frame / arm frame) before DriveConfig is built —
-    # DriveClient itself has no TF dependency, just consumes the floats.
-    cam_tx: float  # m — camera behind base_link
-    cam_ty: float  # m — camera right of base_link
+    # --- Row geometry (drive.py) ---
+    # base_link -> camera_frame offset is resolved via TF by DriveClient
+    # itself, refreshed on every scan()/resume() (see _refresh_cam_pose).
     bushrow_theta: float  # rad — row orientation in odom frame
-    # TF-derived: arm_0_base_link.tx = -0.214 m relative to base_link.
-    # Declared for parity with the reference sim, which documents this offset
-    # but never applies it in the target-pose calc — kept unused here too.
-    arm_tx_offset: float
 
 
 @dataclass

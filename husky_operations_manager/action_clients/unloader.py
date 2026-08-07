@@ -1,14 +1,14 @@
-from rclpy.node import Node
+from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 from rclpy.impl.rcutils_logger import RcutilsLogger
+from rclpy.node import Node
 from rclpy.task import Future
-from action_msgs.msg import GoalStatus
 
-from status_interfaces.action import OperateUnloader
-from husky_operations_manager.types import UnloaderFeedback
 from husky_operations_manager.robot_enums import RobotStatusEnum
+from husky_operations_manager.types import UnloaderFeedback
+from status_interfaces.action import OperateUnloader
 
-_SERVER_WAIT_S = 5.0
+_SERVER_WAIT_S = 30.0
 
 _TARGET_LABEL = {
     OperateUnloader.Goal.HOME: 'HOME',
@@ -38,13 +38,14 @@ class UnloaderActionClient:
         self._current_status = RobotStatusEnum.IDLE
         self._feedback_data: UnloaderFeedback | None = None
 
+        #/a200_0284/operate_unloader
         self.client = ActionClient(
             self.node,
             OperateUnloader,
             f'{self.namespace}/operate_unloader',
         )
 
-        self.logger.info(f'UnloaderActionClient initialized for {self.namespace}')
+        self.logger.info(f'UnloaderActionClient initialized for {self.client._action_name}')
 
     # ------------------------------------------------------------------
     # Core Interface
@@ -156,7 +157,7 @@ class UnloaderActionClient:
             else 'MOVING_TO_END'
         )
 
-        self.logger.info(
+        self.logger.debug(
             f'[{fb.progress_percent:5.1f}%] {direction_label} '
             f'steps={fb.step_count} '
             f'home_limit={int(fb.at_home_limit)} '
