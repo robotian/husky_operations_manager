@@ -140,6 +140,10 @@ class DetectionAlignmentNode(Node):
         if not msg.detection_valid:
             return
 
+        self.get_logger().info(
+            f'Detection center | x={msg.center.x:.4f} y={msg.center.y:.4f}'
+        )
+
         if self._odom_received:
             self._set_target_pose(msg.center.x, msg.center.y)
             self._set_target_pose_tf(msg.center.x, msg.center.y)
