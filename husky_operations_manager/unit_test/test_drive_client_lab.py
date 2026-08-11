@@ -65,23 +65,23 @@ STATIC_DRIVE_PARAMS = {
     'odom_topic': 'ground_truth/odom',
     # --- cmd_vel ---
     'base_frame': BASE_FRAME,
-    'cmd_vel_rate': 10.0,  # Hz — republish rate between detections
+    'cmd_vel_rate': 20.0,  # Hz — republish rate between detections
     # --- Stop condition ---
-    'ex_tolerance': 0.02,  # m — bush level with arm tolerance
+    'ex_tolerance': 0.03,  # m — bush level with arm tolerance
     # --- Speed limits ---
     'v_linear_min': 0.05,  # m/s — minimum speed near stop point
     'v_linear_max': 0.125,  # m/s — speed at first detection
-    'v_angular_max': 0.15,  # rad/s — angular correction clamp
+    'v_angular_max': 0.10,  # rad/s — angular correction clamp
     # --- Departure ---
     'departure_clearance': 0.2,  # m — distance past bush before next scan
     # --- No-detection timeout ---
     'no_detection_distance': 0.60,  # m — row end assumed after this distance
     # --- PD target-pose controller (drive.py) ---
-    'ang_tol': 0.05,  # rad — final-heading tolerance (~3deg)
+    'ang_tol': 0.1,  # rad — final-heading tolerance (~3deg)
     'k_v_p': 0.2,
-    'k_v_d': 0.07,
+    'k_v_d': 0.06,
     'k_omega_p': 0.4,
-    'k_omega_d': 0.1,
+    'k_omega_d': 0.07,
     'k_beta_p': 1.0,
     'k_beta_d': 0.4,
     'a_max': 0.05,  # m/s^2
@@ -138,25 +138,6 @@ class TestDriveNodeLab(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        self._tf_wait_timer = self.create_timer(0.2, self._wait_for_tf)
-        self.get_logger().info(f'Waiting for TF: {BASE_FRAME} -> {CAMERA_FRAME}...')
-
-    # =========================================================================
-    # Startup
-    # =========================================================================
-
-    def _wait_for_tf(self) -> None:
-        """Poll until camera TF is available, then build DriveConfig and start DriveClient."""
-        now = rclpy.time.Time()
-        if not self._tf_buffer.can_transform(BASE_FRAME, CAMERA_FRAME, now):
-            self.get_logger().info('Waiting for TF...', throttle_duration_sec=1.0)
-            return
-
-        self._tf_wait_timer.cancel()
-        self._tf_wait_timer = None
-
-        self.get_logger().info('Camera TF resolved — building DriveClient')
-
         drive_config = DriveConfig(
             **STATIC_DRIVE_PARAMS,
             camera_frame=CAMERA_FRAME,
@@ -169,15 +150,19 @@ class TestDriveNodeLab(Node):
         self._start_timer = self.create_timer(0.2, self._wait_for_odom)
         self.get_logger().info('Waiting for odom before starting scan...')
 
+    # =========================================================================
+    # Startup
+    # =========================================================================
+
     def _wait_for_odom(self) -> None:
-        """Poll until DriveClient has received odom, then call scan()."""
-        if not self._drive_client.is_ready():
-            self.get_logger().info('Waiting for odom...', throttle_duration_sec=1.0)
+        """Poll until odom and camera TF are both ready, then call scan() once."""
+        if not self._drive_client.is_ready() or not self._drive_client.is_camera_tf_ready():
+            self.get_logger().info('Waiting for odom/camera TF...', throttle_duration_sec=1.0)
             return
 
         self._start_timer.cancel()
         self._start_timer = None
-        self.get_logger().info('Odom received — calling DriveClient scan()')
+        self.get_logger().info('Odom + camera TF ready — calling DriveClient scan()')
         self._drive_client.scan()
 
     # =========================================================================

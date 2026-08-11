@@ -47,6 +47,11 @@ Target Pose Calculation
   none are fixed constants, since the camera rides on the arm and
   rotates with it, not just translates.
 
+  Refreshing only at scan()/resume() is sufficient, not a gap: the arm
+  is held fixed for the entire SCANNING/CONTROLLING/DEPARTING cycle and
+  only repositions while STOPPED (harvest). scan()/resume() bracket
+  every arm move, so _cam_pose is never stale when it's used.
+
 -------------------------------------------------------------------------------
 Controller
 -------------------------------------------------------------------------------
@@ -106,8 +111,6 @@ Notes
 """
 
 import math
-import statistics
-from collections import deque
 
 from geometry_msgs.msg import PointStamped, TwistStamped
 from nav_msgs.msg import Odometry
@@ -132,6 +135,8 @@ _STATUS_NAMES = {
     DriveFeedback.ERROR: 'ERROR',
     DriveFeedback.ABORTED: 'ABORTED',
 }
+
+D_ALPHA = 0.3
 
 
 class DriveClient:
@@ -198,11 +203,10 @@ class DriveClient:
         # --- Detection staleness guard ---
         self._latest_detection_stamp: tuple[int, int] | None = None
         self._last_used_detection_stamp: tuple[int, int] | None = None
+        self._scan_start_stamp: Time | None = None
 
         # --- Odom-frame positions of already-harvested bushes ---
         self._harvested_positions: list[tuple[float, float]] = []
-
-        self._detection_window: deque[tuple[float, float]] = deque(maxlen=50)
 
         # --- Drive state ---
         self._status: DriveFeedback = DriveFeedback.IDLE
@@ -230,6 +234,12 @@ class DriveClient:
         self._prev_final_heading_error: float | None = None
         self._distance_error: float = 0.0
         self._heading_error: float = 0.0
+
+        # --- Derivative EMA filter (alpha=1.0 disables; lag ~ dt/alpha) ---
+        self._d_alpha: float = D_ALPHA
+        self._d_distance_filt: float = 0.0
+        self._d_heading_filt: float = 0.0
+        self._d_final_filt: float = 0.0
 
         self._cmd_linear_x: float = 0.0
         self._cmd_angular_z: float = 0.0
@@ -285,13 +295,19 @@ class DriveClient:
     # =========================================================================
 
     def scan(self) -> None:
-        """Start SCANNING forward from a fresh (unlocked) state; no-op with an error log if odom isn't ready."""
+        """Start SCANNING forward from a fresh (unlocked) state; no-op with an error log if odom isn't ready or camera TF is unavailable."""
         if not self._odom_received:
-            self._logger.error('scan() called but odom not yet received — aborting scan')
+            self._logger.error(
+                'scan() called but odom not yet received — aborting scan',
+                throttle_duration_sec=2.0,
+            )
             return
 
         if not self._refresh_cam_pose():
-            self._logger.error('scan() called but camera TF unavailable — aborting scan')
+            self._logger.error(
+                'scan() called but camera TF unavailable — aborting scan',
+                throttle_duration_sec=2.0,
+            )
             return
 
         self._status = DriveFeedback.SCANNING
@@ -302,18 +318,27 @@ class DriveClient:
         self._controlling_retry_count = 0
         self._reset_pd_state()
 
+        # Detection latency is ~2-3s, so detections arriving just after
+        # scan() were imaged before/during departure and can point at the
+        # already-harvested bush. Only lock on imagery taken after this.
+        self._scan_start_stamp = self._node.get_clock().now()
+
         self._logger.info('SCANNING - controller inactive until first detection')
 
     def resume(self) -> None:
-        """Transition STOPPED to DEPARTING after harvest completes; warns and no-ops from any other state."""
+        """Transition STOPPED to DEPARTING after harvest completes; warns and no-ops from any other state or if camera TF is unavailable."""
         if self._status != DriveFeedback.STOPPED:
             self._logger.warning(
-                f'resume() called in unexpected state: {_STATUS_NAMES.get(self._status, self._status)} — ignoring'
+                f'resume() called in unexpected state: {_STATUS_NAMES.get(self._status, self._status)} — ignoring',
+                throttle_duration_sec=2.0,
             )
             return
 
         if not self._refresh_cam_pose():
-            self._logger.error('resume() called but camera TF unavailable — aborting resume')
+            self._logger.error(
+                'resume() called but camera TF unavailable — aborting resume',
+                throttle_duration_sec=2.0,
+            )
             return
 
         self._status = DriveFeedback.DEPARTING
@@ -368,6 +393,10 @@ class DriveClient:
         """Return True if odom has been received and scan() can be safely called."""
         return self._odom_received
 
+    def is_camera_tf_ready(self) -> bool:
+        """Return True if base_frame->camera_frame TF is currently resolvable."""
+        return self._tf_buffer.can_transform(self._base_frame, self._camera_frame, Time())
+
     # =========================================================================
     # Odom callback
     # =========================================================================
@@ -403,25 +432,27 @@ class DriveClient:
         detected = bool(msg.detection_valid)
         bush_x, bush_y = msg.center.x, msg.center.y
 
-        self._logger.info(f'Received Detection - Valid:{msg.detection_valid} at {bush_x, bush_y}')
+        self._logger.debug(
+            f'Received Detection - Valid:{msg.detection_valid} at {bush_x, bush_y}',
+            throttle_duration_sec=2.0,
+        )
 
         self._latest_detection = (detected, bush_x, bush_y)
         self._latest_detection_stamp = (msg.header.stamp.sec, msg.header.stamp.nanosec)
 
-        # NOTE: Below simple detection check code and will be remove once testing is done
-        if detected:
-            self._logger.info(f'Valid Detection: {msg.detection_valid} and Pose: {msg.center}')
-            self._detection_window.append((msg.center.x, msg.center.y))
-
-            if len(self._detection_window) >= 10:
-                xs = [d[0] for d in self._detection_window]
-                ys = [d[1] for d in self._detection_window]
-                self._logger.debug(
-                    f'Detection jitter (n={len(self._detection_window)}) | '
-                    f'bush_x std={statistics.pstdev(xs):.4f}m mean={statistics.mean(xs):.4f}m | '
-                    f'bush_y std={statistics.pstdev(ys):.4f}m mean={statistics.mean(ys):.4f}m',
-                    throttle_duration_sec=2.0,
-                )
+    def _detection_predates_scan(self) -> bool:
+        """True if the latest detection's image was taken before scan() started — i.e. before/during departure, likely showing the already-harvested bush."""
+        if self._latest_detection_stamp is None or self._scan_start_stamp is None:
+            return False
+        stamp_ns = self._latest_detection_stamp[0] * 1_000_000_000 + self._latest_detection_stamp[1]
+        if stamp_ns < self._scan_start_stamp.nanoseconds:
+            self._logger.info(
+                'Ignoring pre-scan detection — imaged before departure completed, '
+                'likely the harvested bush, continuing SCANNING',
+                throttle_duration_sec=2.0,
+            )
+            return True
+        return False
 
     # =========================================================================
     # Control timer — sole driver of the state machine + cmd_vel
@@ -445,7 +476,7 @@ class DriveClient:
             self._cmd_linear_x = self._v_linear_min
             self._cmd_angular_z = 0.0
 
-            if is_new_detection and bush_x < 0:
+            if is_new_detection and bush_x < 0 and not self._detection_predates_scan():
                 self._set_target_pose(bush_x, bush_y)
                 if self._target_pose is None:
                     self._logger.warning(
@@ -455,6 +486,7 @@ class DriveClient:
                 else:
                     self._status = DriveFeedback.CONTROLLING
                     self._state_timer = 0.0
+                    self._last_used_detection_stamp = self._latest_detection_stamp
                     tx, ty, tyaw = self._target_pose
                     self._logger.info(
                         f'Target locked — bush cam=({bush_x:.3f}, {bush_y:.3f}) '
@@ -470,11 +502,13 @@ class DriveClient:
             elif img_detected:
                 self._logger.info(
                     f'Ignoring detection at bush_x={bush_x:.3f} (not ahead) — '
-                    f'likely the departed bush, continuing SCANNING'
+                    f'likely the departed bush, continuing SCANNING',
+                    throttle_duration_sec=2.0,
                 )
 
         elif self._status == DriveFeedback.CONTROLLING:
-            if is_new_detection:
+            # bush_x >= 0 (level/behind) can't improve the lock — skip re-lock
+            if is_new_detection and bush_x < 0:
                 self._set_target_pose(bush_x, bush_y)
                 self._last_used_detection_stamp = self._latest_detection_stamp
 
@@ -571,8 +605,7 @@ class DriveClient:
         cam_ty = transform.transform.translation.y
         q = transform.transform.rotation
         _, _, cam_yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
-
-        self._cam_pose = (cam_tx, cam_ty, cam_yaw)  # camera faces backward
+        self._cam_pose = (cam_tx, cam_ty, cam_yaw)
         self._logger.info(f'Camera pose refreshed | cam_pose={self._cam_pose}')
         return True
 
@@ -600,8 +633,10 @@ class DriveClient:
     def _set_target_pose(self, bush_x: float, bush_y: float) -> None:
         """Lock or re-lock target pose from a camera-frame bush offset, rejecting re-locks past same_bush_threshold."""
         result = self._camera_frame_to_odom(bush_x, bush_y)
+
         if result is None:
             return
+
         cam_x, cam_y = result
         cam_yaw = self._bushrow_theta + self._cam_pose[2]
 
@@ -666,6 +701,13 @@ class DriveClient:
             d_distance = (distance_error - self._prev_distance_error) / self._dt
             d_heading = self._normalize_angle(heading_error - self._prev_heading_error) / self._dt
 
+            # EMA-filter the derivatives: per-tick odom jitter divided by
+            # dt=0.05s otherwise dominates the d-term and chatters omega.
+            self._d_distance_filt = self._d_alpha * d_distance + (1.0 - self._d_alpha) * self._d_distance_filt
+            self._d_heading_filt = self._d_alpha * d_heading + (1.0 - self._d_alpha) * self._d_heading_filt
+            d_distance = self._d_distance_filt
+            d_heading = self._d_heading_filt
+
             pd_v = self._k_v_p * distance_error + self._k_v_d * d_distance
             v_raw = direction * pd_v * math.cos(heading_error)
             if direction == 1.0 and v_raw < 0:
@@ -686,9 +728,10 @@ class DriveClient:
                     self._prev_final_heading_error = final_heading_error
 
                 d_final = self._normalize_angle(final_heading_error - self._prev_final_heading_error) / self._dt
+                self._d_final_filt = self._d_alpha * d_final + (1.0 - self._d_alpha) * self._d_final_filt
 
                 v_raw = 0.0
-                omega_raw = self._k_beta_p * final_heading_error + self._k_beta_d * d_final
+                omega_raw = self._k_beta_p * final_heading_error + self._k_beta_d * self._d_final_filt
                 self._prev_final_heading_error = final_heading_error
             else:
                 v_raw = 0.0
@@ -727,6 +770,9 @@ class DriveClient:
         self._prev_distance_error = None
         self._prev_heading_error = None
         self._prev_final_heading_error = None
+        self._d_distance_filt = 0.0
+        self._d_heading_filt = 0.0
+        self._d_final_filt = 0.0
 
     @staticmethod
     def _normalize_angle(angle: float) -> float:
