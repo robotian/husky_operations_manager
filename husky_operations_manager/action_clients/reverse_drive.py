@@ -1,20 +1,19 @@
-import warnings
-
 import math
 import time
+import warnings
 
 import tf2_geometry_msgs
 import tf2_ros
-from tf_transformations import euler_from_quaternion, quaternion_from_euler
-
 from geometry_msgs.msg import PoseStamped, Quaternion, Twist, TwistStamped
 from rclpy.duration import Duration
 from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.node import Node
 from rclpy.time import Time
+from tf2_ros import TransformException
+from tf_transformations import euler_from_quaternion, quaternion_from_euler
 
-from husky_operations_manager.types import ReverseDriveConfig
 from husky_operations_manager.robot_enums import ReverseDriveStatus
+from husky_operations_manager.types import DockInstanceConfig, ReverseDriveConfig
 
 warnings.filterwarnings('ignore', category=SyntaxWarning, module='angles.*')
 
@@ -41,8 +40,11 @@ class ReverseDriveClient:
         self._done: bool = False
         self._start_time: float | None = None
 
-        # Active dock is always dock_names[0] — caller reorders as needed
-        self._dock = config.dock_configs[config.dock_names[0]]
+        # Dock identity is per-run, not per-client: drive_to_staging(dock_name)
+        # latches one of config.dock_configs for that run only, and reset()
+        # clears it. Nothing here is tied to a single dock.
+        self._active_dock: DockInstanceConfig | None = None
+        self._staging_pose: PoseStamped | None = None
 
         # Speed and tolerances directly from config
         self._lin_speed = config.v_linear_min
@@ -63,17 +65,25 @@ class ReverseDriveClient:
             PoseStamped, f'{self.namespace}/reverse_nav/staging_pose', 10
         )
 
-        # Pre-compute and latch staging pose
-        self._staging_pose = self._compute_staging_pose()
+        # Pre-compute every dock's staging pose once. Dock poses are static, so
+        # this stays a compute-once operation even with several docks — only the
+        # selection is deferred to drive_to_staging().
+        self._staging_poses: dict[str, PoseStamped] = {
+            name: self._compute_staging_pose(dock)
+            for name, dock in config.dock_configs.items()
+        }
 
         # Control timer — idles until drive_to_staging() is called
         self._control_timer = self.node.create_timer(1.0 / config.controller_frequency, self._control_loop)
 
+        staging_summary = ' | '.join(
+            f'{name}=({pose.pose.position.x:.3f}, {pose.pose.position.y:.3f})'
+            for name, pose in self._staging_poses.items()
+        )
         self.logger.info(
             f'ReverseDriveClient Started | '
-            f"dock='{self._dock.instance_name}' | "
-            f'staging=({self._staging_pose.pose.position.x:.3f}, '
-            f'{self._staging_pose.pose.position.y:.3f}) | '
+            f'docks={list(self._staging_poses)} | '
+            f'{staging_summary} | '
             f'speed={self._lin_speed} m/s | timeout={self._timeout:.1f}s'
         )
 
@@ -81,9 +91,17 @@ class ReverseDriveClient:
     # Public
     # ------------------------------------------------------------------
 
-    def drive_to_staging(self) -> bool:
+    def drive_to_staging(self, dock_name: str) -> bool:
+        """Start reversing to `dock_name`'s staging pose; False if refused."""
         if self._status == ReverseDriveStatus.REVERSING:
             self.logger.warning('drive_to_staging() ignored — already active')
+            return False
+
+        if dock_name not in self._staging_poses:
+            self.logger.error(
+                f"Unknown dock '{dock_name}' — known docks: {list(self._staging_poses)}"
+            )
+            self._status = ReverseDriveStatus.ERROR
             return False
 
         if self.config.dock_backwards:
@@ -91,10 +109,16 @@ class ReverseDriveClient:
             self._status = ReverseDriveStatus.ERROR
             return False
 
+        self._active_dock = self.config.dock_configs[dock_name]
+        self._staging_pose = self._staging_poses[dock_name]
         self._done = False
         self._start_time = None
         self._status = ReverseDriveStatus.REVERSING
-        self.logger.info('Reverse drive started')
+        self.logger.info(
+            f"Reverse drive started | dock='{dock_name}' | "
+            f'staging=({self._staging_pose.pose.position.x:.3f}, '
+            f'{self._staging_pose.pose.position.y:.3f})'
+        )
         return True
 
     def cancel(self) -> None:
@@ -109,20 +133,29 @@ class ReverseDriveClient:
     def is_active(self) -> bool:
         return self._status == ReverseDriveStatus.REVERSING
 
+    def get_active_dock(self) -> DockInstanceConfig | None:
+        """Dock this client is currently reversing to, or None when idle."""
+        return self._active_dock
+
     def reset(self) -> None:
         self._status = ReverseDriveStatus.IDLE
         self._done = False
         self._start_time = None
+        self._active_dock = None
+        self._staging_pose = None
         self.logger.info('ReverseDriveClient reset to IDLE')
 
     # ------------------------------------------------------------------
     # Staging pose
     # ------------------------------------------------------------------
 
-    def _compute_staging_pose(self) -> PoseStamped:
-        staging_x = self._dock.pose.x + math.cos(self._dock.pose.theta) * self.config.staging_x_offset
-        staging_y = self._dock.pose.y + math.sin(self._dock.pose.theta) * self.config.staging_x_offset
-        staging_theta = self._dock.pose.theta + self.config.staging_yaw_offset
+    def _compute_staging_pose(self, dock: DockInstanceConfig) -> PoseStamped:
+        """Staging pose for one dock. Does not publish — with several docks that
+        would fire once per dock at boot on a single topic, each overwriting the
+        last. _control_loop republishes the active pose every tick instead."""
+        staging_x = dock.pose.x + math.cos(dock.pose.theta) * self.config.staging_x_offset
+        staging_y = dock.pose.y + math.sin(dock.pose.theta) * self.config.staging_x_offset
+        staging_theta = dock.pose.theta + self.config.staging_yaw_offset
 
         # Converting euler angle to Quaternion
         x, y, z, w = quaternion_from_euler(0.0, 0.0, staging_theta)
@@ -130,14 +163,16 @@ class ReverseDriveClient:
         q.w, q.x, q.y, q.z = float(w), float(x), float(y), float(z)
 
         pose = PoseStamped()
-        pose.header.frame_id = self._dock.frame
+        pose.header.frame_id = dock.frame
         pose.header.stamp = self.node.get_clock().now().to_msg()
         pose.pose.position.x = staging_x
         pose.pose.position.y = staging_y
         pose.pose.orientation = q
 
-        self._staging_pose_pub.publish(pose)
-        self.logger.info(f'Staging pose: ({staging_x:.3f}, {staging_y:.3f}, {math.degrees(staging_theta):.1f}deg)')
+        self.logger.info(
+            f"Staging pose '{dock.instance_name}': "
+            f'({staging_x:.3f}, {staging_y:.3f}, {math.degrees(staging_theta):.1f}deg)'
+        )
         return pose
 
     # ------------------------------------------------------------------
@@ -146,6 +181,11 @@ class ReverseDriveClient:
 
     def _control_loop(self) -> None:
         if self._status != ReverseDriveStatus.REVERSING:
+            return
+
+        if self._staging_pose is None:
+            self.logger.error('REVERSING with no active dock — stopping')
+            self._shutdown(success=False, msg='No active dock selected')
             return
 
         self._staging_pose.header.stamp = self.node.get_clock().now().to_msg()
@@ -184,7 +224,7 @@ class ReverseDriveClient:
             pose.pose.position.y = tf.transform.translation.y
             pose.pose.orientation = tf.transform.rotation
             return pose
-        except Exception as e:
+        except TransformException as e:
             self.logger.warning(f'TF lookup failed: {e}', throttle_duration_sec=2.0)
             return None
 
@@ -222,7 +262,7 @@ class ReverseDriveClient:
             tf = self._tf_buffer.lookup_transform(
                 self.config.base_frame, target.header.frame_id, Time(), timeout=Duration(seconds=0.1)
             )
-        except Exception as e:
+        except TransformException as e:
             self.logger.error(f'TF base_frame lookup failed: {e}')
             return False
 

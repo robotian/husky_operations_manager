@@ -19,12 +19,12 @@ Exercises the full undocking sequence:
 
 import rclpy
 from rclpy.node import Node
-from status_interfaces.msg import SubTask, UndockGoal
 
-from husky_operations_manager.robot_enums import RobotStatusEnum, ReverseDriveStatus
-from husky_operations_manager.types import DockInstanceConfig, DockPose, ReverseDriveConfig
-from husky_operations_manager.action_clients.undocking import UndockingActionClient
 from husky_operations_manager.action_clients.reverse_drive import ReverseDriveClient
+from husky_operations_manager.action_clients.undocking import UndockingActionClient
+from husky_operations_manager.robot_enums import ReverseDriveStatus, RobotStatusEnum
+from husky_operations_manager.types import DockInstanceConfig, DockPose, ReverseDriveConfig
+from status_interfaces.msg import SubTask, UndockGoal
 
 # =============================================================================
 # GLOBAL CONFIG — edit here instead of a YAML file
@@ -35,29 +35,29 @@ DOCK_CONFIGS: dict[str, DockInstanceConfig] = {
         instance_name='husky_charger',
         type='simple_charging_dock',
         frame='map',
-        pose=DockPose(x=0.8, y=-1.945, theta=0.0),
+        pose=DockPose(x=-6.001, y=2.194, theta=0.0), # -6.001, 2.194, 0.0
     ),
     'unloading_station': DockInstanceConfig(
         instance_name='unloading_station',
         type='simple_charging_dock',
         frame='map',
-        pose=DockPose(x=0.85, y=1.60, theta=1.571),
+        pose=DockPose(x=-6.001, y=2.194, theta=0.0)
+        # pose=DockPose(x=0.85, y=1.60, theta=1.571),
     ),
 }
 
-MOTION_CONFIG = dict(
-    dock_configs=DOCK_CONFIGS,
-    plugin_name='simple_charging_dock',
-    staging_x_offset=-1.5,
-    staging_yaw_offset=0.0,
-    base_frame='base_link',
-    controller_frequency=50.0,
-    v_linear_min=0.15,
-    v_angular_max=0.25,
-    linear_tolerance=0.05,
-    angular_tolerance=0.1,
-    dock_backwards=False,
-)
+MOTION_CONFIG = {
+    'dock_configs': DOCK_CONFIGS,
+    'staging_x_offset': -1.5,
+    'staging_yaw_offset': 0.0,
+    'base_frame': 'base_link',
+    'controller_frequency': 50.0,
+    'v_linear_min': 0.15,
+    'v_angular_max': 0.25,
+    'linear_tolerance': 0.05,
+    'angular_tolerance': 0.1,
+    'dock_backwards': False,
+}
 
 DEFAULT_ACTIVE_DOCK = 'husky_charger'
 DOCK_TYPE           = 'simple_charging_dock'

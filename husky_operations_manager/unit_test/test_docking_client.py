@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Simple test node for DockingActionClient.
 
@@ -12,10 +11,10 @@ Usage:
 
 import rclpy
 from rclpy.node import Node
-from status_interfaces.msg import SubTask, DockGoal
 
 from husky_operations_manager.action_clients.docking import DockingActionClient
 from husky_operations_manager.robot_enums import RobotStatusEnum
+from status_interfaces.msg import DockGoal, SubTask
 
 # Terminal states that trigger node shutdown
 TERMINAL_STATES = {

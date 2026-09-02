@@ -52,22 +52,25 @@ class DriveConfig:
     a_max: float  # m/s^2
     alpha_max: float  # rad/s^2
     backward_distance_threshold: float  # m — allow reverse approach below this distance
-    same_bush_threshold: float  # m — CONTROLLING re-lock accepted only within this of the currently locked target
+    same_bush_threshold: float  # m — CONTROLLING re-lock accepted only within this of the original lock
     controlling_timeout: float  # s — no goal reached within this long -> reset lock, retry same bush
     max_controlling_retries: int  # retry attempts on same bush before giving up (-> ERROR)
     controlling_retry_delay: float  # s — stopped wait between ABORTED and re-entering CONTROLLING
-    
+
     # --- Row geometry (drive.py) ---
     # base_link -> camera_frame offset is resolved via TF by DriveClient
     # itself, refreshed on every scan()/resume() (see _refresh_cam_pose).
     bushrow_theta: float  # rad — row orientation in odom frame
 
 
+
+
 @dataclass
 class ReverseDriveConfig:
-    dock_names: list[str]
-    dock_configs: dict
-    plugin_name: str
+    # Every dock the client can reverse to, keyed by instance name. The caller
+    # selects one per run via drive_to_staging(dock_name) — the client holds no
+    # dock identity between runs. Each dock's `type` doubles as its plugin name.
+    dock_configs: dict[str, DockInstanceConfig]
     staging_x_offset: float
     staging_yaw_offset: float
     base_frame: str

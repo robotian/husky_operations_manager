@@ -113,7 +113,6 @@ Notes
 import math
 
 from geometry_msgs.msg import PointStamped, TwistStamped
-from nav_msgs.msg import Odometry
 from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -138,6 +137,9 @@ _STATUS_NAMES = {
 
 D_ALPHA = 0.3
 
+# m — extra sideways gap between the robot and the bush it parks at, on top of
+# the camera's own lateral offset. Keeps the wheels out of the plant.
+BUSH_CLEARANCE_M = 0.15
 
 class DriveClient:
     """
@@ -193,8 +195,8 @@ class DriveClient:
         self._no_detection_timeout: float = config.no_detection_distance / config.v_linear_min
         self._departure_duration: float = config.departure_clearance / config.v_linear_min
 
-        # --- Odom state ---
-        self._odom_received: bool = False
+        # --- Pose state (from TF, in odom_frame) ---
+        self._pose_received: bool = False
         self._current_pose: list[float] = [0.0, 0.0, 0.0]  # x, y, yaw
 
         # --- Latest cached detection ---
@@ -244,13 +246,12 @@ class DriveClient:
         self._cmd_linear_x: float = 0.0
         self._cmd_angular_z: float = 0.0
 
-        # --- Odom subscription ---
-        self._odom_sub = self._node.create_subscription(
-            Odometry,
-            f'{self._ns}/{config.odom_topic}',
-            self._odom_callback,
-            qos_profile_sensor_data,
-        )
+        # The robot pose is read from TF, not from an odometry topic. The odom
+        # topic publishes in the odom frame while the target is built in
+        # odom_frame (map in field runs), and the PD controller subtracts one
+        # from the other — so a topic-sourced pose put a fixed map->odom offset,
+        # about 10 m in the field, straight into the position error.
+        # config.odom_topic is left in DriveConfig but is no longer subscribed.
 
         # --- Detection subscription ---
         self._detection_sub = self._node.create_subscription(
@@ -295,10 +296,11 @@ class DriveClient:
     # =========================================================================
 
     def scan(self) -> None:
-        """Start SCANNING forward from a fresh (unlocked) state; no-op with an error log if odom isn't ready or camera TF is unavailable."""
-        if not self._odom_received:
+        """Start SCANNING forward from a fresh (unlocked) state; no-op with an error log if the robot pose or camera TF is unavailable."""
+        if not self.is_ready():
             self._logger.error(
-                'scan() called but odom not yet received — aborting scan',
+                f'scan() called but the robot pose does not resolve in '
+                f'{self._odom_frame} yet — aborting scan',
                 throttle_duration_sec=2.0,
             )
             return
@@ -381,6 +383,10 @@ class DriveClient:
         """Return the current full feedback state as a DriveFeedback message."""
         return self._build_feedback_msg()
 
+    def set_bushrow_theta(self, theta: float) -> None:
+        """Update the row-heading assumption used for target-pose calculation. Call before scan()/resume() when moving to a new row."""
+        self._bushrow_theta = theta
+
     def is_active(self) -> bool:
         """Return True if status is SCANNING, CONTROLLING, or DEPARTING."""
         return self._status in (
@@ -390,38 +396,59 @@ class DriveClient:
         )
 
     def is_ready(self) -> bool:
-        """Return True if odom has been received and scan() can be safely called."""
-        return self._odom_received
+        """Return True if the robot pose resolves in odom_frame and scan() can be safely called."""
+        return self._tf_buffer.can_transform(self._odom_frame, self._base_frame, Time())
 
     def is_camera_tf_ready(self) -> bool:
         """Return True if base_frame->camera_frame TF is currently resolvable."""
         return self._tf_buffer.can_transform(self._base_frame, self._camera_frame, Time())
 
     # =========================================================================
-    # Odom callback
+    # Robot pose
     # =========================================================================
 
-    def _odom_callback(self, msg: Odometry) -> None:
-        """Update current pose/velocity of the robot."""
-        q = msg.pose.pose.orientation
-        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
-        self._current_pose = [msg.pose.pose.position.x, msg.pose.pose.position.y, yaw]
-        current_velocity = [msg.twist.twist.linear.x, msg.twist.twist.angular.z]
+    def _refresh_pose_from_tf(self) -> bool:
+        """
+        Read the robot pose in odom_frame straight from TF.
 
-        if not self._odom_received:
+        This has to be the same frame the target is built in
+        (_camera_frame_to_odom uses odom_frame too), because the PD controller
+        subtracts the two. Taking the pose from an odometry topic instead meant
+        subtracting an odom-frame position from a map-frame target, which put
+        the whole map->odom offset into the error and the goal never closed.
+        """
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self._odom_frame, self._base_frame, Time()
+            )
+        except TransformException as e:
+            self._logger.warning(
+                f'Robot pose TF lookup failed ({self._odom_frame} <- {self._base_frame}): {e}',
+                throttle_duration_sec=2.0,
+            )
+            return False
+
+        q = tf.transform.rotation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self._current_pose = [
+            tf.transform.translation.x,
+            tf.transform.translation.y,
+            yaw,
+        ]
+
+        if not self._pose_received:
             self._logger.info(
-                f'First odom received | pose=({self._current_pose[0]:.3f}, '
+                f'First pose from TF | {self._odom_frame} pose=({self._current_pose[0]:.3f}, '
                 f'{self._current_pose[1]:.3f}, {math.degrees(self._current_pose[2]):.1f}deg)'
             )
-
-        self._odom_received = True
+            self._pose_received = True
 
         self._logger.debug(
-            f'Odom | pose=({self._current_pose[0]:.3f}, {self._current_pose[1]:.3f}, '
-            f'{math.degrees(self._current_pose[2]):.1f}deg) | '
-            f'velocity=(v={current_velocity[0]:.3f}, omega={current_velocity[1]:.3f})',
+            f'Pose | ({self._current_pose[0]:.3f}, {self._current_pose[1]:.3f}, '
+            f'{math.degrees(self._current_pose[2]):.1f}deg) in {self._odom_frame}',
             throttle_duration_sec=2.0,
         )
+        return True
 
     # =========================================================================
     # Detection callback — caches only, state machine runs on control timer
@@ -460,7 +487,9 @@ class DriveClient:
 
     def _control_callback(self) -> None:
         """Drive the state machine, PD controller, and cmd_vel/feedback publishing on a fixed-rate tick."""
-        if not self._odom_received:
+        # Pose first: every branch below compares against it, so a tick with a
+        # stale or missing pose must not command anything.
+        if not self._refresh_pose_from_tf():
             return
 
         self._state_timer += self._dt
@@ -640,8 +669,21 @@ class DriveClient:
         cam_x, cam_y = result
         cam_yaw = self._bushrow_theta + self._cam_pose[2]
 
-        target_x = cam_x + self._cam_pose[0] * math.cos(cam_yaw) - self._cam_pose[1] * math.sin(cam_yaw)
-        target_y = cam_y + self._cam_pose[0] * math.sin(cam_yaw) + self._cam_pose[1] * math.cos(cam_yaw)
+        # Extra gap so the wheels stay off the bush. It is applied to the camera's
+        # sideways offset BEFORE the rotation, not to target_y afterwards, and it
+        # keeps that offset's sign so it always pushes away from the row.
+        #
+        # Adding it straight to target_y does not work: the standoff side flips
+        # with the direction the row is driven. With the measured camera pose,
+        # base_link sits at bush_y - 0.698 in a row driven -x and at bush_y + 0.693
+        # in one driven +x, so a fixed +0.2 in map Y widens the gap to 0.893 m one
+        # way and narrows it to 0.498 m the other — closer to the bush, which is
+        # the opposite of the intent.
+        cam_lateral = self._cam_pose[1]
+        cam_lateral += math.copysign(BUSH_CLEARANCE_M, cam_lateral)
+
+        target_x = cam_x + self._cam_pose[0] * math.cos(cam_yaw) - cam_lateral * math.sin(cam_yaw)
+        target_y = cam_y + self._cam_pose[0] * math.sin(cam_yaw) + cam_lateral * math.cos(cam_yaw)
         target_yaw = cam_yaw - self._cam_pose[2]
 
         if self._target_pose is not None:

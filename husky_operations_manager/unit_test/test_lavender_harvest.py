@@ -1,72 +1,404 @@
-#!/usr/bin/env python3
 """
-LavenderHarvestNode — combined NavigateThroughPoses + DriveClient harvesting node.
+test_lavender_harvest.py
 
-Startup sequence:  nearest-dock selection → startup undocking (with arm STOW gate)
-                   → send task trigger to server
-Task execution:    dual-mode navigation
-                     - Nav2 (NavigateThroughPoses) for row start / dock area
-                     - DriveClient for camera-guided row traversal
-Arm control:       STOW/READY gating via ManipulatorTaskActionClient
-                   (identical pattern to husky_operations_manager.py)
-Unloading:         UnloaderActionClient  END → delay → HOME
-Task generation:   publishes trigger to server; server creates task and stores in DB
+Standalone, hardcoded-sequence harvest run across a farm's rows: for each row in
+ROWS, drive to its start, harvest every bush along it (camera-guided), then move
+to the next row. Low battery or a full load interrupts the current row, docks,
+resolves the condition, and resumes where it left off. When every row in ROWS
+has been attempted, the node docks at the unloading station, unloads, undocks,
+and stops.
+
+No status_server / Task-message dependency — this node drives its own sequence
+end to end. All tuning values are module constants below, not YAML; field
+tuning is a one-file edit that takes effect on the next run under
+--symlink-install, no rebuild.
+
+-------------------------------------------------------------------------------
+State model
+-------------------------------------------------------------------------------
+
+  This node is a prototype for the production husky_operations_manager once
+  DriveClient lands there, so it uses production's state model rather than its
+  own vocabulary:
+
+    * `self.current_status` (RobotStatusEnum) is the ONLY state. It moves only
+      through `_transition_status()`.
+    * Everything else is context — it never decides *what runs*, only which
+      exit a state takes.
+    * `_process_action_clients()` is the single arbiter: exactly one motion
+      client is serviced per tick, in priority order. The manipulator is polled
+      alongside, because arm motion overlaps robot motion.
+
+  Camera driving reuses START_MOVING / MOVING / DESTINATION_REACHED. The
+  `motion_source` context field says whether Nav2 or DriveClient owns the
+  current MOVING, and therefore what the following DESTINATION_REACHED means:
+
+    'nav'   -> arrived at a row start   -> arm READY, then scan()
+    'drive' -> parked at a bush         -> harvest
+
+Harvesting is trigger-and-wait only: one START_HARVEST goal per bush. Cut
+counting and any per-cut loading sequence are owned by another package and are
+out of scope here.
+
+No time.sleep() anywhere — every wait is polled from a single monitor timer, so
+battery, pose, and TF stay live throughout.
+
+Run:
+  ros2 run husky_operations_manager test_lavender_harvest \\
+    --ros-args -r __ns:=/a200_0284 -r /tf:=tf -r /tf_static:=tf_static
 """
 
 import math
-import time
 
 import rclpy
+from geometry_msgs.msg import TwistStamped
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+from sensor_msgs.msg import BatteryState
+from std_msgs.msg import Bool
+from tf2_ros import Buffer, TransformException, TransformListener
 
-from geometry_msgs.msg import PoseWithCovarianceStamped
-from sensor_msgs.msg import BatteryState, Imu, NavSatFix
-from std_msgs.msg import Bool, String
-from status_interfaces.msg import (
-    ImageDetectionPose,
-    RobotStatus,
-    SubTask,
-    Task,
-    UndockGoal,
-    WayPoint,
-)
-from status_interfaces.action import OperateUnloader
-
-from husky_operations_manager.robot_enums import (
-    DriveStatus,
-    NavigationStatus,
-    OnlineFlagEnum,
-    ReverseDriveStatus,
-    RobotStatusEnum,
-)
-from husky_operations_manager.types import (
-    DockInstanceConfig,
-    DockPose,
-    DriveConfig,
-    ReverseDriveConfig,
-)
 from husky_operations_manager.action_clients.docking import DockingActionClient
 from husky_operations_manager.action_clients.drive import DriveClient
-from husky_operations_manager.action_clients.manipulator import (
-    ArmCommand,
-    ManipulatorTaskActionClient,
-)
+from husky_operations_manager.action_clients.manipulator import ArmCommand, ManipulatorTaskActionClient
 from husky_operations_manager.action_clients.navigation import NavigationActionClient
 from husky_operations_manager.action_clients.reverse_drive import ReverseDriveClient
 from husky_operations_manager.action_clients.undocking import UndockingActionClient
 from husky_operations_manager.action_clients.unloader import UnloaderActionClient
+from husky_operations_manager.robot_enums import (
+    NavigationStatus,
+    ReverseDriveStatus,
+    RobotStatusEnum,
+    TaskEnum,
+)
+from husky_operations_manager.types import DockInstanceConfig, DockPose, DriveConfig, ReverseDriveConfig
+from status_interfaces.action import OperateUnloader
+from status_interfaces.msg import DockGoal, RobotStatus, SubTask, Task, UndockGoal, WayPoint
+
+# =============================================================================
+# GLOBAL CONFIG — edit here instead of a YAML file
+# =============================================================================
+
+# --- TF frames ---
+BASE_FRAME = 'base_link'
+CAMERA_FRAME = 'camera_1_color_optical_frame'
+# Frame DriveClient builds bush targets in AND reads the robot pose in. Those two
+# must match: the PD controller subtracts one from the other, so a target in map
+# against a pose in odom put the whole map->odom offset into the position error.
+ODOM_FRAME = 'map'
+# Frame every navigation goal is stamped in (navigation.py stamps 'map'), and
+# therefore the frame ROWS and row_progress_pose are compared in. The pose topic
+# publishes in the odom frame, so TF closes the gap — see _robot_pose_in_frame.
+NAV_FRAME = 'map'
+
+STATIC_DRIVE_PARAMS = {
+    'detection_topic': 'sensors/camera_1/detection/image_annotated/detection_pose',
+    'odom_topic': 'platform/odom/filtered',
+    'base_frame': BASE_FRAME,
+    'cmd_vel_rate': 10.0,  # Hz
+    'ex_tolerance': 0.02,  # m
+    'v_linear_min': 0.05,  # m/s
+    'v_linear_max': 0.125,  # m/s
+    'v_angular_max': 0.15,  # rad/s
+    'departure_clearance': 0.2,  # m
+    'no_detection_distance': 1.5,  # m — row end assumed after this distance
+    'ang_tol': 0.05,  # rad
+    'k_v_p': 0.2,
+    'k_v_d': 0.07,
+    'k_omega_p': 0.4,
+    'k_omega_d': 0.1,
+    'k_beta_p': 1.0,
+    'k_beta_d': 0.4,
+    'a_max': 0.05,  # m/s^2
+    'alpha_max': 0.3,  # rad/s^2w
+    'backward_distance_threshold': 1.0,  # m
+    'same_bush_threshold': 0.25,  # m
+    'controlling_timeout': 30.0,  # s
+    'max_controlling_retries': 3,
+    'controlling_retry_delay': 5.0,  # s
+}
+
+# --- Job identity ---
+# Filled into every Task this node builds for itself. In production the task
+# server owns both.
+ROBOT_ID = 0
+CROP_TYPE = 'lavender'
+
+# --- Subscribed topics ---
+TOPIC_BATTERY = 'platform/bms/state'
+TOPIC_ESTOP = 'platform/emergency_stop'
+
+# --- Timing ---
+TIMER_PERIOD_SEC = 0.2  # s — monitor loop period; every polled wait derives from this
+
+# s — a sensor reading older than this is treated as no reading at all. Set
+# from the slowest of the three topics, not the fastest.
+SENSOR_STALE_SEC = 5.0
+
+# --- Deadlines ---
+# Every state that waits on something external has one. Without them a dead
+# action server or a silent topic parks the robot indefinitely with nothing in
+# the log to say why. Each is counted in monitor ticks, never slept.
+TIMEOUT_INIT_SEC = 60.0          # pose + battery + camera TF + map->odom
+TIMEOUT_DRIVE_READY_SEC = 15.0   # DriveClient odom/TF before a scan or resume
+TIMEOUT_NAV_SEC = 180.0          # one Nav2 goal
+TIMEOUT_DRIVE_SEC = 120.0        # one camera-guided leg (30s x3 retries + delays)
+TIMEOUT_DOCKING_SEC = 180.0      # includes the staging approach
+TIMEOUT_UNDOCKING_SEC = 25.0     # 2x the max_undocking_time sent in the goal
+TIMEOUT_HARVEST_SEC = 120.0      # one real cut cycle
+TIMEOUT_UNLOAD_STEP_SEC = 60.0   # one carriage END or HOME traverse
+TIMEOUT_ERROR_SETTLE_SEC = 10.0  # cancels to land during recovery
+
+RETRY_DELAY_SEC = 5.0  # s — backoff before re-sending a failed nav or dock goal
+
+# --- Row alignment ---
+# Nav2 reports arrival on position first, which says nothing useful about which
+# way the robot ends up pointing, and SCANNING then drives straight along
+# whatever heading it happens to hold (drive.py keeps _cmd_angular_z at 0.0). So
+# the robot is turned onto the row heading before the camera drive may start.
+# This also covers the move between rows 2 and 3, which is a pure 180 deg turn
+# with no translation — the one Nav2 can call SUCCEEDED without turning at all.
+ALIGN_ANGULAR_TOL_RAD = 0.05  # rad (~2.9 deg) — matches DriveClient's ang_tol
+ALIGN_ANGULAR_MAX = 0.15      # rad/s — matches DriveClient's v_angular_max
+ALIGN_ANGULAR_MIN = 0.05      # rad/s — below this the base will not turn at all
+ALIGN_GAIN = 0.8              # rad/s of turn per rad of heading error
+TIMEOUT_ALIGN_SEC = 45.0      # s — a 180 deg turn at ALIGN_ANGULAR_MAX takes ~21s
+
+# Charging has no fixed deadline — the battery decides when it is done. What is
+# bounded is progress: if the percentage stops rising, the robot is not actually
+# charging (charger off, bad contact, BMS wedged) and waiting longer will not
+# help. EPSILON exists because the BMS reports fractional percent, so noise
+# alone must not count as progress and mask a real stall.
+CHARGE_NO_PROGRESS_TIMEOUT_SEC = 120.0
+CHARGE_PROGRESS_EPSILON = 0.1  # %
+
+# --- Hardware simulation ---
+# Only the cut cycle and the unloader carriage are stood in for. GO_STOW and
+# GO_READY are always sent to the real manipulator server, so the stow gate
+# that guards every base motion reflects where the arm actually is.
+SIMULATE_HARVEST = True
+SIMULATE_UNLOADER = True
+
+SIM_HARVEST_SEC = 30.0   # s — stand-in for one START_HARVEST cut cycle
+SIM_UNLOADER_SEC = 4.0   # s — stand-in for one carriage END or HOME traverse
+
+# --- Thresholds ---
+BATTERY_LOW_THRESHOLD = 50.0   # % — below this, interrupt the row and go charge
+BATTERY_FULL_THRESHOLD = 99.0  # % — ends the charging interrupt
+LOAD_INCREMENT = 20.0          # % per confirmed harvest — SIMULATED, nothing weighs the bin
+DOCKING_THRESHOLD_M = 1.0     # m — startup "at dock" distance check
+NAV_CLOSE_ENOUGH_M = 0.25      # m — ABORT within this of the target may count as success
+NAV_HEADING_TOL_RAD = 0.15     # rad (~8.6deg) — ...but only if the heading also matches
+
+# --- Retries ---
+MAX_HARVEST_RETRIES = 3
+MAX_DOCKING_RETRIES = 3
+MAX_NAVIGATION_RETRIES = 3
+MAX_RECOVERY_ATTEMPTS = 3  # ERROR recoveries before parking in ABNORMAL for good
+
+# --- Docks ---
+CHARGING_DOCK_NAME = 'husky_charger'
+UNLOADING_DOCK_NAME = 'unloading_station'
+
+DOCK_CONFIGS: dict[str, DockInstanceConfig] = {
+    'husky_charger': DockInstanceConfig(
+        instance_name='husky_charger',
+        type='simple_charging_dock',
+        frame='map',
+        pose=DockPose(x=-6.001, y=2.194, theta=0.0), # -6.001, 2.194, 0.0
+    ),
+    'unloading_station': DockInstanceConfig(
+        instance_name='unloading_station',
+        type='simple_charging_dock',
+        frame='map',
+        pose=DockPose(x=-6.001, y=2.194, theta=0.0), # NOTE: for testing only
+        # pose=DockPose(x=-6.772, y=8.290, theta=1.571), # -6.772, 8.290, 1.571
+        # pose=DockPose(x=0.85, y=1.60, theta=1.571),
+    ),
+}
+
+MOTION_CONFIG = {
+    'dock_configs': DOCK_CONFIGS,
+    'staging_x_offset': -1.5,
+    'staging_yaw_offset': 0.0,
+    'base_frame': 'base_link',
+    'controller_frequency': 50.0,
+    'v_linear_min': 0.15,
+    'v_angular_max': 0.25,
+    'linear_tolerance': 0.05,
+    'angular_tolerance': 0.1,
+    'dock_backwards': False,
+}
+
+POST_UNLOAD_DELAY_SEC = 5.0  # s — wait at END before returning carriage HOME
+
+# --- Rows ---
+# Field data, taken from the farm_node DB table. Each row is
+# (start_node_id, start_x, start_y, end_node_id, end_x, end_y). Heading down
+# the row is computed from start -> end at run time.
+# ROWS = [
+#     (1, -1.6, 0.5, 3, 1.0, 0.5),      # row b1
+#     (2, 1.0, -1.26, 4, -1.6, -1.26),  # row b2
+# ]
+
+# NOTE: Below values are wrt map frame while the values in db are wrt base_mocap frame for testing in lab
+#
+# TODO: node 2 and node 3 currently hold the SAME coordinates (-1.089, 0.299).
+# Surveyed values needed for at least one of them. While they stay identical,
+# _next_row_target(1) navigates to the point the robot already occupies after
+# row b1 ends, so the goal is ~0 translation and a 141 deg rotation. Nav2 checks
+# position first, so it can report SUCCEEDED without ever turning — and SCANNING
+# drives straight along the robot's current heading (drive.py,
+# _cmd_angular_z = 0.0), so row b2 would rescan row b1 over harvested bushes.
+# _is_at_nav_target() now also checks heading, which stops the ABORT-within-
+# tolerance path from hiding this, but it cannot fix a genuine Nav2 SUCCEEDED.
+# ROWS = [
+#     (1, 1.622, 1.219, 2, -1.089, 0.299),  # row b1
+#     (3, -1.089, 0.299, 4, 0.601, 2.937),  # row b2  <-- node 3 == node 2, see TODO
+# ]
+
+# Note these corrds are exact location before and after the bush
+ROWS = [
+    (1, -9.243, 3.98, 2, -13.422, 3.86),  # row b1
+    (3, -12.953, 5.64, 4, -9.539, 5.67),
+    (5, -9.539, 5.67, 6, -12.953, 5.64),  # row b2
+]
 
 
-class LavenderHarvestNode(Node):
-    """
-    Combined NavigateThroughPoses + DriveClient node for lavender row harvesting.
+def _row_heading(row: tuple) -> float:
+    """atan2(end - start) for a ROWS entry — the direction of travel down that row."""
+    _, sx, sy, _, ex, ey = row
+    return math.atan2(ey - sy, ex - sx)
 
-    Startup: nearest-dock selection → startup undocking → task trigger to server
-    Task:    Nav2 to row start then DriveClient for bush-by-bush traversal
-    Arm:     STOW/READY gating around every harvest cycle and undocking
-    Unload:  UnloaderActionClient  END → delay → HOME
-    """
+
+def _row_start_waypoint(row: tuple) -> WayPoint:
+    """Build the nav target WayPoint for a ROWS entry's start point, heading down the row."""
+    node_id, x, y, _, _, _ = row
+    return _make_waypoint(node_id, x, y, _row_heading(row))
+
+
+def _yaw_from_quaternion(q) -> float:
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def _pose_to_waypoint(pose: tuple[float, float, float]) -> WayPoint:
+    """A resume point has no node in the farm table, hence node_id -1."""
+    x, y, theta = pose
+    return _make_waypoint(-1, x, y, theta)
+
+
+def _normalize_angle(angle: float) -> float:
+    """Wrap an angle to [-pi, pi]."""
+    return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+# =============================================================================
+# TASK / SUBTASK CONSTRUCTION
+# =============================================================================
+#
+# In production a task server builds these messages and publishes them; this
+# node subscribes and executes. Here the same messages are built locally so the
+# node can run on its own, but they are the real Task and SubTask types with
+# every field a server would fill in.
+#
+# Building them through these factories rather than inline at each goal-send
+# means swapping to a real subscriber later replaces one function — _build_task
+# — and nothing else. It also keeps the fields consistent: previously each send
+# site set whichever two fields it happened to need and left the rest at their
+# defaults.
+
+
+def _make_waypoint(node_id: int, x: float, y: float, theta: float) -> WayPoint:
+    wp = WayPoint()
+    wp.node_id = node_id
+    wp.x = x
+    wp.y = y
+    wp.theta = theta
+    return wp
+
+
+def _make_subtask(
+    sub_task_id: int,
+    sub_task_type: int,
+    description: str,
+    waypoints: list[WayPoint] | None = None,
+    dock_goal: DockGoal | None = None,
+    undock_goal: UndockGoal | None = None,
+) -> SubTask:
+    """Build one SubTask. Only the fields that type actually uses are set."""
+    subtask = SubTask()
+    subtask.sub_task_id = sub_task_id
+    subtask.type = sub_task_type
+    subtask.description = description
+    if waypoints is not None:
+        subtask.data = waypoints
+    if dock_goal is not None:
+        subtask.dock_goal = dock_goal
+    if undock_goal is not None:
+        subtask.undock_goal = undock_goal
+    return subtask
+
+
+def _make_dock_goal(dock_id: str) -> DockGoal:
+    dock_goal = DockGoal()
+    dock_goal.use_dock_id = True
+    dock_goal.dock_id = dock_id
+    dock_goal.navigate_to_staging_pose = True
+    return dock_goal
+
+
+def _make_undock_goal(dock_type: str, max_undocking_time: float) -> UndockGoal:
+    return UndockGoal(dock_type=dock_type, max_undocking_time=max_undocking_time)
+
+
+def _max_undocking_time() -> float:
+    """How long backing out to the staging pose should take, plus 25%."""
+    staging_x_offset = MOTION_CONFIG['staging_x_offset']
+    v_linear_min = MOTION_CONFIG['v_linear_min']
+    return (abs(staging_x_offset) / max(v_linear_min, 0.01)) * 1.25
+
+
+# Readable names for log lines. The message only carries the integers.
+SUB_TASK_NAMES = {
+    SubTask.MOVING: 'move',
+    SubTask.HARVESTING: 'harvest',
+    SubTask.DOCKING: 'dock',
+    SubTask.CHARGING: 'charge',
+    SubTask.LOADING: 'load',
+    SubTask.UNLOADING: 'unload',
+    SubTask.UNDOCKING: 'undock',
+}
+
+
+def _make_task(
+    task_id: int,
+    task_type: TaskEnum,
+    description: str,
+    sub_tasks: list[SubTask],
+    crop_load: float,
+    target_node_id: int = -1,
+) -> Task:
+    """Build the Task envelope a server would otherwise publish."""
+    task = Task()
+    task.task_id = task_id
+    task.task_type = task_type.value
+    task.assigned_robot_id = ROBOT_ID
+    task.target_node_id = target_node_id
+    task.job_schedule = ''  # set by the scheduler in production
+    task.description = description
+    task.crop_type = CROP_TYPE
+    task.crop_load = crop_load
+    task.sub_tasks = sub_tasks
+    return task
+
+
+class TestLavenderHarvestNode(Node):
+    """Hardcoded, standalone run: dock check -> per-row camera harvest, with
+    battery/load interrupts -> final dock/unload/undock once every row is done."""
 
     def __init__(self):
         super().__init__('test_lavender_harvest')
@@ -74,1665 +406,2236 @@ class LavenderHarvestNode(Node):
         self.namespace = self.get_namespace().rstrip('/')
         self.get_logger().info(f'Node namespace: {self.namespace}')
 
-        self._declare_parameter()
-        self._get_paramters()
         self._init_state_variables()
         self._init_sensor_data()
         self._init_subscriptions()
+        self._validate_config()
 
-        # Publishers
-        self.robot_state_pub = self.create_publisher(RobotStatus, f'{self.namespace}/status/robot', 10)
-        self.task_trigger_pub = self.create_publisher(String, f'{self.namespace}/{self.task_trigger_topic}', 10)
+        # RobotStatus is republished here purely so NavigationActionClient has a
+        # live current-position to build its first goal pose from — nothing else
+        # in this node reads it back.
+        self.robot_state_pub = self.create_publisher(
+            RobotStatus, f'{self.namespace}/status/robot', 10)
 
-        # Action clients that do NOT require active_dock — built here
+        # Same topic and message type DriveClient and ReverseDriveClient use. The
+        # single-mover interlock is what stops two of them commanding at once.
+        self.align_cmd_pub = self.create_publisher(
+            TwistStamped, f'{self.namespace}/cmd_vel', 10)
+
+        # --- Action clients ---
         self.navigation = NavigationActionClient(self)
         self.docking_action_client = DockingActionClient(self)
         self.undocking_action_client = UndockingActionClient(self)
         self.manipulator_client = ManipulatorTaskActionClient(self)
-        self.unloader_action_client = UnloaderActionClient(self)
+        self.unloader_client = UnloaderActionClient(self)
+        self.reverse_drive_client = ReverseDriveClient(self, ReverseDriveConfig(**MOTION_CONFIG))
 
-        # DriveClient built from YAML drive.* params
-        self.drive_client = DriveClient(
-            self,
-            DriveConfig(
-                detection_topic=self.drive_detection_topic,
-                odom_topic=self.drive_odom_topic,
-                base_frame=self.drive_base_frame,
-                cmd_vel_rate=self.drive_cmd_vel_rate,
-                ex_tolerance=self.drive_ex_tolerance,
-                stop_lookahead=self.drive_stop_lookahead,
-                ex_coast_gate=self.drive_ex_coast_gate,
-                ex_angular_gate=self.drive_ex_angular_gate,
-                k_rho=self.drive_k_rho,
-                v_linear_min=self.drive_v_linear_min,
-                v_linear_max=self.drive_v_linear_max,
-                v_angular_max=self.drive_v_angular_max,
-                departure_clearance=self.drive_departure_clearance,
-                no_detection_distance=self.drive_no_detection_distance,
-                ang_tol=self.drive_ang_tol,
-                k_v_p=self.drive_k_v_p,
-                k_v_d=self.drive_k_v_d,
-                k_omega_p=self.drive_k_omega_p,
-                k_omega_d=self.drive_k_omega_d,
-                k_beta_p=self.drive_k_beta_p,
-                k_beta_d=self.drive_k_beta_d,
-                a_max=self.drive_a_max,
-                alpha_max=self.drive_alpha_max,
-                backward_distance_threshold=self.drive_backward_distance_threshold,
-                bushrow_theta=self.drive_bushrow_theta,
-            ),
-        )
+        # --- DriveClient — built once pose and camera TF both resolve ---
+        self.drive_client: DriveClient | None = None
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
 
-        # active_dock and reverse_drive_client are resolved in _check_initial_position
-        self.active_dock: DockInstanceConfig | None = None
-        self.reverse_drive_client: ReverseDriveClient | None = None
+        # One startup timer, not two. Until it sets is_initialized, timer_callback
+        # publishes status and does nothing else — so no phase can advance while
+        # DriveClient is still missing.
+        self.init_check_timer = self.create_timer(TIMER_PERIOD_SEC, self._initial_check_timer)
+        self.timer = self.create_timer(TIMER_PERIOD_SEC, self.timer_callback)
 
-        self.init_check_timer = self.create_timer(
-            self.timing_initial_position_check_delay,
-            self._initial_position_check_timer,
-        )
-        self.timer = self.create_timer(self.timing_timer_period, self.timer_callback)
-
-        self.get_logger().info('LavenderHarvestNode initialised.')
+        self.get_logger().info('test_lavender_harvest started')
 
     # =========================================================================
-    # PARAMETERS
+    # INITIALISATION
     # =========================================================================
 
-    def _declare_parameter(self):
-        """Declare all ROS2 parameters with defaults. Values are overridden by YAML."""
-        self.declare_parameter('navigation.max_retries', 3)
-        self.declare_parameter('navigation.retry_delay', 5.0)
-        self.declare_parameter('docking.max_retries', 2)
-        self.declare_parameter('docking.retry_delay', 3.0)
-        self.declare_parameter('docking.threshold', 0.25)
-        self.declare_parameter('battery.low_threshold', 50.0)
-        self.declare_parameter('battery.full_threshold', 99.0)
-        self.declare_parameter('loading.increment', 20.0)
-        self.declare_parameter('unloading.home_delay_s', 2.0)
-        self.declare_parameter('timing.timer_period', 1.0)
-        self.declare_parameter('timing.initial_position_check_delay', 2.0)
-
-        # Dock instances
-        self.declare_parameter('docks.names', ['main_dock'])
-        dock_names = list(self.get_parameter('docks.names').value)
-        for name in dock_names:
-            self.declare_parameter(f'docks.{name}.type', 'simple_charging_dock')
-            self.declare_parameter(f'docks.{name}.frame', 'map')
-            self.declare_parameter(f'docks.{name}.pose', [0.0, 0.0, 0.0])
-
-        # Plugin (staging offsets)
-        self.declare_parameter('plugin.name', 'simple_charging_dock')
-        self.declare_parameter('plugin.staging_x_offset', -1.5)
-        self.declare_parameter('plugin.staging_yaw_offset', 0.0)
-
-        # Controller (reverse drive motion params)
-        self.declare_parameter('controller.base_frame', 'base_link')
-        self.declare_parameter('controller.controller_frequency', 50.0)
-        self.declare_parameter('controller.v_linear_min', 0.15)
-        self.declare_parameter('controller.v_linear_max', 0.15)
-        self.declare_parameter('controller.v_angular_max', 0.25)
-
-        # Undocking tolerances
-        self.declare_parameter('undocking.linear_tolerance', 0.05)
-        self.declare_parameter('undocking.angular_tolerance', 0.1)
-        self.declare_parameter('undocking.dock_backwards', False)
-
-        # DriveClient
-        self.declare_parameter('drive.detection_topic', 'manipulators/arm_0_detection/image_annotated/detection_pose')
-        self.declare_parameter('drive.odom_topic', 'platform/odom')
-        self.declare_parameter('drive.base_frame', 'base_link')
-        self.declare_parameter('drive.cmd_vel_rate', 10.0)
-        self.declare_parameter('drive.v_linear_min', 0.05)
-        self.declare_parameter('drive.v_linear_max', 0.2)
-        self.declare_parameter('drive.v_angular_max', 0.5)
-        self.declare_parameter('drive.k_rho', 1.0)
-        self.declare_parameter('drive.ex_tolerance', 0.05)
-        self.declare_parameter('drive.stop_lookahead', 0.05)
-        self.declare_parameter('drive.ex_coast_gate', 0.1)
-        self.declare_parameter('drive.ex_angular_gate', 0.05)
-        self.declare_parameter('drive.departure_clearance', 0.3)
-        self.declare_parameter('drive.no_detection_distance', 0.5)
-        # --- PD target-pose controller (drive.py) ---
-        self.declare_parameter('drive.ang_tol', 0.05)
-        self.declare_parameter('drive.k_v_p', 0.2)
-        self.declare_parameter('drive.k_v_d', 0.2)
-        self.declare_parameter('drive.k_omega_p', 0.4)
-        self.declare_parameter('drive.k_omega_d', 0.1)
-        self.declare_parameter('drive.k_beta_p', 1.0)
-        self.declare_parameter('drive.k_beta_d', 1.0)
-        self.declare_parameter('drive.a_max', 0.05)
-        self.declare_parameter('drive.alpha_max', 0.3)
-        self.declare_parameter('drive.backward_distance_threshold', 1.0)
-        # --- Camera mount / row geometry (drive.py) ---
-        # cam_tx/cam_ty/arm_tx_offset resolved via TF at DriveClient startup.
-        self.declare_parameter('drive.bushrow_theta', 0.0)
-
-        # Task trigger
-        self.declare_parameter('task.trigger_topic', 'job/trigger')
-
-        # Subscription topics (relative to robot namespace)
-        self.declare_parameter('topics.battery', 'platform/bms/state')
-        self.declare_parameter('topics.pose', 'ground_truth/pose')
-        self.declare_parameter('topics.imu', 'sensors/gps_0/imu')
-        self.declare_parameter('topics.estop', 'platform/emergency_stop')
-        self.declare_parameter('topics.task', 'status/task')
-        self.declare_parameter('topics.detection', 'manipulators/arm_0_detection/image_annotated/detection_pose')
-
-    def _get_paramters(self):
-        """Read all declared parameters into instance variables."""
-        self.navigation_max_retries = int(self.get_parameter('navigation.max_retries').value)
-        self.navigation_retry_delay = float(self.get_parameter('navigation.retry_delay').value)
-        self.docking_max_retries = int(self.get_parameter('docking.max_retries').value)
-        self.docking_retry_delay = float(self.get_parameter('docking.retry_delay').value)
-        self.docking_threshold = float(self.get_parameter('docking.threshold').value)
-        self.battery_low_threshold = float(self.get_parameter('battery.low_threshold').value)
-        self.battery_full_threshold = float(self.get_parameter('battery.full_threshold').value)
-        self.loading_increment = float(self.get_parameter('loading.increment').value)
-        self.unloading_home_delay_s = float(self.get_parameter('unloading.home_delay_s').value)
-        self.timing_timer_period = float(self.get_parameter('timing.timer_period').value)
-        self.timing_initial_position_check_delay = float(
-            self.get_parameter('timing.initial_position_check_delay').value
-        )
-
-        # Build dock configs dict — used for nearest-dock selection in _check_initial_position
-        dock_names = list(self.get_parameter('docks.names').value)
-        self.dock_configs: dict[str, DockInstanceConfig] = {}
-        for name in dock_names:
-            pose = list(self.get_parameter(f'docks.{name}.pose').value)
-            self.dock_configs[name] = DockInstanceConfig(
-                instance_name=name,
-                type=str(self.get_parameter(f'docks.{name}.type').value),
-                frame=str(self.get_parameter(f'docks.{name}.frame').value),
-                pose=DockPose(x=float(pose[0]), y=float(pose[1]), theta=float(pose[2])),
-            )
-
-        self.plugin_name = str(self.get_parameter('plugin.name').value)
-        self.staging_x_offset = float(self.get_parameter('plugin.staging_x_offset').value)
-        self.staging_yaw_offset = float(self.get_parameter('plugin.staging_yaw_offset').value)
-
-        self.base_frame = str(self.get_parameter('controller.base_frame').value)
-        self.controller_frequency = float(self.get_parameter('controller.controller_frequency').value)
-        self.v_linear_min = float(self.get_parameter('controller.v_linear_min').value)
-        self.v_linear_max = float(self.get_parameter('controller.v_linear_max').value)
-        self.v_angular_max = float(self.get_parameter('controller.v_angular_max').value)
-
-        self.linear_tolerance = float(self.get_parameter('undocking.linear_tolerance').value)
-        self.angular_tolerance = float(self.get_parameter('undocking.angular_tolerance').value)
-        self.dock_backwards = bool(self.get_parameter('undocking.dock_backwards').value)
-
-        self.drive_detection_topic = str(self.get_parameter('drive.detection_topic').value)
-        self.drive_odom_topic = str(self.get_parameter('drive.odom_topic').value)
-        self.drive_base_frame = str(self.get_parameter('drive.base_frame').value)
-        self.drive_cmd_vel_rate = float(self.get_parameter('drive.cmd_vel_rate').value)
-        self.drive_v_linear_min = float(self.get_parameter('drive.v_linear_min').value)
-        self.drive_v_linear_max = float(self.get_parameter('drive.v_linear_max').value)
-        self.drive_v_angular_max = float(self.get_parameter('drive.v_angular_max').value)
-        self.drive_k_rho = float(self.get_parameter('drive.k_rho').value)
-        self.drive_ex_tolerance = float(self.get_parameter('drive.ex_tolerance').value)
-        self.drive_stop_lookahead = float(self.get_parameter('drive.stop_lookahead').value)
-        self.drive_ex_coast_gate = float(self.get_parameter('drive.ex_coast_gate').value)
-        self.drive_ex_angular_gate = float(self.get_parameter('drive.ex_angular_gate').value)
-        self.drive_departure_clearance = float(self.get_parameter('drive.departure_clearance').value)
-        self.drive_no_detection_distance = float(self.get_parameter('drive.no_detection_distance').value)
-        # --- PD target-pose controller (drive.py) ---
-        self.drive_ang_tol = float(self.get_parameter('drive.ang_tol').value)
-        self.drive_k_v_p = float(self.get_parameter('drive.k_v_p').value)
-        self.drive_k_v_d = float(self.get_parameter('drive.k_v_d').value)
-        self.drive_k_omega_p = float(self.get_parameter('drive.k_omega_p').value)
-        self.drive_k_omega_d = float(self.get_parameter('drive.k_omega_d').value)
-        self.drive_k_beta_p = float(self.get_parameter('drive.k_beta_p').value)
-        self.drive_k_beta_d = float(self.get_parameter('drive.k_beta_d').value)
-        self.drive_a_max = float(self.get_parameter('drive.a_max').value)
-        self.drive_alpha_max = float(self.get_parameter('drive.alpha_max').value)
-        self.drive_backward_distance_threshold = float(self.get_parameter('drive.backward_distance_threshold').value)
-        # --- Camera mount / row geometry (drive.py) ---
-        self.drive_bushrow_theta = float(self.get_parameter('drive.bushrow_theta').value)
-
-        self.task_trigger_topic = str(self.get_parameter('task.trigger_topic').value)
-
-        self.topic_battery = str(self.get_parameter('topics.battery').value)
-        self.topic_pose = str(self.get_parameter('topics.pose').value)
-        self.topic_imu = str(self.get_parameter('topics.imu').value)
-        self.topic_estop = str(self.get_parameter('topics.estop').value)
-        self.topic_task = str(self.get_parameter('topics.task').value)
-        self.topic_detection = str(self.get_parameter('topics.detection').value)
-
-        self.get_logger().debug(
-            f'Parameters loaded | '
-            f'nav_retries={self.navigation_max_retries} nav_delay={self.navigation_retry_delay}s | '
-            f'dock_retries={self.docking_max_retries} dock_delay={self.docking_retry_delay}s '
-            f'dock_threshold={self.docking_threshold}m | '
-            f'battery_low={self.battery_low_threshold}% battery_full={self.battery_full_threshold}% | '
-            f'load_increment={self.loading_increment}% | '
-            f'timer={self.timing_timer_period}s'
-        )
-
-    def _init_state_variables(self):
-        """Initialise all state-tracking variables to their boot defaults."""
-        # --- Startup ---
-        self.is_initialized = False
-        self.is_at_docking_station = False
-        self.startup_undock_complete = False
-
-        # --- Robot state ---
+    def _init_state_variables(self) -> None:
+        """Initialise every state-tracking variable to its boot default."""
+        # --- Robot state: the only true state in this node ---
         self.current_status = RobotStatusEnum.IDLE
         self.previous_status = RobotStatusEnum.IDLE
 
-        # --- Task management ---
+        # --- Startup ---
+        self.is_initialized = False           # True once every init gate has passed
+        self.is_at_docking_station = False    # True if booted within DOCKING_THRESHOLD_M
+        self.startup_undock_complete = False  # True once the boot sequence is finished
+        self.init_ticks = 0                   # counted against TIMEOUT_INIT_SEC
+        self.pose_valid = False               # True while the pose resolves into NAV_FRAME
+
+        # --- Dock selection (this node owns active_dock; the client does not) ---
+        self.active_dock: DockInstanceConfig | None = None
+
+        # --- Task ---
+        # Which of HARVESTING/CHARGING/UNLOADING the current status chain serves.
+        # CHARGING and UNLOADING share START_DOCKING..DONE_UNDOCKING, so this and
+        # active_dock are what tell the two apart.
+        self.current_task_type: TaskEnum | None = None
+
+        # The Task message the node built for itself, standing in for the one a
+        # task server would publish. Every goal sent while it is current draws
+        # its SubTask from here rather than making one up at the send site.
         self.current_task: Task | None = None
-        self.current_sub_task: SubTask | None = None
-        self.current_sub_task_index = 0
-        self.last_handled_task_id: int | None = None
-        self.last_handled_task_type: int | None = None
-        self.last_handled_subtask_type: int | None = None
-        self.current_node_id = 0
+        self.next_task_id = 1
+        self.next_sub_task_id = 1
+        self.farm_exhausted = False
+        self.run_complete = False
+
+        # --- Motion ownership: who owns the current MOVING / DESTINATION_REACHED ---
+        self.motion_source: str | None = None  # 'nav', 'align' or 'drive'
+        self.pending_move: str | None = None   # 'scan' or 'resume'
+        self.nav_target_wp: WayPoint | None = None
+
+        # --- Row bookkeeping (no production counterpart) ---
+        self.row_index = 0
+        self.row_over = False
+        # Furthest point covered in the current row, written every time the robot
+        # parks at a bush — not only after a harvest completes. A row is driven
+        # in one direction, so a single pose describes progress fully; resume
+        # after any interrupt returns here rather than to the row start.
+        self.row_progress_pose: tuple[float, float, float] | None = None
+        self.park_count_snapshot = 0
+        self.bushes_visited = 0
+        self.bushes_harvested = 0
         self.current_load_status = 0.0
 
         # --- Retry counters ---
         self.navigation_retry_count = 0
         self.docking_retry_count = 0
+        self.harvest_retry_count = 0
+        self.recovery_attempts = 0
 
-        # --- Undocking ---
-        self.last_undocking_subtask: SubTask | None = None
-        self.undocking_after_task_type: int | None = None
+        # --- Retry backoff: ticks to wait before re-sending a failed goal ---
+        self.nav_retry_wait_ticks = 0
+        self.dock_retry_wait_ticks = 0
+
+        # --- Deadlines ---
+        # One counter for the current status, reset by _transition_status. States
+        # with sub-steps (unloading, recovery, init) count separately below.
+        self.state_ticks = 0
+        self.unload_step_ticks = 0
+        self.error_settle_ticks = 0
+
+        # --- Charging progress monitor ---
+        self.charge_last_pct: float | None = None
+        self.charge_stall_ticks = 0
 
         # --- Reverse drive ---
-        self.reverse_drive_active: bool = False
+        self.reverse_drive_active = False
 
-        # --- Navigation routing ---
-        # True  = next HARVESTING MOVING sends Nav2 goal first
-        # False = skip Nav2, go straight to DriveClient at DESTINATION_REACHED
-        self._need_row_navigation: bool = True
+        # --- Row alignment (turn in place onto the row heading) ---
+        self.align_active = False
+        self.align_target_theta: float | None = None
 
-        # --- DriveClient detection tracking ---
-        # Reset False on each scan()/resume(); True when a valid detection arrives.
-        # Distinguishes STOPPED-at-bush from STOPPED-by-no-detection-timeout.
-        self._detection_received: bool = False
-        self.last_detection_time: float | None = None
+        # --- Unloader: END -> wait -> HOME is three steps inside one UNLOADING
+        # state, which RobotStatusEnum cannot express on its own. ---
+        self.unload_step: str | None = None  # 'END', 'WAIT', 'HOME'
+        self.unload_goal_sent = False
+        self.unload_wait_ticks = 0
 
-        # --- Unloader phase ---
-        # False = awaiting AT_END; True = AT_END done, now commanding HOME.
-        self._unloader_at_end: bool = False
+        # --- Goal-sent latches ---
+        self.nav_goal_sent = False
+        self.dock_goal_sent = False
+        self.undock_goal_sent = False
 
-        # --- Arm state (mirrors husky_operations_manager.py) ---
-        # Boot assumption: arm configuration unknown — STOW gate fires on first undock.
+        # --- Arm state ---
+        # Boot value is UNKNOWN, not GO_STOW: nothing has confirmed where the arm
+        # actually is. Both startup paths gate on a confirmed STOW before the
+        # robot is allowed to move.
         self.last_confirmed_arm_command: str = ArmCommand.UNKNOWN
-        # True while waiting for a STOW goal to complete via _handle_manipulator.
-        self.arm_stow_pending: bool = False
-        # True while waiting for a READY goal to complete via _handle_manipulator.
-        self.arm_ready_pending: bool = False
+        self.arm_stow_pending = False
+        self.arm_ready_pending = False
 
-        self.get_logger().debug('State variables initialised')
+        # --- Hardware simulation ---
+        # Tick counters standing in for an action in flight. Counted against the
+        # monitor period rather than slept, so the loop keeps serving callbacks
+        # and an e-stop pre-empts a simulated wait the same as a real one.
+        self.sim_harvest_ticks = 0
+        self.sim_unloader_ticks = 0
 
-    def _init_sensor_data(self):
-        """Initialise sensor data containers with empty default messages."""
-        self.battery_status = BatteryState()
-        self.task = Task()
-        self.gps_status = NavSatFix()
-        self.pose_status = PoseWithCovarianceStamped()
-        self.imu_status = Imu()
-        self.estop_status = Bool()
+    def _init_sensor_data(self) -> None:
+        # All three start as None, not as default-constructed messages. An empty
+        # BatteryState reads 0% and an empty Bool reads "not stopped", so a dead
+        # or QoS-mismatched topic would look like valid data saying "flat
+        # battery, safe to drive". None is the only value that means "nothing
+        # has told us yet", and every reader below treats it as unsafe.
+        #
+        # Each carries the time it was received rather than a header stamp:
+        # std_msgs/Bool has no header, so receipt time is the only measure of
+        # freshness the three can share.
+        # The robot pose is not among them: it comes from TF, so its freshness is
+        # the age of the transform rather than the age of a message.
+        self.battery_status: BatteryState | None = None
+        self.battery_stamp: Time | None = None
+        self.estop_status: Bool | None = None
+        self.estop_stamp: Time | None = None
 
-    def _init_subscriptions(self):
-        """Create all ROS2 subscriptions using YAML-configured topic names."""
+    def _init_subscriptions(self) -> None:
+        # There is no pose subscription. The robot pose is read from TF instead,
+        # because docks, rows and navigation goals are all map-frame while the
+        # odometry topic publishes in the odom frame — comparing the two silently
+        # measured distances across frames, which in the field put the whole
+        # map->odom offset (about 10 m) into the camera drive's position error.
+        #
+        # QoS matches the publishers (qos_profile_sensor_data, BEST_EFFORT): a
+        # RELIABLE subscriber against a BEST_EFFORT publisher connects to nothing
+        # and reports no error.
         self.battery_sub = self.create_subscription(
-            BatteryState,
-            f'{self.namespace}/{self.topic_battery}',
-            lambda msg: setattr(self, 'battery_status', msg),
-            qos_profile_sensor_data,
-        )
-        self.pose_sub = self.create_subscription(
-            PoseWithCovarianceStamped,
-            f'{self.namespace}/{self.topic_pose}',
-            self._pose_callback,
-            10,
-        )
-        self.imu_sub = self.create_subscription(
-            Imu,
-            f'{self.namespace}/{self.topic_imu}',
-            lambda msg: setattr(self, 'imu_status', msg),
-            qos_profile_sensor_data,
-        )
+            BatteryState, f'{self.namespace}/{TOPIC_BATTERY}',
+            self._battery_callback, qos_profile_sensor_data)
         self.estop_sub = self.create_subscription(
-            Bool,
-            f'{self.namespace}/{self.topic_estop}',
-            lambda msg: setattr(self, 'estop_status', msg),
-            qos_profile_sensor_data,
-        )
-        self.task_sub = self.create_subscription(
-            Task,
-            f'{self.namespace}/{self.topic_task}',
-            self._task_callback,
-            10,
-        )
-        self.detection_sub = self.create_subscription(
-            ImageDetectionPose,
-            f'{self.namespace}/{self.topic_detection}',
-            self._detection_callback,
-            qos_profile_sensor_data,
-        )
-        self.get_logger().debug('Subscriptions initialised')
+            Bool, f'{self.namespace}/{TOPIC_ESTOP}',
+            self._estop_callback, qos_profile_sensor_data)
+
+    def _battery_callback(self, msg: BatteryState) -> None:
+        self.battery_status = msg
+        self.battery_stamp = self.get_clock().now()
+
+    def _estop_callback(self, msg: Bool) -> None:
+        self.estop_status = msg
+        self.estop_stamp = self.get_clock().now()
+
+    def _is_fresh(self, stamp: Time | None) -> bool:
+        """True when a reading arrived recently enough to be acted on."""
+        if stamp is None:
+            return False
+        return (self.get_clock().now() - stamp).nanoseconds / 1e9 <= SENSOR_STALE_SEC
+
+    def _pose_tf_fresh(self) -> bool:
+        """True when TF can still place the robot, recently enough to act on."""
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                NAV_FRAME, BASE_FRAME, Time(), timeout=Duration(seconds=0.05)
+            )
+        except TransformException:
+            return False
+
+        stamp = Time.from_msg(tf.header.stamp)
+        if stamp.nanoseconds == 0:
+            return True  # static transform, it has no age to check
+        return self._is_fresh(stamp)
+
+    def _stale_sensors(self) -> list[str]:
+        """Names of the readings that have gone quiet. Empty is good."""
+        stale = []
+        if not self._pose_tf_fresh():
+            stale.append('pose')
+        if not self._is_fresh(self.battery_stamp):
+            stale.append('battery')
+        if not self._is_fresh(self.estop_stamp):
+            stale.append('e-stop')
+        return stale
 
     # =========================================================================
-    # SUBSCRIPTION CALLBACKS
+    # STARTUP
     # =========================================================================
 
-    def _pose_callback(self, msg: PoseWithCovarianceStamped):
-        """Store latest ground-truth pose for dock distance checks."""
-        self.pose_status = msg
-
-    def _detection_callback(self, msg: ImageDetectionPose):
-        """Set _detection_received on valid detection — used by _subtask_moving."""
-        if msg.detection_valid:
-            self._detection_received = True
-            self.last_detection_time = self.get_clock().now().nanoseconds / 1e9
-            self.get_logger().debug(f'Detection | center=({msg.center.x:.3f}, {msg.center.y:.3f})')
-
-    def _task_callback(self, msg: Task):
+    def _validate_config(self) -> None:
         """
-        Handle incoming Task messages from JobPublisher.
+        Check the hardcoded tables before anything can move.
 
-        Detects new task (task_id or task_type changed) or new subtask (first subtask
-        type differs from last processed). Repeated identical publishes are no-ops.
+        A bad row or dock entry does not fail loudly at run time — it produces a
+        goal that looks valid and drives the robot somewhere wrong. Catching it
+        at boot is the only cheap point.
         """
-        subtasks_summary = [(st.sub_task_id, st.type, st.description) for st in msg.sub_tasks]
-        self.get_logger().debug(
-            f'Received task | ID: {msg.task_id} | Type: {msg.task_type} | '
-            f'Target Node: {msg.target_node_id} | SubTasks: {subtasks_summary}'
+        problems: list[str] = []
+        warnings: list[str] = []
+
+        if not ROWS:
+            problems.append('ROWS is empty — there is nothing to harvest')
+
+        for index, row in enumerate(ROWS):
+            _, sx, sy, _, ex, ey = row
+            if math.isclose(sx, ex, abs_tol=1e-6) and math.isclose(sy, ey, abs_tol=1e-6):
+                problems.append(
+                    f'ROWS[{index}] starts and ends at the same point '
+                    f'({sx:.3f}, {sy:.3f}) — its heading cannot be computed'
+                )
+
+        if not DOCK_CONFIGS:
+            problems.append('DOCK_CONFIGS is empty — the robot cannot dock or undock')
+
+        for name in (CHARGING_DOCK_NAME, UNLOADING_DOCK_NAME):
+            if name not in DOCK_CONFIGS:
+                problems.append(f"DOCK_CONFIGS has no entry named '{name}'")
+
+        docks = list(DOCK_CONFIGS.values())
+        for i, first in enumerate(docks):
+            for second in docks[i + 1:]:
+                if (math.isclose(first.pose.x, second.pose.x, abs_tol=1e-6)
+                        and math.isclose(first.pose.y, second.pose.y, abs_tol=1e-6)):
+                    warnings.append(
+                        f"docks '{first.instance_name}' and '{second.instance_name}' "
+                        f'share the same position ({first.pose.x:.3f}, {first.pose.y:.3f}) '
+                        '— the nearest-dock choice between them is arbitrary'
+                    )
+
+        for message in warnings:
+            self.get_logger().warning(f'Config warning: {message}')
+
+        if problems:
+            for message in problems:
+                self.get_logger().error(f'Config error: {message}')
+            self.get_logger().error(
+                'Configuration is not safe to drive with — halting before startup'
+            )
+            self._transition_status(RobotStatusEnum.ABNORMAL)
+            return
+
+        self.get_logger().info(
+            f'Config checked: {len(ROWS)} rows, {len(DOCK_CONFIGS)} docks'
         )
 
-        is_new_task = (
-            msg.task_id != self.last_handled_task_id
-            or self.current_task
-            and msg.task_type != self.current_task.task_type
-        )
-
-        is_new_subtask = False
-        if isinstance(msg.sub_tasks, list) and len(msg.sub_tasks) > 0:
-            first_subtask = msg.sub_tasks[0]
-            if isinstance(first_subtask, SubTask):
-                is_new_subtask = first_subtask.type != self.last_handled_subtask_type
-
-        self.get_logger().debug(
-            f'Task callback | id={msg.task_id} type={msg.task_type} | '
-            f'is_new_task={is_new_task} is_new_subtask={is_new_subtask} | '
-            f'last_task_id={self.last_handled_task_id} '
-            f'last_subtask_type={self.last_handled_subtask_type}'
-        )
-
-        if is_new_task:
-            self.get_logger().info(f'New Task: {msg.description} (ID: {msg.task_id})')
-            self.current_sub_task_index = 0
-            self.last_handled_subtask_type = None
-        elif is_new_subtask:
-            self.get_logger().info(f'New Subtask for task ID: {msg.task_id}')
-            self.current_sub_task_index = 0
-            if self.current_status == RobotStatusEnum.JOB_DONE:
-                self._transition_status(RobotStatusEnum.IDLE)
-
-        if self.last_handled_task_id is None:
-            self.current_load_status = self.task.crop_load
-
-        self.task = msg
-
-    # =========================================================================
-    # TASK TRIGGER
-    # =========================================================================
-
-    def _send_task_trigger(self):
-        """Publish a trigger to the server to generate and store the next task."""
-        msg = String()
-        msg.data = self.namespace
-        self.task_trigger_pub.publish(msg)
-        self.get_logger().info(f'Task trigger published to {self.task_trigger_topic}')
-
-    # =========================================================================
-    # MAIN TIMER CALLBACK
-    # =========================================================================
-
-    def timer_callback(self):
+    def _action_servers(self) -> dict:
         """
-        1 Hz control loop.
+        Every action server this node sends goals to, keyed by the name used in
+        logs. Simulated hardware is left out — nothing is sent to it.
+        """
+        servers = {
+            'navigation (NavigateThroughPoses)': self.navigation.client,
+            'docking (dock_robot)': self.docking_action_client.client,
+            'undocking (undock_robot)': self.undocking_action_client.client,
+            'arm (manipulator_action_server)': self.manipulator_client.client,
+        }
+        if not SIMULATE_UNLOADER:
+            servers['unloader (operate_unloader)'] = self.unloader_client.client
+        return servers
 
-        Routes to error recovery, startup undocking, or task execution.
-        Publishes RobotStatus at the end of every tick.
+    def _missing_servers(self) -> list[str]:
+        """Names of the action servers that are not up. Empty is good.
+
+        server_is_ready() answers from the discovery graph without blocking,
+        unlike wait_for_server(), which parks the whole monitor loop for its
+        timeout while it waits.
+        """
+        return [
+            name for name, client in self._action_servers().items()
+            if not client.server_is_ready()
+        ]
+
+    def _require_server(self, name: str, client) -> bool:
+        """
+        Confirm a server is there before sending it anything.
+
+        A missing action server is not a transient fault. Retrying spent the
+        whole recovery budget re-sending goals into nothing, and moved the arm
+        through a full stow on every attempt. It also blocked the monitor loop
+        for the client's wait_for_server timeout each time, which made the
+        sensor freshness check report pose, battery and e-stop as stale when
+        they were arriving normally.
+        """
+        if client.server_is_ready():
+            return True
+
+        self.get_logger().error(
+            f'{name} is not running. Retrying will not bring it back, so the node '
+            'is stopping here. Start that server, then restart this node.'
+        )
+        self._transition_status(RobotStatusEnum.ABNORMAL)
+        return False
+
+    def _initial_check_timer(self) -> None:
+        """
+        Fires until every precondition for driving is satisfied, then runs the
+        dock check, builds DriveClient, and cancels itself.
+
+        Battery is one of the gates. Without it the first task pick reads a
+        default 0% and sends the robot to the charger, where it waits for a full
+        charge that a silent BMS never reports. The action servers are another:
+        starting a run without them just burns the recovery budget on goals that
+        cannot be delivered.
+        """
+        if self.current_status == RobotStatusEnum.ABNORMAL:
+            return
+
+        self.init_ticks += 1
+        elapsed = self.init_ticks * TIMER_PERIOD_SEC
+
+        waiting_for: list[str] = []
+        if not self._tf_buffer.can_transform(NAV_FRAME, BASE_FRAME, Time()):
+            waiting_for.append(f'robot pose TF ({NAV_FRAME} -> {BASE_FRAME})')
+        if self.battery_status is None:
+            waiting_for.append(f"battery state (topic '{TOPIC_BATTERY}')")
+        if self.estop_status is None:
+            waiting_for.append(f"emergency stop state (topic '{TOPIC_ESTOP}')")
+        if not self._tf_buffer.can_transform(BASE_FRAME, CAMERA_FRAME, Time()):
+            waiting_for.append(f'camera TF ({BASE_FRAME} -> {CAMERA_FRAME})')
+
+        missing = self._missing_servers()
+        if missing:
+            waiting_for.append(f'action servers [{", ".join(missing)}]')
+
+        if waiting_for:
+            self._init_wait_or_give_up(elapsed, waiting_for)
+            return
+
+        # The dock check needs map->odom, which can lag camera TF at boot. Resolve
+        # it before building anything so the timer can simply fire again.
+        if not self._check_initial_position():
+            self._init_wait_or_give_up(elapsed, [f'TF into the dock frame ({NAV_FRAME})'])
+            return
+
+        # bushrow_theta starts at the real row-0 heading rather than a placeholder.
+        # set_bushrow_theta() still updates it per row before every scan()/resume().
+        drive_config = DriveConfig(
+            **STATIC_DRIVE_PARAMS,
+            camera_frame=CAMERA_FRAME,
+            odom_frame=ODOM_FRAME,
+            bushrow_theta=_row_heading(ROWS[0]),
+        )
+        self.drive_client = DriveClient(self, drive_config)
+
+        self.init_check_timer.cancel()
+        self.is_initialized = True
+        self.get_logger().info(
+            f'Startup checks passed in {elapsed:.1f}s — pose, battery, e-stop and '
+            'camera TF all present, DriveClient built'
+        )
+
+    def _init_wait_or_give_up(self, elapsed: float, waiting_for: list[str]) -> None:
+        """Log what startup is still missing, or halt once the budget is spent."""
+        missing = ', '.join(waiting_for)
+
+        if elapsed > TIMEOUT_INIT_SEC:
+            self.get_logger().error(
+                f'Startup gave up after {elapsed:.0f}s. Still missing: {missing}. '
+                'The robot will not move — check those topics and the TF tree.'
+            )
+            self.init_check_timer.cancel()
+            self._transition_status(RobotStatusEnum.ABNORMAL)
+            return
+
+        self.get_logger().info(
+            f'Startup waiting for: {missing} ({elapsed:.0f}s of '
+            f'{TIMEOUT_INIT_SEC:.0f}s)',
+            throttle_duration_sec=2.0,
+        )
+
+    def _robot_pose_in_frame(self, target_frame: str) -> tuple[float, float, float] | None:
+        """
+        Robot pose (x, y, yaw) in `target_frame`, read from TF.
+
+        One lookup, no odometry message involved. Everything this node compares
+        against — dock poses, row coordinates, navigation goals — lives in the
+        map frame, and TF is what knows where base_link is inside it.
+
+        Returns None while TF cannot resolve the pair, so the caller can retry
+        rather than compare two frames as though they were one.
+        """
+        target = target_frame.lstrip('/')
+        try:
+            # Time() asks for the latest available transform rather than one at a
+            # specific stamp, which would be rejected as an extrapolation while
+            # map->odom is still being filled in at boot.
+            tf = self._tf_buffer.lookup_transform(
+                target, BASE_FRAME, Time(), timeout=Duration(seconds=0.2)
+            )
+        except TransformException as e:
+            self.get_logger().warning(
+                f"TF lookup '{BASE_FRAME}' -> '{target}' failed: {e}",
+                throttle_duration_sec=2.0,
+            )
+            return None
+
+        return (
+            tf.transform.translation.x,
+            tf.transform.translation.y,
+            _yaw_from_quaternion(tf.transform.rotation),
+        )
+
+    def _check_initial_position(self) -> bool:
+        """
+        Pick the nearest dock and decide whether the boot sequence must undock.
+
+        False means TF was not ready — call again on the next tick. Every dock
+        must resolve before deciding: picking a "nearest" dock from a partial set
+        would silently select the wrong one at boot.
+        """
+        # Docks may not all declare the same frame, so resolve the robot once per
+        # distinct frame and compare each dock inside its own frame.
+        robot_xy_by_frame: dict[str, tuple[float, float]] = {}
+        candidates: list[tuple[DockInstanceConfig, float]] = []
+
+        for dock in DOCK_CONFIGS.values():
+            frame = dock.frame.lstrip('/')
+            if frame not in robot_xy_by_frame:
+                robot_pose = self._robot_pose_in_frame(frame)
+                if robot_pose is None:
+                    self.get_logger().warning(
+                        f"Dock '{dock.instance_name}' frame '{frame}' unresolved — "
+                        'deferring position check',
+                        throttle_duration_sec=2.0,
+                    )
+                    return False
+                robot_xy_by_frame[frame] = robot_pose[:2]
+            robot_x, robot_y = robot_xy_by_frame[frame]
+            candidates.append((dock, math.hypot(robot_x - dock.pose.x, robot_y - dock.pose.y)))
+
+        nearest_dock, nearest_dist = min(candidates, key=lambda candidate: candidate[1])
+        robot_x, robot_y = robot_xy_by_frame[nearest_dock.frame.lstrip('/')]
+
+        self.get_logger().info(
+            f"Initial Robot position: ({robot_x:.3f}, {robot_y:.3f}) in "
+            f"'{nearest_dock.frame}' | Nearest dock: '{nearest_dock.instance_name}' | "
+            f'Distance to dock: {nearest_dist:.3f}m'
+        )
+
+        self.active_dock = nearest_dock
+        self.is_at_docking_station = nearest_dist <= DOCKING_THRESHOLD_M
+
+        if self.is_at_docking_station:
+            self.get_logger().info('Robot at dock — will stow and undock before rows')
+        else:
+            self.get_logger().info('Robot away from dock — will stow before driving')
+
+        return True
+
+    def _handle_startup(self) -> None:
+        """
+        Drive the boot sequence. Both exits gate on a confirmed STOW first, so
+        the robot never drives with the arm in an unknown configuration.
+
+        At a dock:    IDLE -(STOW)-> START_UNDOCKING -> UNDOCKING -> DONE_UNDOCKING
+        Away from it: IDLE -(STOW)-> startup complete, normal task execution
+        """
+        if self.current_status == RobotStatusEnum.IDLE:
+            if not self._ensure_arm(ArmCommand.GO_STOW):
+                return  # hold in IDLE until the arm is confirmed stowed
+
+            if self.is_at_docking_station:
+                self.get_logger().info('Arm stowed — starting startup undocking')
+                self._transition_status(RobotStatusEnum.START_UNDOCKING)
+            else:
+                self.get_logger().info('Arm stowed — skipping undock, ready for rows')
+                self.startup_undock_complete = True
+            return
+
+        if self.current_status == RobotStatusEnum.START_UNDOCKING:
+            self._send_undock_goal('Startup undocking')
+            return
+
+        if self.current_status == RobotStatusEnum.DONE_UNDOCKING:
+            self.get_logger().info('Startup undocking complete')
+            self.startup_undock_complete = True
+            self._transition_status(RobotStatusEnum.IDLE)
+
+    # =========================================================================
+    # MAIN LOOP
+    # =========================================================================
+
+    def timer_callback(self) -> None:
+        """
+        Main control loop.
+
+        Order matters here. The emergency stop is evaluated before the
+        initialisation gate, because "not started up yet" must never be a reason
+        to ignore the stop button. Anything that can move the robot sits below
+        both.
+
+        Each tick:
+          1. Build a RobotStatus from current sensor readings
+          2. Emergency stop, then terminal states, then the init gate
+          3. Route: ERROR -> recovery, boot incomplete -> startup,
+             otherwise -> task execution
+          4. Check the current state against its deadline
+          5. Stamp final state and publish
         """
         robot_status = RobotStatus()
         robot_status.header.stamp = self.get_clock().now().to_msg()
         robot_status.robot_namespace = self.namespace.replace('/', '')
+        self._set_sensor_fields(robot_status)
 
-        self._set_battery_status(robot_status)
-        self._set_estop_status(robot_status)
-        self._set_location_status(robot_status)
+        if self.run_complete:
+            self._publish_status(robot_status, 'Run complete')
+            return
 
-        self.get_logger().debug(
-            f'Tick | status={self.current_status.name} | '
-            f'startup_undock_complete={self.startup_undock_complete} | '
-            f'reverse_drive_active={self.reverse_drive_active}'
-        )
+        if self.current_status == RobotStatusEnum.ABNORMAL:
+            self._publish_status(robot_status, 'Halted — needs a person')
+            return
 
-        if self.current_status in [RobotStatusEnum.ERROR, RobotStatusEnum.ABNORMAL]:
+        # --- Emergency stop, above everything that can move ------------------
+        # An unknown stop state is not a clear one. Hold rather than declaring
+        # EMERGENCY_STOP: that state exits through ERROR, and a topic that has
+        # not spoken yet at boot is not a fault worth spending a recovery on.
+        if self.estop_status is None:
+            self._publish_status(robot_status, 'Waiting for emergency stop state')
+            self.get_logger().warning(
+                f"No message on '{TOPIC_ESTOP}' yet — holding until the emergency "
+                'stop state is known',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        if self.estop_status.data:
+            self._publish_status(robot_status, 'Emergency stop')
+            if self.current_status != RobotStatusEnum.EMERGENCY_STOP:
+                self.get_logger().error('EMERGENCY STOP pressed — stopping everything')
+                self._cancel_active_motion()
+                self._transition_status(RobotStatusEnum.EMERGENCY_STOP)
+            return
+
+        if self.current_status == RobotStatusEnum.EMERGENCY_STOP:
+            self._resume_from_last_good_state('Emergency stop released')
+            self._publish_status(robot_status, self._status_description())
+            return
+
+        # Nothing may advance before DriveClient exists and the dock check has run.
+        if not self.is_initialized:
+            self._publish_status(robot_status, 'Starting up')
+            return
+
+        # Past this point the robot is allowed to drive, so a sensor that has
+        # gone quiet is a fault, not a wait.
+        stale = self._stale_sensors()
+        if stale and self.current_status != RobotStatusEnum.ERROR:
+            self.get_logger().error(
+                f'Lost {" and ".join(stale)} for more than {SENSOR_STALE_SEC:.0f}s '
+                '— stopping'
+            )
+            self._transition_status(RobotStatusEnum.ERROR)
+
+        if self.current_status == RobotStatusEnum.ERROR:
             self._handle_error_recovery()
         elif not self.startup_undock_complete:
-            self._handle_startup_undocking(robot_status)
+            self._process_action_clients()
+            self._handle_startup()
         else:
-            self._handle_task_execution(robot_status)
+            self._handle_task_execution()
+
+        self._check_state_deadline()
+        self._publish_status(robot_status, self._status_description())
+
+    def _resume_from_last_good_state(self, reason: str) -> None:
+        """
+        Drop everything in flight and restart the current task from the last
+        point the robot is known to have reached.
+
+        Row progress, load and which task was running are all kept — only the
+        in-flight goals are thrown away. The arm is deliberately marked unknown:
+        whatever was moving when the stop landed may have stopped anywhere, so
+        it gets re-stowed before the robot drives again.
+        """
+        self.get_logger().info(f'{reason} — cancelling everything and restarting the task')
+
+        self._cancel_active_motion()
+        self._reset_all_clients()
+        self._clear_goal_latches()
+
+        self.last_confirmed_arm_command = ArmCommand.UNKNOWN
+        self.arm_stow_pending = False
+        self.arm_ready_pending = False
+
+        if self.current_task_type is None:
+            self.get_logger().info('No task was running — going idle')
+            self._transition_status(RobotStatusEnum.IDLE)
+            return
+
+        target = self._next_nav_target()
+        self.get_logger().info(
+            f'Restarting {self.current_task_type.name} | row {self.row_index} | '
+            f'returning to ({target.x:.3f}, {target.y:.3f})'
+        )
+        self._transition_status(RobotStatusEnum.JOB_START)
+
+    def _check_state_deadline(self) -> None:
+        """
+        Fail a state that has waited longer than it ever should.
+
+        Without this a dead action server or a client that stops reporting
+        leaves the robot parked in a normal-looking state with nothing in the
+        log to say it is stuck.
+        """
+        limit = self._state_deadline_sec()
+        if limit is None:
+            self.state_ticks = 0
+            return
+
+        self.state_ticks += 1
+        waited = self.state_ticks * TIMER_PERIOD_SEC
+        if waited <= limit:
+            return
+
+        self.get_logger().error(
+            f'{self.current_status.name} has been waiting {waited:.0f}s '
+            f'(limit {limit:.0f}s) — giving up on it'
+        )
+        self._transition_status(RobotStatusEnum.ERROR)
+
+    def _state_deadline_sec(self) -> float | None:
+        """How long the current state is allowed to wait, or None if it may wait."""
+        status = self.current_status
+
+        if status == RobotStatusEnum.MOVING:
+            if self.motion_source == 'nav':
+                return TIMEOUT_NAV_SEC
+            if self.motion_source == 'align':
+                return TIMEOUT_ALIGN_SEC
+            return TIMEOUT_DRIVE_SEC
+
+        # Covers both sources. The drive branch waits on odom/TF; the nav branch
+        # can stall too, when a previous goal is somehow still active and the
+        # send is skipped every tick.
+        if status == RobotStatusEnum.START_MOVING:
+            return TIMEOUT_DRIVE_READY_SEC
+
+        return {
+            RobotStatusEnum.DOCKING: TIMEOUT_DOCKING_SEC,
+            RobotStatusEnum.UNDOCKING: TIMEOUT_UNDOCKING_SEC,
+            RobotStatusEnum.HARVESTING: TIMEOUT_HARVEST_SEC,
+        }.get(status)
+
+    def _set_sensor_fields(self, robot_status: RobotStatus) -> None:
+        pct = self._battery_pct()
+        robot_status.battery_level = pct if pct is not None else 0.0
+        robot_status.load_status = self.current_load_status
+
+        # NavigationActionClient reads this back as the goal list's first waypoint
+        # and stamps the goal 'map', so it must be published in NAV_FRAME. Raw
+        # odometry here would put the start of every path in the wrong place.
+        robot_pose = self._robot_pose_in_frame(NAV_FRAME)
+        self.pose_valid = robot_pose is not None
+        if robot_pose is None:
+            return
+
+        robot_x, robot_y, robot_yaw = robot_pose
+        robot_status.topo_map_position.x = robot_x
+        robot_status.topo_map_position.y = robot_y
+        robot_status.topo_map_orientation.z = math.sin(robot_yaw / 2.0)
+        robot_status.topo_map_orientation.w = math.cos(robot_yaw / 2.0)
+
+    def _publish_status(self, robot_status: RobotStatus, description: str) -> None:
+        # A status with no resolved position is worse than no status at all:
+        # NavigationActionClient reads the position back as the start of the next
+        # path, and an unset field reads as the map origin.
+        if not self.pose_valid:
+            self.get_logger().warning(
+                f"Robot position not resolvable in '{NAV_FRAME}' — withholding "
+                'status so no path is planned from the wrong place',
+                throttle_duration_sec=2.0,
+            )
+            return
 
         robot_status.status = self.current_status.value
-        robot_status.current_node_id = self.current_node_id
+        robot_status.task = description
         robot_status.load_status = self.current_load_status
         self.robot_state_pub.publish(robot_status)
 
-    # =========================================================================
-    # STARTUP — INITIAL POSITION CHECK
-    # =========================================================================
+    def _status_description(self) -> str:
+        """Human-readable sentence for RobotStatus.task, matching production's use
+        of that field. The machine-readable state goes in RobotStatus.status."""
+        if not self.startup_undock_complete:
+            return 'Startup sequence'
+        if self.current_task_type == TaskEnum.CHARGING_TASK:
+            return f'Charging at {CHARGING_DOCK_NAME}'
+        if self.current_task_type == TaskEnum.UNLOADING_TASK:
+            return f'Unloading at {UNLOADING_DOCK_NAME}'
+        if self.current_task_type == TaskEnum.HARVESTING_TASK:
+            return f'Harvesting row {self.row_index}'
+        return 'Idle'
 
-    def _initial_position_check_timer(self):
-        """Fire once after initial_position_check_delay; wait for pose then check."""
-        if self.pose_status is None:
-            self.get_logger().warning('Waiting for pose data...')
-            return
-        self.init_check_timer.cancel()
-        self._check_initial_position()
+    def _battery_pct(self) -> float | None:
+        """Battery percentage, or None while nothing has reported one."""
+        if self.battery_status is None:
+            return None
+        pct = self.battery_status.percentage
+        return pct * 100.0 if pct <= 1.0 else pct
 
-    def _check_initial_position(self):
+    def _battery_is_low(self) -> bool:
+        """True only when the battery is *known* to be below the threshold.
+
+        An unknown battery is not low — it is unknown, and the init gate already
+        refuses to let the robot move until a real reading has arrived.
         """
-        Find nearest dock by Euclidean distance, build ReverseDriveClient,
-        and decide whether startup undocking is needed.
-        """
-        if self.is_initialized:
+        pct = self._battery_pct()
+        return pct is not None and pct < BATTERY_LOW_THRESHOLD
+
+    def _transition_status(self, new_status: RobotStatusEnum) -> None:
+        if new_status == self.current_status:
             return
-
-        if not self.pose_status or not self.pose_status.pose:
-            self.get_logger().warning('No pose data — retrying in 1s')
-            time.sleep(1.0)
-            self._check_initial_position()
-            return
-
-        pos = self.pose_status.pose.pose.position
-
-        # Nearest dock by Euclidean distance (not dock_names[0])
-        nearest_dock = min(
-            self.dock_configs.values(),
-            key=lambda d: math.sqrt((pos.x - d.pose.x) ** 2 + (pos.y - d.pose.y) ** 2),
-        )
-        dist = math.sqrt((pos.x - nearest_dock.pose.x) ** 2 + (pos.y - nearest_dock.pose.y) ** 2)
-
-        self.active_dock = nearest_dock
-
-        # Build ReverseDriveClient with nearest dock at index 0
-        ordered_names = [nearest_dock.instance_name] + [n for n in self.dock_configs if n != nearest_dock.instance_name]
-        self.reverse_drive_client = ReverseDriveClient(
-            self,
-            ReverseDriveConfig(
-                dock_names=ordered_names,
-                dock_configs=self.dock_configs,
-                plugin_name=self.plugin_name,
-                staging_x_offset=self.staging_x_offset,
-                staging_yaw_offset=self.staging_yaw_offset,
-                base_frame=self.base_frame,
-                controller_frequency=self.controller_frequency,
-                v_linear_min=self.v_linear_min,
-                v_angular_max=self.v_angular_max,
-                linear_tolerance=self.linear_tolerance,
-                angular_tolerance=self.angular_tolerance,
-                dock_backwards=self.dock_backwards,
-            ),
-        )
-
+        self.previous_status = self.current_status
+        self.current_status = new_status
+        # Deadlines are per-state, so entering a new one starts a fresh clock.
+        self.state_ticks = 0
         self.get_logger().info(
-            f'Position check | robot=({pos.x:.3f}, {pos.y:.3f}) | '
-            f"nearest='{nearest_dock.instance_name}' "
-            f'({nearest_dock.pose.x:.3f}, {nearest_dock.pose.y:.3f}) | '
-            f'dist={dist:.3f}m | threshold={self.docking_threshold}m'
+            f'Status: {self.previous_status.name} -> {self.current_status.name}'
         )
 
-        if dist <= self.docking_threshold:
-            self.is_at_docking_station = True
-            self.startup_undock_complete = False
-            self.get_logger().info('Robot AT dock — startup undocking required')
-        else:
-            self.is_at_docking_station = False
-            self.startup_undock_complete = True
-            self.get_logger().info('Robot NOT at dock — skipping startup undocking')
-            self._send_task_trigger()
-
-        self.is_initialized = True
-
     # =========================================================================
-    # STARTUP — UNDOCKING STATE MACHINE
+    # ACTION CLIENT ARBITRATION
     # =========================================================================
 
-    def _handle_startup_undocking(self, robot_status: RobotStatus):
+    def _process_action_clients(self) -> None:
         """
-        Drive startup undocking state machine (called while startup_undock_complete=False).
+        Poll the action clients and hand the tick to exactly one motion client,
+        in priority order:
 
-        Tick 1 (IDLE):            → START_UNDOCKING
-        Tick 2 (START_UNDOCKING): call _handle_manipulator if arm_stow_pending,
-                                  then call _subtask_undocking (which has STOW gate)
-        Tick 3+ (else):           poll undocking or reverse drive
-        """
-        if not self.is_initialized or self.startup_undock_complete:
-            return
+          1. NavigationActionClient — NavigateThroughPoses
+          2. DockingActionClient    — dock_robot
+          3. UndockingActionClient  — undock_robot
+          4. ReverseDriveClient     — TF closed-loop reverse (undocking fallback)
+          5. DriveClient            — camera-guided row driving
 
-        self.get_logger().debug(
-            f'Startup undocking | current_status={self.current_status.name} | '
-            f'reverse_drive_active={self.reverse_drive_active}'
-        )
+        No discriminator flag is needed between 1 and 5: DriveClient reports IDLE
+        whenever it is not driving, so it can only win the funnel while active.
 
-        if self.current_status == RobotStatusEnum.IDLE:
-            self.get_logger().info('Starting startup undocking...')
-            self._transition_status(RobotStatusEnum.START_UNDOCKING)
-            robot_status.task = 'Startup: Preparing to undock'
-
-        elif self.current_status == RobotStatusEnum.START_UNDOCKING:
-            robot_status.task = 'Startup: Undocking'
-
-            dock_type = self.active_dock.type
-            staging_x_offset = self.staging_x_offset
-            v_linear = self.v_linear_max
-            max_undocking_time = (abs(staging_x_offset) / max(v_linear, 0.01)) * 1.25
-
-            self.get_logger().debug(
-                f"Startup UndockGoal | dock_type='{dock_type}' | "
-                f'staging_x_offset={staging_x_offset} | '
-                f'max_undocking_time={max_undocking_time:.1f}s'
-            )
-
-            startup_subtask = SubTask()
-            startup_subtask.type = SubTask.UNDOCKING
-            startup_subtask.description = 'Startup Undocking'
-            startup_subtask.undock_goal = UndockGoal(
-                dock_type=dock_type,
-                max_undocking_time=max_undocking_time,
-            )
-            self.last_undocking_subtask = startup_subtask
-
-            # Poll manipulator during startup so the STOW gate can be cleared
-            if self.arm_stow_pending:
-                self._handle_manipulator(robot_status)
-
-            self._subtask_undocking()
-
-        else:
-            if self.reverse_drive_active:
-                self._handle_reverse_drive(robot_status)
-            else:
-                self._handle_undocking(robot_status)
-
-    # =========================================================================
-    # TASK EXECUTION
-    # =========================================================================
-
-    def _handle_task_execution(self, robot_status: RobotStatus):
-        """
-        Main task loop — called from timer_callback when startup is complete and
-        status is not ERROR/ABNORMAL.
-
-        Each tick:
-          1. Validate task — go IDLE if absent
-          2. Battery check — interrupt on low battery
-          3. Process action clients (nav/dock/undock/reverse-drive/arm)
-          4. Refresh current_sub_task
-          5. Route: IDLE/JOB_DONE → _handle_task_start; else → _execute_current_subtask
-        """
-        if not self.task or not self.task.description or not self.task.job_schedule:
-            if self.current_status != RobotStatusEnum.IDLE:
-                self._transition_status(RobotStatusEnum.IDLE)
-            return
-
-        self.current_task = self.task
-
-        if self._check_and_handle_low_battery():
-            return
-
-        self._process_action_clients(robot_status)
-        self._update_current_subtask()
-
-        robot_status.crop_type = self.current_task.crop_type
-        robot_status.target_node_id = self.current_task.target_node_id
-        robot_status.task = (
-            self.current_sub_task.description if self.current_sub_task else self.current_task.description
-        )
-
-        self.get_logger().debug(
-            f'Task execution | status={self.current_status.name} | '
-            f'task_id={self.current_task.task_id} task_type={self.current_task.task_type} | '
-            f'subtask_index={self.current_sub_task_index} | '
-            f'subtask_type={self.current_sub_task.type if self.current_sub_task else "None"}'
-        )
-
-        if self.current_status in (RobotStatusEnum.IDLE, RobotStatusEnum.JOB_DONE):
-            self._handle_task_start()
-        else:
-            self._execute_current_subtask()
-
-    def _check_and_handle_low_battery(self) -> bool:
-        """
-        Interrupt task on low battery. Returns True when caller should skip the tick.
-
-        Non-CHARGING task with low battery → cancel navigation → ERROR
-        ERROR with CHARGING_TASK → clear error, IDLE (bypass _handle_error_recovery)
-        """
-        if not self.task or not self.current_task:
-            return False
-
-        battery_pct = self._normalize_battery(self.battery_status.percentage)
-
-        if self.task.task_type != Task.CHARGING_TASK and battery_pct <= self.battery_low_threshold:
-            self.get_logger().warning(
-                f'Battery low: {battery_pct:.1f}% — '
-                f'threshold={self.battery_low_threshold}% | '
-                f'task_type={self.task.task_type} | status={self.current_status.name}'
-            )
-            if self.current_status in [RobotStatusEnum.START_MOVING, RobotStatusEnum.MOVING]:
-                self.navigation.cancel_goal()
-            self._transition_status(RobotStatusEnum.ERROR)
-            return True
-
-        if self.current_status == RobotStatusEnum.ERROR and self.current_task.task_type == Task.CHARGING_TASK:
-            self.get_logger().info(f'Recovering from low battery — CHARGING_TASK received | battery={battery_pct:.1f}%')
-            self._transition_status(RobotStatusEnum.IDLE)
-
-        return False
-
-    def _process_action_clients(self, robot_status: RobotStatus):
-        """
-        Poll all active action clients each tick.
-
-        Priority: navigation → docking → undocking → reverse drive
-        Arm manipulator is polled independently (runs in parallel with motion).
+        The manipulator is polled separately because arm motion overlaps robot
+        motion — its completion is what unblocks the motion states.
         """
         nav_status = self.navigation.get_navigation_status()
         dock_status = self.docking_action_client.get_status()
         undock_status = self.undocking_action_client.get_status()
-
-        self.get_logger().debug(
-            f'Action clients | nav={nav_status.name} | '
-            f'dock={dock_status.name} | '
-            f'undock={undock_status.name} | '
-            f'reverse_drive_active={self.reverse_drive_active} | '
-            f'arm_stow_pending={self.arm_stow_pending} | '
-            f'arm_ready_pending={self.arm_ready_pending}'
-        )
+        drive_active = False
+        if self.drive_client is not None:
+            drive_feedback = self.drive_client.get_status()
+            drive_active = drive_feedback.status != drive_feedback.IDLE
 
         if nav_status != NavigationStatus.IDLE:
-            self._handle_navigation(robot_status)
+            self._handle_navigation()
         elif dock_status != RobotStatusEnum.IDLE:
-            self._handle_docking(robot_status)
+            self._handle_docking()
         elif undock_status != RobotStatusEnum.IDLE:
-            self._handle_undocking(robot_status)
+            self._handle_undocking()
         elif self.reverse_drive_active:
-            self._handle_reverse_drive(robot_status)
+            self._handle_reverse_drive()
+        elif self.align_active:
+            self._handle_align()
+        elif drive_active:
+            self._handle_drive()
 
-        # Arm polled independently — its completion unblocks harvesting and undocking flows
         arm_harvest_active = (
             self.current_status == RobotStatusEnum.HARVESTING
             and not self.arm_stow_pending
             and not self.arm_ready_pending
         )
         if self.arm_stow_pending or self.arm_ready_pending or arm_harvest_active:
-            self._handle_manipulator(robot_status)
+            self._handle_manipulator()
 
-    def _update_current_subtask(self):
-        """Refresh current_sub_task from sub_tasks[current_sub_task_index]."""
-        if not self.current_task:
-            return
-
-        if isinstance(self.current_task.sub_tasks, list):
-            if self.current_sub_task_index < len(self.current_task.sub_tasks):
-                self.current_sub_task = self.current_task.sub_tasks[self.current_sub_task_index]
-            else:
-                self.current_sub_task = None
-
-        self.get_logger().debug(
-            f'Current subtask | index={self.current_sub_task_index} | '
-            f'type={self.current_sub_task.type if self.current_sub_task else "None"} | '
-            f"desc='{self.current_sub_task.description if self.current_sub_task else 'None'}'"
-        )
-
-    def _handle_task_start(self):
+    def _cancel_active_motion(self) -> None:
         """
-        Initialise a new task or clear a completed one.
+        Stop everything that can move the robot. Non-blocking.
 
-        New task (id/type changed):
-          - Update _need_row_navigation based on last task type
-          - Cache new task identifiers, clear undocking state, → JOB_START
-          - Send task trigger after CHARGING/UNLOADING task completes (return to row)
-
-        Same task, JOB_DONE:
-          - If HARVESTING_TASK: _need_row_navigation = False (resume row on next subtask)
-          - → IDLE, clear current_task, send trigger for next task
+        Docking and undocking are in this list because Nav2's dock server drives
+        the base itself. Cancelling only navigation left the robot driving into
+        or out of a dock with the state machine frozen. The manipulator is here
+        for the same reason at the other end — an arm mid-motion keeps moving
+        until its goal is cancelled.
         """
-        if not self.current_task:
-            return
+        stopped: list[str] = []
 
-        if (
-            self.current_task.task_id != self.last_handled_task_id
-            or self.current_task.task_type != self.last_handled_task_type
+        if self.navigation.is_navigation_active():
+            self.navigation.cancel_goal()
+            stopped.append('navigation')
+        if self.docking_action_client.get_status() != RobotStatusEnum.IDLE:
+            self.docking_action_client.cancel_goal()
+            stopped.append('docking')
+        if self.undocking_action_client.get_status() != RobotStatusEnum.IDLE:
+            self.undocking_action_client.cancel_goal()
+            stopped.append('undocking')
+        if self.reverse_drive_active:
+            self.reverse_drive_client.cancel()
+            stopped.append('reverse drive')
+        if self.align_active:
+            self._publish_align_cmd(0.0)
+            self.align_active = False
+            stopped.append('row alignment')
+        if self.drive_client is not None and self.drive_client.is_active():
+            self.drive_client.cancel()
+            stopped.append('camera drive')
+        if self.manipulator_client.get_status() not in (
+            RobotStatusEnum.IDLE, RobotStatusEnum.DONE_HARVESTING
         ):
-            self.get_logger().info(
-                f'Starting Task: {self.current_task.description} | '
-                f'ID: {self.current_task.task_id} | '
-                f'Current Node: {self.current_node_id} | '
-                f'Target Node: {self.current_task.target_node_id}'
-            )
-            self.get_logger().debug(
-                f'Task start | task_type={self.current_task.task_type} | '
-                f'last_task_id={self.last_handled_task_id} | '
-                f'last_task_type={self.last_handled_task_type}'
-            )
+            self.manipulator_client.cancel_goal()
+            stopped.append('arm')
 
-            # Update _need_row_navigation: returning from dock requires Nav2 back to row
-            if self.last_handled_task_type in (Task.CHARGING_TASK, Task.UNLOADING_TASK):
-                self._need_row_navigation = True
-            # HARVESTING → HARVESTING: keep current value (set by _subtask_moving)
-
-            self.last_handled_task_id = self.current_task.task_id
-            self.last_handled_task_type = self.current_task.task_type
-            self.last_handled_subtask_type = None
-            self.last_undocking_subtask = None
-            self.undocking_after_task_type = None
-            self._transition_status(RobotStatusEnum.JOB_START)
-
-        elif self.current_status == RobotStatusEnum.JOB_DONE:
-            # Same task still publishing — consecutive subtask (e.g. next bush)
-            if self.current_task.task_type == Task.HARVESTING_TASK:
-                # Next subtask continues the row — DriveClient resumes, no Nav2
-                self._need_row_navigation = False
-            elif self.current_task.task_type in (Task.CHARGING_TASK, Task.UNLOADING_TASK):
-                self._need_row_navigation = True
-
-            self.get_logger().debug(
-                f'JOB_DONE — same task still publishing | task_id={self.current_task.task_id} — transitioning to IDLE'
-            )
-            self._transition_status(RobotStatusEnum.IDLE)
-            self.current_task = None
-            self._send_task_trigger()
-
-    def _execute_current_subtask(self):
-        """Route to the correct subtask handler based on current_sub_task.type."""
-        if not isinstance(self.current_sub_task, SubTask):
-            self.get_logger().debug(f'_execute_current_subtask — no valid subtask | status={self.current_status.name}')
-            return
-
-        if self.current_sub_task.type != self.last_handled_subtask_type:
-            self.get_logger().info(f'Executing: {self.current_sub_task.description}')
-            self.last_handled_subtask_type = self.current_sub_task.type
-
-        task_handler_map = {
-            SubTask.MOVING: self._subtask_moving,
-            SubTask.HARVESTING: self._subtask_harvesting,
-            SubTask.DOCKING: self._subtask_docking,
-            SubTask.CHARGING: self._subtask_charging,
-            SubTask.UNLOADING: self._subtask_unloading,
-            SubTask.UNDOCKING: self._subtask_undocking,
-        }
-
-        handler = task_handler_map.get(self.current_sub_task.type)
-        if handler:
-            handler()
+        if stopped:
+            self.get_logger().warning(f'Cancelling: {", ".join(stopped)}')
         else:
-            self.get_logger().warning(f'Unknown subtask type: {self.current_sub_task.type} — no handler registered')
+            self.get_logger().info('Nothing was moving')
+
+    def _busy_motion_clients(self, starting: str) -> list[str]:
+        """
+        Names of motion clients that are not idle, ignoring the one about to
+        start.
+
+        Each client publishes cmd_vel from its own timer, so two of them active
+        at once means two sets of velocity commands fighting over the base. The
+        priority chain in _process_action_clients only decides which one this
+        node *watches* — it does not stop the others from driving.
+        """
+        busy: list[str] = []
+
+        if starting != 'nav' and self.navigation.get_navigation_status() != NavigationStatus.IDLE:
+            busy.append('navigation')
+        if starting != 'dock' and self.docking_action_client.get_status() != RobotStatusEnum.IDLE:
+            busy.append('docking')
+        if starting != 'undock' and self.undocking_action_client.get_status() != RobotStatusEnum.IDLE:
+            busy.append('undocking')
+        if starting != 'reverse' and self.reverse_drive_client.get_status() != ReverseDriveStatus.IDLE:
+            busy.append('reverse drive')
+        if starting != 'align' and self.align_active:
+            busy.append('row alignment')
+        if starting != 'drive' and self.drive_client is not None:
+            feedback = self.drive_client.get_status()
+            if feedback.status != feedback.IDLE:
+                busy.append('camera drive')
+
+        return busy
+
+    def _may_start_motion(self, starting: str) -> bool:
+        """Refuse to start a second mover while another one is still running."""
+        busy = self._busy_motion_clients(starting)
+        if not busy:
+            return True
+
+        self.get_logger().error(
+            f'Refusing to start {starting} — {" and ".join(busy)} still running'
+        )
+        return False
+
+    def _reset_all_clients(self) -> None:
+        """Return every action client to idle. Local state only."""
+        self.navigation.reset()
+        self.docking_action_client.reset()
+        self.undocking_action_client.reset()
+        self.manipulator_client.reset()
+        self.unloader_client.reset()
+        self.reverse_drive_client.reset()
+        if self.drive_client is not None:
+            self.drive_client.reset()
+        self.reverse_drive_active = False
+
+    def _clear_goal_latches(self) -> None:
+        """Forget which goals were sent so the next attempt starts clean."""
+        self.nav_goal_sent = False
+        self.dock_goal_sent = False
+        self.undock_goal_sent = False
+        self.unload_goal_sent = False
+        self.unload_step = None
+        self.motion_source = None
+        self.pending_move = None
+        self.nav_retry_wait_ticks = 0
+        self.dock_retry_wait_ticks = 0
+        self.align_active = False
+        self.align_target_theta = None
+        self.sim_harvest_ticks = 0
+        self.sim_unloader_ticks = 0
+        self.unload_step_ticks = 0
+        self.navigation_retry_count = 0
+        self.docking_retry_count = 0
+        self.harvest_retry_count = 0
 
     # =========================================================================
     # ACTION CLIENT HANDLERS
     # =========================================================================
 
-    def _handle_navigation(self, robot_status: RobotStatus):
-        """
-        Monitor NavigationActionClient.
+    def _handle_navigation(self) -> None:
+        """Map NavigationStatus onto the shared MOVING / DESTINATION_REACHED pair."""
+        if self.motion_source != 'nav':
+            return
 
-        ACTIVE    → MOVING
-        SUCCEEDED → reset, update node, → DESTINATION_REACHED
-        ABORTED/ERROR → retry logic
-        CANCELED  → reset, → IDLE
-        """
-        nav_status = self.navigation.get_navigation_status()
-        wpf_status = self.navigation.get_current_status()
+        # Backoff between attempts. The client is deliberately left un-reset while
+        # this counts down, so its status stays non-idle and this handler keeps
+        # being reached. Re-sending a goal the instant Nav2 rejected it just
+        # spends the whole retry budget in under a second.
+        if self.nav_retry_wait_ticks > 0:
+            self.nav_retry_wait_ticks -= 1
+            if self.nav_retry_wait_ticks == 0:
+                self.navigation.reset()
+                self.nav_goal_sent = False
+                self.get_logger().info('Retrying navigation now')
+                self._transition_status(RobotStatusEnum.START_MOVING)
+            return
 
-        if wpf_status:
-            robot_status.task = wpf_status.task
-            robot_status.current_node_id = wpf_status.current_node_id
-            robot_status.target_node_id = wpf_status.target_node_id
-        else:
-            robot_status.task = self.current_task.description if self.current_task else ''
-            robot_status.current_node_id = self.current_node_id
-            robot_status.target_node_id = self.current_task.target_node_id if self.current_task else -1
+        status = self.navigation.get_navigation_status()
 
-        self.get_logger().debug(
-            f'Navigation handler | nav_status={nav_status.name} | '
-            f'current_node={self.current_node_id} | '
-            f'retry_count={self.navigation_retry_count}/{self.navigation_max_retries}'
-        )
-
-        if nav_status == NavigationStatus.ACTIVE:
-            self._transition_status(RobotStatusEnum.MOVING)
-
-        elif nav_status == NavigationStatus.SUCCEEDED:
-            self.get_logger().info('Navigation complete')
-            self.navigation_retry_count = 0
+        if status == NavigationStatus.SUCCEEDED:
             self.navigation.reset()
-            self.current_node_id = wpf_status.target_node_id if wpf_status else self.current_node_id
-            self._transition_status(RobotStatusEnum.DESTINATION_REACHED)
-
-        elif nav_status in [NavigationStatus.ABORTED, NavigationStatus.ERROR]:
-            self._handle_navigation_retry()
-
-        elif nav_status == NavigationStatus.CANCELED:
-            self.get_logger().info('Navigation canceled')
-            self.navigation.reset()
+            self.nav_goal_sent = False
             self.navigation_retry_count = 0
-            self._transition_status(RobotStatusEnum.IDLE)
-
-    def _handle_navigation_retry(self):
-        """Retry NavigateThroughPoses up to navigation_max_retries, then ERROR."""
-        self.get_logger().warning(
-            f'Navigation failed | retry {self.navigation_retry_count + 1}/{self.navigation_max_retries}'
-        )
-
-        if self._is_robot_at_target():
-            self.get_logger().info('Robot already at target — treating navigation as complete')
-            wpf_status = self.navigation.get_current_status()
-            self.navigation_retry_count = 0
-            self.navigation.reset()
-            self.current_node_id = wpf_status.target_node_id if wpf_status else self.current_node_id
             self._transition_status(RobotStatusEnum.DESTINATION_REACHED)
             return
 
-        if self.navigation_retry_count < self.navigation_max_retries:
-            self.navigation_retry_count += 1
-            self.get_logger().info(
-                f'Retrying navigation in {self.navigation_retry_delay:.1f}s | '
-                f'attempt {self.navigation_retry_count}/{self.navigation_max_retries}'
+        if status in (
+            NavigationStatus.SENDING,
+            NavigationStatus.ACCEPTED,
+            NavigationStatus.ACTIVE,
+        ):
+            return  # still in flight
+
+        if status == NavigationStatus.CANCELED:
+            # Somebody else stopped this goal. Previously this fell through every
+            # branch and returned, leaving the node in MOVING for good with
+            # nothing in the log.
+            self.get_logger().warning(
+                'Navigation goal was cancelled from outside — dropping it and '
+                'restarting the task'
             )
-            time.sleep(self.navigation_retry_delay)
-            self._retry_navigation()
-        else:
-            self.get_logger().error(f'Navigation failed after {self.navigation_max_retries} retries')
             self.navigation.reset()
-            self._transition_status(RobotStatusEnum.ERROR)
-            self.navigation_retry_count = 0
-
-    def _retry_navigation(self):
-        """Re-send the NavigateThroughPoses goal for the current task."""
-        if not self.current_task:
-            self.get_logger().error('Navigation retry failed — no current task')
+            self.nav_goal_sent = False
+            self._transition_status(RobotStatusEnum.IDLE)
             return
 
-        nav_status = self.navigation.get_navigation_status()
-        if nav_status in [NavigationStatus.ACTIVE, NavigationStatus.SENDING]:
-            self.get_logger().warning(f'Navigation still active ({nav_status.name}) — skipping retry')
+        if status not in (
+            NavigationStatus.ABORTED,
+            NavigationStatus.ERROR,
+            NavigationStatus.FAILED,
+            NavigationStatus.REJECTED,
+        ):
+            self.get_logger().error(
+                f'Navigation reported {status.name}, which this node has no rule '
+                'for — treating it as a failure rather than waiting forever'
+            )
+            self.navigation.reset()
+            self.nav_goal_sent = False
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
+        if self._is_at_nav_target():
+            self.get_logger().info(
+                f'Navigation {status.name} but within position and heading tolerance — treating as arrived'
+            )
+            self.navigation.reset()
+            self.nav_goal_sent = False
+            self.navigation_retry_count = 0
+            self._transition_status(RobotStatusEnum.DESTINATION_REACHED)
+            return
+
+        if self.navigation_retry_count < MAX_NAVIGATION_RETRIES:
+            self.navigation_retry_count += 1
+            self.nav_retry_wait_ticks = max(1, int(RETRY_DELAY_SEC / TIMER_PERIOD_SEC))
+            self.get_logger().warning(
+                f'Navigation {status.name} — waiting {RETRY_DELAY_SEC:.0f}s then '
+                f'retrying ({self.navigation_retry_count}/{MAX_NAVIGATION_RETRIES})'
+            )
             return
 
         self.navigation.reset()
-        time.sleep(self.navigation_retry_delay)
+        self.nav_goal_sent = False
+        self.get_logger().error(f'Navigation failed after {MAX_NAVIGATION_RETRIES} retries')
+        self._transition_status(RobotStatusEnum.ERROR)
 
-        if self.navigation.send_goal(self.current_task):
-            self._transition_status(RobotStatusEnum.MOVING)
-        else:
-            self.get_logger().error('Navigation retry send_goal failed')
-            self._transition_status(RobotStatusEnum.ERROR)
-
-    def _handle_docking(self, robot_status: RobotStatus):
+    def _is_at_nav_target(self) -> bool:
         """
-        Monitor DockingActionClient.
+        True when an ABORTED goal actually left the robot where it was asked to be.
 
-        DOCKING      → DOCKING
-        DONE_DOCKING → reset, → DONE_DOCKING
-        ERROR        → retry
+        Position alone is not enough: a goal that is mostly a rotation (see the
+        node 2 == node 3 TODO above) can end within centimetres of the target
+        while pointing the wrong way, and SCANNING drives along the robot's
+        current heading. Heading is checked too.
         """
-        status = self.docking_action_client.get_status()
-        feedback = self.docking_action_client.get_feedback()
+        if not self.nav_target_wp:
+            return False
 
-        if feedback:
-            robot_status.task = feedback.task
-        else:
-            robot_status.task = 'Docking in progress'
+        # Goal poses are stamped NAV_FRAME by NavigationActionClient, so the robot
+        # has to be expressed there too — raw odometry would measure the wrong gap.
+        robot_pose = self._robot_pose_in_frame(NAV_FRAME)
+        if robot_pose is None:
+            return False
 
-        self.get_logger().debug(
-            f'Docking handler | status={status.name} | '
-            f'retry_count={self.docking_retry_count}/{self.docking_max_retries}'
-        )
+        robot_x, robot_y, robot_yaw = robot_pose
+        dist = math.hypot(robot_x - self.nav_target_wp.x, robot_y - self.nav_target_wp.y)
+        if dist > NAV_CLOSE_ENOUGH_M:
+            return False
 
-        if status == RobotStatusEnum.DOCKING:
-            self._transition_status(RobotStatusEnum.DOCKING)
-
-        elif status == RobotStatusEnum.DONE_DOCKING:
-            self.get_logger().info('Docking complete')
-            self._transition_status(RobotStatusEnum.DONE_DOCKING)
-            self.docking_action_client.reset()
-            self.docking_retry_count = 0
-
-        elif status == RobotStatusEnum.ERROR:
-            self._handle_docking_retry()
-
-    def _handle_docking_retry(self):
-        """Retry dock_robot goal up to docking_max_retries, then ERROR."""
-        self.get_logger().error(f'Docking failed | retry {self.docking_retry_count + 1}/{self.docking_max_retries}')
-
-        if self.docking_retry_count < self.docking_max_retries:
-            self.docking_retry_count += 1
-            self.get_logger().info(
-                f'Retrying docking in {self.docking_retry_delay:.1f}s | '
-                f'attempt {self.docking_retry_count}/{self.docking_max_retries}'
+        heading_error = abs(_normalize_angle(robot_yaw - self.nav_target_wp.theta))
+        if heading_error > NAV_HEADING_TOL_RAD:
+            self.get_logger().warning(
+                f'Within {dist:.3f}m of target but heading is off by '
+                f'{math.degrees(heading_error):.1f}deg — not treating as arrived'
             )
-            time.sleep(self.docking_retry_delay)
-            self._retry_docking()
-        else:
-            self.get_logger().error(f'Docking failed after {self.docking_max_retries} retries — ERROR')
-            self.docking_action_client.reset()
-            self._transition_status(RobotStatusEnum.ERROR)
-            self.docking_retry_count = 0
+            return False
 
-    def _retry_docking(self):
-        """Re-send the dock_robot goal using the current subtask's DockGoal."""
-        if not self.current_sub_task:
-            self.get_logger().error('Docking retry failed — no current subtask')
+        return True
+
+    def _handle_drive(self) -> None:
+        """
+        Map DriveClient feedback onto the same MOVING / DESTINATION_REACHED pair
+        that Nav2 uses. Only acts while MOVING is owned by the drive client —
+        DriveClient sits in STOPPED through the whole harvest, so without this
+        guard the same stop would be handled on every tick.
+        """
+        if self.current_status != RobotStatusEnum.MOVING or self.motion_source != 'drive':
             return
 
-        if self.docking_action_client.send_docking_goal(self.current_sub_task):
+        feedback = self.drive_client.get_status()
+
+        if feedback.status in (feedback.CANCELED, feedback.ERROR):
+            self.get_logger().error(f'DriveClient reported status {feedback.status} during row traversal')
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
+        if feedback.status == feedback.ABORTED:
+            # ABORTED is DriveClient's own retry wait, not a failure: it returns to
+            # CONTROLLING after controlling_retry_delay and only escalates to ERROR
+            # once max_controlling_retries is spent. Treating it as fatal here would
+            # throw away every configured retry.
+            self.get_logger().info('DriveClient ABORTED — internal retry in progress', throttle_duration_sec=5.0)
+            return
+
+        if feedback.status != feedback.STOPPED:
+            return  # SCANNING / CONTROLLING / DEPARTING — keep waiting
+
+        if feedback.harvested_count == self.park_count_snapshot:
+            # Nothing new found since the snapshot — the row is finished.
+            # harvested_count is cumulative across rows, which is why the
+            # comparison is against a per-move snapshot rather than zero.
+            self.get_logger().info('No detection — row over')
+            self.drive_client.reset()
+            self.row_over = True
+            self._transition_status(RobotStatusEnum.DONE_HARVESTING)
+            return
+
+        self.bushes_visited += 1
+        self.harvest_retry_count = 0
+
+        # Row progress is recorded here, at the park, rather than after the
+        # harvest completes. An interrupt between parking and finishing the cut
+        # would otherwise resume from the row start and re-drive bushes already
+        # covered.
+        parked_pose = self._robot_pose_in_frame(NAV_FRAME)
+        if parked_pose is not None:
+            self.row_progress_pose = parked_pose
+        else:
+            self.get_logger().warning(
+                f"Parked at a bush but could not work out where in '{NAV_FRAME}' — "
+                'if this row is interrupted it will restart from the beginning'
+            )
+
+        self.get_logger().info(f'Parked at bush {self.bushes_visited} of this run')
+        self._transition_status(RobotStatusEnum.DESTINATION_REACHED)
+
+    def _handle_docking(self) -> None:
+        # Backoff between attempts, same reasoning as navigation: the client is
+        # left un-reset so this handler keeps being reached while it counts down.
+        if self.dock_retry_wait_ticks > 0:
+            self.dock_retry_wait_ticks -= 1
+            if self.dock_retry_wait_ticks == 0:
+                self.docking_action_client.reset()
+                self.dock_goal_sent = False
+                self.get_logger().info('Retrying docking now')
+                self._transition_status(RobotStatusEnum.START_DOCKING)
+            return
+
+        status = self.docking_action_client.get_status()
+
+        if status == RobotStatusEnum.DONE_DOCKING:
+            self.docking_action_client.reset()
+            self.dock_goal_sent = False
+            self.docking_retry_count = 0
+            self._transition_status(RobotStatusEnum.DONE_DOCKING)
+            return
+
+        if status in (RobotStatusEnum.START_DOCKING, RobotStatusEnum.DOCKING):
             self._transition_status(RobotStatusEnum.DOCKING)
-        else:
-            self.get_logger().error('Docking retry send_goal failed')
+            return
+
+        if status == RobotStatusEnum.IDLE:
+            return
+
+        if status != RobotStatusEnum.ERROR:
+            self.get_logger().error(
+                f'Docking reported {status.name}, which this node has no rule for '
+                '— treating it as a failure rather than waiting forever'
+            )
+            self.docking_action_client.reset()
+            self.dock_goal_sent = False
             self._transition_status(RobotStatusEnum.ERROR)
+            return
 
-    def _handle_undocking(self, robot_status: RobotStatus):
-        """
-        Monitor UndockingActionClient.
+        if self.docking_retry_count < MAX_DOCKING_RETRIES:
+            self.docking_retry_count += 1
+            self.dock_retry_wait_ticks = max(1, int(RETRY_DELAY_SEC / TIMER_PERIOD_SEC))
+            self.get_logger().warning(
+                f'Docking failed — waiting {RETRY_DELAY_SEC:.0f}s then retrying '
+                f'({self.docking_retry_count}/{MAX_DOCKING_RETRIES})'
+            )
+            return
 
-        Context-aware DONE_UNDOCKING:
-          startup context → startup_undock_complete=True, clear task IDs, → IDLE,
-                            send task trigger (request first task)
-          task context    → stay at DONE_UNDOCKING for _subtask_undocking → JOB_DONE
-        """
+        self.docking_action_client.reset()
+        self.dock_goal_sent = False
+        self.get_logger().error(f'Docking failed after {MAX_DOCKING_RETRIES} retries')
+        self._transition_status(RobotStatusEnum.ERROR)
+
+    def _handle_undocking(self) -> None:
         status = self.undocking_action_client.get_status()
-        feedback = self.undocking_action_client.get_feedback()
 
-        if feedback:
-            robot_status.task = feedback.task
-        else:
-            robot_status.task = 'Undocking in progress'
-
-        self.get_logger().debug(
-            f'Undocking handler | status={status.name} | startup_undock_complete={self.startup_undock_complete}'
-        )
-
-        if status == RobotStatusEnum.UNDOCKING:
-            self._transition_status(RobotStatusEnum.UNDOCKING)
-
-        elif status == RobotStatusEnum.DONE_UNDOCKING:
-            self.get_logger().info('Undocking complete')
-            self._transition_status(RobotStatusEnum.DONE_UNDOCKING)
+        if status == RobotStatusEnum.DONE_UNDOCKING:
             self.undocking_action_client.reset()
+            self.undock_goal_sent = False
+            self._transition_status(RobotStatusEnum.DONE_UNDOCKING)
+            return
 
-            if not self.startup_undock_complete:
-                self.get_logger().debug('Undocking DONE — startup context: → IDLE, sending task trigger')
-                self.startup_undock_complete = True
-                self.last_handled_task_id = None
-                self.last_handled_task_type = None
-                self._transition_status(RobotStatusEnum.IDLE)
-                self.get_logger().info('Startup undocking complete — requesting first task')
-                self._send_task_trigger()
-            else:
-                self.get_logger().debug(
-                    'Undocking DONE — task context: staying at DONE_UNDOCKING for _subtask_undocking'
-                )
+        if status in (RobotStatusEnum.START_UNDOCKING, RobotStatusEnum.UNDOCKING):
+            self._transition_status(RobotStatusEnum.UNDOCKING)
+            return
 
-        elif status == RobotStatusEnum.ERROR:
-            self._handle_undocking_retry()
+        if status == RobotStatusEnum.IDLE:
+            return
 
-    def _handle_undocking_retry(self):
-        """Undocking action failed — start ReverseDriveClient as fallback."""
+        if status != RobotStatusEnum.ERROR:
+            self.get_logger().error(
+                f'Undocking reported {status.name}, which this node has no rule '
+                'for — treating it as a failure rather than waiting forever'
+            )
+            self.undocking_action_client.reset()
+            self.undock_goal_sent = False
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
         self.undocking_action_client.reset()
+        self.undock_goal_sent = False
+        self._start_reverse_drive('Undocking action failed')
+
+    def _start_reverse_drive(self, reason: str) -> None:
+        """Undocking did not work — back out using the TF closed-loop drive instead."""
+        dock_name = self.active_dock.instance_name if self.active_dock else ''
+
+        if not self._may_start_motion('reverse'):
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
         self.get_logger().warning(
-            f'Undocking failed — starting reverse drive | '
-            f"dock='{self.active_dock.instance_name if self.active_dock else 'unknown'}'"
+            f"{reason} — reversing to the '{dock_name}' staging pose instead"
         )
 
-        if self.reverse_drive_client and self.reverse_drive_client.drive_to_staging():
-            self.reverse_drive_active = True
-            self._transition_status(RobotStatusEnum.UNDOCKING)
-        else:
-            self.get_logger().error(f'ReverseDriveClient refused to start — dock_backwards={self.dock_backwards}')
+        if not self.reverse_drive_client.drive_to_staging(dock_name):
+            self.get_logger().error(
+                f"Reverse drive refused to start for dock '{dock_name}' — "
+                'the robot cannot get clear on its own'
+            )
             self._transition_status(RobotStatusEnum.ERROR)
+            return
 
-    def _handle_reverse_drive(self, robot_status: RobotStatus):
-        """
-        Monitor ReverseDriveClient (fallback after undocking failure).
+        self.reverse_drive_active = True
+        self._transition_status(RobotStatusEnum.UNDOCKING)
 
-        Same context-aware logic as _handle_undocking for the DONE branch.
+    def _handle_align(self) -> None:
         """
-        robot_status.task = 'Reverse drive to staging pose'
+        Turn in place until the robot faces along the row, then hand over to the
+        camera drive.
+
+        Runs on the monitor tick rather than a timer of its own. At 5 Hz and
+        ALIGN_ANGULAR_MAX the robot turns about 1.7 deg per tick, comfortably
+        inside the 2.9 deg tolerance, so the coarse rate cannot overshoot the
+        gate — and an emergency stop pre-empts the turn like any other motion.
+        """
+        if self.current_status != RobotStatusEnum.MOVING or self.motion_source != 'align':
+            return
+
+        if self.align_target_theta is None:
+            self._publish_align_cmd(0.0)
+            self.align_active = False
+            self.get_logger().error('Asked to line up with the row but no heading was set')
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
+        robot_pose = self._robot_pose_in_frame(NAV_FRAME)
+        if robot_pose is None:
+            # Do not keep turning blind — hold still until TF comes back. The
+            # MOVING deadline catches it if it never does.
+            self._publish_align_cmd(0.0)
+            return
+
+        error = _normalize_angle(self.align_target_theta - robot_pose[2])
+
+        if abs(error) <= ALIGN_ANGULAR_TOL_RAD:
+            self._publish_align_cmd(0.0)
+            self.align_active = False
+            self.align_target_theta = None
+            self.get_logger().info(
+                f'Lined up with the row — facing {math.degrees(robot_pose[2]):.0f} degrees, '
+                f'{math.degrees(abs(error)):.1f} degrees off'
+            )
+            self.motion_source = 'drive'
+            self._transition_status(RobotStatusEnum.START_MOVING)
+            return
+
+        omega = max(-ALIGN_ANGULAR_MAX, min(ALIGN_ANGULAR_MAX, ALIGN_GAIN * error))
+        # A command below the base's own deadband turns nothing at all, so the
+        # last couple of degrees would never close.
+        if abs(omega) < ALIGN_ANGULAR_MIN:
+            omega = math.copysign(ALIGN_ANGULAR_MIN, omega)
+
+        self._publish_align_cmd(omega)
+        self.get_logger().info(
+            f'Turning onto the row — {math.degrees(error):.0f} degrees to go',
+            throttle_duration_sec=2.0,
+        )
+
+    def _publish_align_cmd(self, omega: float) -> None:
+        """Rotation-only velocity command. No linear component, ever."""
+        msg = TwistStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = BASE_FRAME
+        msg.twist.angular.z = omega
+        self.align_cmd_pub.publish(msg)
+
+    def _handle_reverse_drive(self) -> None:
         status = self.reverse_drive_client.get_status()
 
-        self.get_logger().debug(
-            f'Reverse drive handler | status={status.name} | startup_undock_complete={self.startup_undock_complete}'
-        )
-
-        if status == ReverseDriveStatus.REVERSING:
-            self._transition_status(RobotStatusEnum.UNDOCKING)
-
-        elif status == ReverseDriveStatus.DONE:
-            self.get_logger().info('Reverse drive complete — undocking done')
-            self.reverse_drive_active = False
+        if status == ReverseDriveStatus.DONE:
+            self.get_logger().info('Reverse drive complete')
             self.reverse_drive_client.reset()
-
-            if not self.startup_undock_complete:
-                self.get_logger().debug('Reverse drive DONE — startup context: → IDLE, sending task trigger')
-                self.startup_undock_complete = True
-                self.last_handled_task_id = None
-                self.last_handled_task_type = None
-                self._transition_status(RobotStatusEnum.DONE_UNDOCKING)
-                self._transition_status(RobotStatusEnum.IDLE)
-                self.get_logger().info('Startup undocking complete — requesting first task')
-                self._send_task_trigger()
-            else:
-                self.get_logger().debug('Reverse drive DONE — task context: DONE_UNDOCKING for _subtask_undocking')
-                self._transition_status(RobotStatusEnum.DONE_UNDOCKING)
-
-        elif status == ReverseDriveStatus.ERROR:
-            self.get_logger().error('Reverse drive failed — ERROR')
             self.reverse_drive_active = False
+            self._transition_status(RobotStatusEnum.DONE_UNDOCKING)
+            return
+
+        if status in (ReverseDriveStatus.ERROR, ReverseDriveStatus.CANCELED):
             self.reverse_drive_client.reset()
+            self.reverse_drive_active = False
+            self.get_logger().error('Reverse drive failed')
             self._transition_status(RobotStatusEnum.ERROR)
 
-        elif status == ReverseDriveStatus.CANCELED:
-            self.get_logger().warning('Reverse drive canceled — IDLE')
-            self.reverse_drive_active = False
-            self.reverse_drive_client.reset()
-            self._transition_status(RobotStatusEnum.IDLE)
-
-    def _handle_manipulator(self, robot_status: RobotStatus):
+    def _handle_manipulator(self) -> None:
         """
-        Monitor ManipulatorTaskActionClient for STOW, READY, or START_HARVEST goals.
-
-        Verbatim from husky_operations_manager.py:1226-1337.
-
-        Context-aware completion:
-          STOW confirmed in START_UNDOCKING   → re-enter _subtask_undocking
-          STOW confirmed in DONE_HARVESTING   → no-op (_subtask_harvesting picks up next tick)
-          READY confirmed in DESTINATION_REACHED → no-op (_subtask_harvesting picks up next tick)
-          Harvest complete (HARVESTING, no flags) → DONE_HARVESTING
-          ERROR → clear flags, reset, → ERROR
+        Resolve arm goals. The manipulator reports DONE_HARVESTING for every
+        command it completes — STOW, READY and START_HARVEST alike — so the
+        pending flags are what say which one just finished.
         """
-        arm_status = self.manipulator_client.get_status()
+        # STOW and READY always go to the real arm, so the gate that stops the
+        # robot driving with the arm out reflects where the arm actually is.
+        if self.arm_stow_pending:
+            self._resolve_arm_gate(self.manipulator_client.get_status(), ArmCommand.GO_STOW)
+            return
 
-        self.get_logger().debug(
-            f'Manipulator handler | arm_status={arm_status.name} | '
-            f'current_status={self.current_status.name} | '
-            f'arm_stow_pending={self.arm_stow_pending} | '
-            f'arm_ready_pending={self.arm_ready_pending} | '
-            f"last_confirmed_arm='{self.last_confirmed_arm_command}'"
+        if self.arm_ready_pending:
+            self._resolve_arm_gate(self.manipulator_client.get_status(), ArmCommand.GO_READY)
+            return
+
+        if self.current_status != RobotStatusEnum.HARVESTING:
+            return
+
+        status = (
+            self._sim_harvest_status() if SIMULATE_HARVEST
+            else self.manipulator_client.get_status()
         )
 
-        # ---- STOW completion ----
-        if self.arm_stow_pending and arm_status == RobotStatusEnum.DONE_HARVESTING:
-            self.get_logger().info(f'Arm STOW confirmed | context={self.current_status.name}')
+        if status == RobotStatusEnum.ERROR:
+            self.manipulator_client.reset()
+            if self.harvest_retry_count < MAX_HARVEST_RETRIES:
+                self.harvest_retry_count += 1
+                self.get_logger().warning(
+                    f'Harvest failed — retrying ({self.harvest_retry_count}/{MAX_HARVEST_RETRIES})'
+                )
+                self._transition_status(RobotStatusEnum.START_HARVESTING)
+                return
+            self.get_logger().error(f'Harvest failed after {MAX_HARVEST_RETRIES} retries')
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
+        if status != RobotStatusEnum.DONE_HARVESTING:
+            return  # still in flight
+
+        if not SIMULATE_HARVEST:
+            self.manipulator_client.reset()
+
+        self.bushes_harvested += 1
+        # SIMULATED: nothing weighs the bin. This assumed increment is what
+        # triggers the unload interrupt.
+        self.current_load_status = min(self.current_load_status + LOAD_INCREMENT, 100.0)
+
+        # A finished bush is real progress, so the recovery budget starts over.
+        self._note_progress()
+
+        self.get_logger().info(
+            f'Harvest done | {self.bushes_harvested} bushes cut so far | '
+            f'load now {self.current_load_status:.0f}% (estimated, nothing weighs the bin)'
+        )
+        self._transition_status(RobotStatusEnum.DONE_HARVESTING)
+
+    def _sim_harvest_status(self) -> RobotStatusEnum:
+        """
+        Stand in for the cut cycle when no START_HARVEST goal was sent.
+
+        Counted in monitor ticks rather than on a timer of its own. A separate
+        ROS timer would keep running through an emergency stop and then report a
+        finished harvest from whatever state the robot had moved into; counting
+        ticks here means the stop pre-empts the wait by construction.
+        """
+        self.sim_harvest_ticks += 1
+        remaining = SIM_HARVEST_SEC - self.sim_harvest_ticks * TIMER_PERIOD_SEC
+
+        if remaining > 0:
+            self.get_logger().info(
+                f'Pretending to harvest — {remaining:.0f}s left',
+                throttle_duration_sec=5.0,
+            )
+            return RobotStatusEnum.HARVESTING
+
+        self.sim_harvest_ticks = 0
+        return RobotStatusEnum.DONE_HARVESTING
+
+    def _note_progress(self) -> None:
+        """
+        Clear the recovery budget after something actually went right.
+
+        The budget exists to stop the node driving into the same fault forever.
+        Counting it across a whole farm run instead would halt a healthy robot
+        after three unrelated hiccups hours apart.
+        """
+        if self.recovery_attempts:
+            self.get_logger().info(
+                f'Progress made — clearing {self.recovery_attempts} earlier '
+                'recovery attempt(s)'
+            )
+        self.recovery_attempts = 0
+
+    def _resolve_arm_gate(self, status: RobotStatusEnum, target: str) -> None:
+        if status == RobotStatusEnum.DONE_HARVESTING:
+            self.manipulator_client.reset()
+            self.last_confirmed_arm_command = target
             self.arm_stow_pending = False
-            self.last_confirmed_arm_command = ArmCommand.GO_STOW
-            self.manipulator_client.reset()
-
-            if self.current_status == RobotStatusEnum.START_UNDOCKING:
-                self.get_logger().debug('STOW confirmed in START_UNDOCKING — re-entering _subtask_undocking')
-                self._subtask_undocking()
-            elif self.current_status == RobotStatusEnum.DONE_HARVESTING:
-                self.get_logger().debug(
-                    'STOW confirmed in DONE_HARVESTING — _subtask_harvesting will advance to JOB_DONE on next tick'
-                )
-            else:
-                self.get_logger().warning(
-                    f'STOW confirmed in unexpected context={self.current_status.name} — no action taken'
-                )
-
-        # ---- READY completion ----
-        elif self.arm_ready_pending and arm_status == RobotStatusEnum.DONE_HARVESTING:
-            self.get_logger().info(f'Arm READY confirmed | context={self.current_status.name}')
             self.arm_ready_pending = False
-            self.last_confirmed_arm_command = ArmCommand.GO_READY
+            self.get_logger().info(f'Arm {target} confirmed')
+            return
+
+        if status == RobotStatusEnum.ERROR:
             self.manipulator_client.reset()
+            self.arm_stow_pending = False
+            self.arm_ready_pending = False
+            self.get_logger().error(f'Arm {target} goal failed')
+            self._transition_status(RobotStatusEnum.ERROR)
 
-            if self.current_status == RobotStatusEnum.DESTINATION_REACHED:
-                self.get_logger().debug(
-                    'READY confirmed in DESTINATION_REACHED — '
-                    '_subtask_harvesting will advance to START_HARVESTING on next tick'
-                )
-            else:
-                self.get_logger().warning(
-                    f'READY confirmed in unexpected context={self.current_status.name} — no action taken'
-                )
+    def _ensure_arm(self, target: str) -> bool:
+        """
+        Idempotent arm gate. Returns True only when `target` is confirmed.
 
-        # ---- Harvest completion (START_HARVEST goal succeeded) ----
-        elif (
-            not self.arm_stow_pending
-            and not self.arm_ready_pending
-            and arm_status == RobotStatusEnum.DONE_HARVESTING
-            and self.current_status == RobotStatusEnum.HARVESTING
+        Safe to call on every tick: it sends one goal, then reports False until
+        _handle_manipulator resolves it.
+        """
+        if self.last_confirmed_arm_command == target:
+            return True
+
+        if self.arm_stow_pending or self.arm_ready_pending:
+            return False  # already sent, waiting on _handle_manipulator
+
+        if not self._require_server(
+            'the arm (manipulator_action_server)', self.manipulator_client.client
         ):
-            self.get_logger().info('Harvest goal complete — transitioning to DONE_HARVESTING')
-            self.manipulator_client.reset()
-            self._transition_status(RobotStatusEnum.DONE_HARVESTING)
+            return False
 
-        # ---- ERROR ----
-        elif arm_status == RobotStatusEnum.ERROR:
+        # An arm gate is not part of the task a server would send — it is this
+        # node's own safety move before driving — so it gets its own subtask
+        # rather than borrowing the task's harvesting one.
+        subtask = self._new_subtask(SubTask.HARVESTING, f'Arm gate: {target}')
+
+        if target == ArmCommand.GO_STOW:
+            sent = self.manipulator_client.send_stow_goal(subtask)
+            self.arm_stow_pending = sent
+        else:
+            sent = self.manipulator_client.send_ready_goal(subtask)
+            self.arm_ready_pending = sent
+
+        if not sent:
             self.get_logger().error(
-                f'Arm command failed | context={self.current_status.name} | '
-                f'stow_pending={self.arm_stow_pending} | '
-                f'ready_pending={self.arm_ready_pending}'
+                f"Could not ask the arm to '{target}' — is the manipulator action "
+                'server running? Not moving until the arm answers.'
             )
-            self.arm_stow_pending = False
-            self.arm_ready_pending = False
-            self.manipulator_client.reset()
             self._transition_status(RobotStatusEnum.ERROR)
+            return False
+
+        self.get_logger().info(f"Asked the arm to '{target}' — waiting for it")
+        return False
 
     # =========================================================================
-    # ERROR HANDLING
+    # TASK EXECUTION
     # =========================================================================
 
-    def _handle_error_recovery(self):
-        """Cancel navigation and arm goals, reset subtask state, → IDLE."""
-        if self.current_status not in [RobotStatusEnum.ERROR, RobotStatusEnum.ABNORMAL]:
+    def _handle_task_execution(self) -> None:
+        """
+        Run after the boot sequence finishes.
+
+          1. Poll the action clients so async results land on the tick they arrive
+          2. IDLE / JOB_DONE -> pick the next task
+          3. anything else   -> run the current task's handler
+        """
+        self._process_action_clients()
+
+        if self.current_status in (RobotStatusEnum.IDLE, RobotStatusEnum.JOB_DONE):
+            self._handle_task_start()
             return
 
-        self.get_logger().warning(
-            f'Error recovery | status={self.current_status.name} | '
-            f'task_id={self.last_handled_task_id} | '
-            f'subtask_type={self.last_handled_subtask_type}'
-        )
+        handler = {
+            TaskEnum.HARVESTING_TASK: self._task_harvesting,
+            TaskEnum.CHARGING_TASK: self._task_charging,
+            TaskEnum.UNLOADING_TASK: self._task_unloading,
+        }.get(self.current_task_type)
 
-        nav_status = self.navigation.get_navigation_status()
-        if nav_status in [NavigationStatus.ACTIVE, NavigationStatus.ACCEPTED]:
-            self.get_logger().info('Cancelling active navigation during error recovery')
-            try:
-                self.navigation.cancel_goal()
-                time.sleep(self.navigation_retry_delay)
-            except Exception as e:
-                self.get_logger().warning(f'Navigation cancel raised exception: {e}')
+        if handler:
+            handler()
+        else:
+            self.get_logger().warning(f'No handler for task type: {self.current_task_type}')
 
-        self.arm_stow_pending = False
-        self.arm_ready_pending = False
-        self.manipulator_client.reset()
-
-        self.current_sub_task = None
-        self.current_sub_task_index = 0
-        self.get_logger().debug('Error recovery — reset subtask state, → IDLE')
-        self._transition_status(RobotStatusEnum.IDLE)
-
-    def _cancel_all_motion(self):
-        """Cancel navigation, DriveClient, and manipulator. Clear arm pending flags."""
-        nav_status = self.navigation.get_navigation_status()
-        if nav_status in [NavigationStatus.ACTIVE, NavigationStatus.ACCEPTED]:
-            self.navigation.cancel_goal()
-
-        if self.drive_client.is_active():
-            self.drive_client.cancel()
-
-        if self.manipulator_client.get_status() == RobotStatusEnum.HARVESTING:
-            self.manipulator_client.cancel_goal()
-
-        self.arm_stow_pending = False
-        self.arm_ready_pending = False
-
-    # =========================================================================
-    # SUBTASK HANDLERS
-    # =========================================================================
-
-    def _subtask_moving(self):
+    def _handle_task_start(self) -> None:
         """
-        Dual-mode navigation subtask.
+        Pick the next task. This is the internal sequencer that stands in for the
+        JobPublisher the production node subscribes to.
 
-        JOB_START:
-          HARVESTING and _need_row_navigation=False → DESTINATION_REACHED (skip Nav2)
-          Otherwise → START_MOVING (Nav2 path)
-
-        DESTINATION_REACHED:
-          HARVESTING_TASK → start DriveClient, → MOVING
-          CHARGING/UNLOADING → task interruption: cancel, trigger server, → IDLE
-
-        MOVING (DriveClient active):
-          STOPPED + detection → advance subtask, → DESTINATION_REACHED
-          STOPPED + no detection → row end; _need_row_navigation=True, trigger, → JOB_DONE
-          CANCELED/ERROR → ERROR
+        Priority: low battery, then full load, then whatever the farm needs next.
         """
-        if not self.current_task:
+        if self.farm_exhausted and self.current_task_type == TaskEnum.UNLOADING_TASK:
+            self._finish_run()
             return
 
-        task_type = self.current_task.task_type
+        if self._battery_is_low():
+            self.get_logger().warning(
+                f'Battery down to {self._battery_pct():.0f}% — going to charge first'
+            )
+            self._start_task(TaskEnum.CHARGING_TASK)
+            return
 
-        self.get_logger().debug(
-            f'_subtask_moving | status={self.current_status.name} | '
-            f'task_type={task_type} | '
-            f'_need_row_navigation={self._need_row_navigation}'
+        if self.current_load_status >= 100.0:
+            self.get_logger().warning('Load full (simulated) — unloading before continuing')
+            self._start_task(TaskEnum.UNLOADING_TASK)
+            return
+
+        if self.farm_exhausted:
+            self.get_logger().info('All rows attempted — final unload')
+            self._start_task(TaskEnum.UNLOADING_TASK)
+            return
+
+        self._start_task(TaskEnum.HARVESTING_TASK)
+
+    def _start_task(self, task_type: TaskEnum) -> None:
+        self.current_task_type = task_type
+        self.current_task = self._build_task(task_type)
+        self.docking_retry_count = 0
+        self.navigation_retry_count = 0
+
+        steps = ' then '.join(
+            SUB_TASK_NAMES.get(sub.type, str(sub.type))
+            for sub in self.current_task.sub_tasks
+        )
+        self.get_logger().info(
+            f'Task {self.current_task.task_id}: {self.current_task.description} '
+            f'({steps})'
+        )
+        self._transition_status(RobotStatusEnum.JOB_START)
+
+    def _build_task(self, task_type: TaskEnum) -> Task:
+        """
+        Compose the Task to run next.
+
+        This is the stand-in for the task server. When tasks start arriving from
+        outside, this method is what a subscription replaces — everything
+        downstream already reads the Task message rather than making up its own
+        goals.
+        """
+        task_id = self.next_task_id
+        self.next_task_id += 1
+
+        if task_type == TaskEnum.HARVESTING_TASK:
+            row = ROWS[self.row_index]
+            sub_tasks = [
+                self._new_subtask(
+                    SubTask.MOVING,
+                    f'Drive to row {self.row_index}',
+                    waypoints=self._nav_waypoints(self._next_nav_target()),
+                ),
+                self._new_subtask(SubTask.HARVESTING, f'Harvest the bushes in row {self.row_index}'),
+            ]
+            return _make_task(
+                task_id, task_type, f'Harvest row {self.row_index}',
+                sub_tasks, self.current_load_status, target_node_id=row[0],
+            )
+
+        charging = task_type == TaskEnum.CHARGING_TASK
+        dock_name = CHARGING_DOCK_NAME if charging else UNLOADING_DOCK_NAME
+        dock = DOCK_CONFIGS[dock_name]
+        middle_type = SubTask.CHARGING if charging else SubTask.UNLOADING
+        description = 'Charge the battery' if charging else 'Empty the bin'
+
+        sub_tasks = [
+            self._new_subtask(
+                SubTask.DOCKING, f'Dock at {dock_name}',
+                dock_goal=_make_dock_goal(dock_name),
+            ),
+            self._new_subtask(middle_type, description),
+            self._new_subtask(
+                SubTask.UNDOCKING, f'Undock from {dock_name}',
+                undock_goal=_make_undock_goal(dock.type, _max_undocking_time()),
+            ),
+        ]
+        return _make_task(
+            task_id, task_type, description, sub_tasks, self.current_load_status,
         )
 
+    def _new_subtask(
+        self,
+        sub_task_type: int,
+        description: str,
+        waypoints: list[WayPoint] | None = None,
+        dock_goal: DockGoal | None = None,
+        undock_goal: UndockGoal | None = None,
+    ) -> SubTask:
+        """Build a SubTask with the next id in sequence."""
+        sub_task_id = self.next_sub_task_id
+        self.next_sub_task_id += 1
+        return _make_subtask(
+            sub_task_id, sub_task_type, description, waypoints, dock_goal, undock_goal
+        )
+
+    def _subtask_of(self, sub_task_type: int) -> SubTask | None:
+        """The current task's subtask of that type, or None if there isn't one."""
+        if self.current_task is None:
+            return None
+        for subtask in self.current_task.sub_tasks:
+            if subtask.type == sub_task_type:
+                return subtask
+        return None
+
+    def _nav_waypoints(self, target: WayPoint) -> list[WayPoint]:
+        """
+        Two-waypoint list for a navigation subtask.
+
+        NavigationActionClient throws away index 0's x/y and substitutes the
+        robot's live position, so only the last entry has to be a real target.
+        Its heading is copied onto the placeholder so both agree.
+        """
+        return [_make_waypoint(-1, 0.0, 0.0, target.theta), target]
+
+    def _finish_run(self) -> None:
+        self.get_logger().info(
+            '\n══════════════════════════════════════════════\n'
+            '  Farm run complete\n'
+            f'  bushes_visited={self.bushes_visited} bushes_harvested={self.bushes_harvested}\n'
+            '══════════════════════════════════════════════'
+        )
+        self.run_complete = True
+        self._transition_status(RobotStatusEnum.JOB_DONE)
+        rclpy.shutdown()
+
+    # =========================================================================
+    # TASK: HARVESTING
+    # =========================================================================
+
+    def _task_harvesting(self) -> None:
+        """
+        One row, bush by bush.
+
+          JOB_START           -> nav to the row start (or back to the last bush)
+          START_MOVING        -> issue the Nav2 goal, or scan()/resume()
+          MOVING              -> owned by _handle_navigation / _handle_drive
+          DESTINATION_REACHED -> 'nav': arm READY then scan()
+                                 'drive': parked at a bush, harvest it
+          START_HARVESTING    -> send START_HARVEST
+          HARVESTING          -> owned by _handle_manipulator
+          DONE_HARVESTING     -> stow and end the row, or move to the next bush
+        """
         if self.current_status == RobotStatusEnum.JOB_START:
-            if task_type == Task.HARVESTING_TASK and not self._need_row_navigation:
-                # Skip Nav2 — DriveClient resumes the current row
-                self.get_logger().info(
-                    'HARVESTING + _need_row_navigation=False — skipping Nav2, proceeding directly to DriveClient'
-                )
-                self._transition_status(RobotStatusEnum.DESTINATION_REACHED)
-            else:
+            # Nav2 drives the base, so the arm must be stowed before it starts —
+            # the same gate charging and unloading already use. It used to hold
+            # here only by accident of the order the states happen to run in.
+            if not self._ensure_arm(ArmCommand.GO_STOW):
+                return
+
+            self.row_over = False
+            self.motion_source = 'nav'
+            self.nav_target_wp = self._next_nav_target()
+            self.nav_goal_sent = False
+            resuming = 'resuming at' if self.row_progress_pose is not None else 'starting at'
+            self.get_logger().info(
+                f'Row {self.row_index} — {resuming} '
+                f'({self.nav_target_wp.x:.3f}, {self.nav_target_wp.y:.3f}), '
+                f'facing {math.degrees(self.nav_target_wp.theta):.0f} degrees'
+            )
+            self._transition_status(RobotStatusEnum.START_MOVING)
+            return
+
+        if self.current_status == RobotStatusEnum.START_MOVING:
+            self._start_move()
+            return
+
+        if self.current_status == RobotStatusEnum.DESTINATION_REACHED:
+            if not self._ensure_arm(ArmCommand.GO_READY):
+                return
+
+            if self.motion_source == 'nav':
+                # At the row start. Set the row heading before the first scan —
+                # the single choke point every path funnels through.
+                row_theta = _row_heading(ROWS[self.row_index])
+                self.drive_client.set_bushrow_theta(row_theta)
+                # Turn onto that heading before scanning. Nav2 arrives on
+                # position, and SCANNING drives straight along whatever heading
+                # the robot is left holding.
+                self.align_target_theta = row_theta
+                self.pending_move = 'scan'
+                self.motion_source = 'align'
                 self._transition_status(RobotStatusEnum.START_MOVING)
-
-        elif self.current_status == RobotStatusEnum.START_MOVING:
-            if self.navigation.is_navigation_active():
-                self.get_logger().warning(
-                    f'Navigation send skipped — already active | '
-                    f'nav_status={self.navigation.get_navigation_status().name}'
-                )
                 return
-            self.get_logger().info(f'Starting navigation: {self.current_node_id} → {self.current_task.target_node_id}')
-            if self.navigation.send_goal(self.current_task):
-                self._transition_status(RobotStatusEnum.MOVING)
-            else:
-                self.get_logger().error(f'Failed to send navigation goal | task_id={self.current_task.task_id}')
-                self._transition_status(RobotStatusEnum.ERROR)
 
-        elif self.current_status == RobotStatusEnum.DESTINATION_REACHED:
-            if task_type == Task.HARVESTING_TASK:
-                # --- Start DriveClient for row traversal ---
-                self._need_row_navigation = False
-                drive_status = self.drive_client.get_status()
-                if drive_status == DriveStatus.STOPPED:
-                    self.get_logger().info('Resuming DriveClient from STOPPED (depart from bush)')
-                    self.drive_client.resume()
-                else:
-                    self.get_logger().info('Starting DriveClient scan (fresh row start)')
-                    self.drive_client.scan()
-                self._detection_received = False
-                self.last_detection_time = self.get_clock().now().nanoseconds / 1e9
-                self._transition_status(RobotStatusEnum.MOVING)
-
-            else:
-                # --- CHARGING or UNLOADING: task interruption ---
-                self.get_logger().info(
-                    f'DESTINATION_REACHED for task_type={task_type} (CHARGING/UNLOADING) — task interruption'
-                )
-                self._cancel_all_motion()
-                self._send_task_trigger()
-                # Reset so server's response is treated as a fresh task
-                self.last_handled_task_id = None
-                self.last_handled_task_type = None
-                self.current_task = None
-                self.current_sub_task = None
-                self.current_sub_task_index = 0
-                self._transition_status(RobotStatusEnum.IDLE)
-
-        elif self.current_status == RobotStatusEnum.MOVING:
-            # DriveClient is active — check its status
-            drive_status = self.drive_client.get_status()
-
-            self.get_logger().debug(
-                f'DriveClient | drive_status={drive_status.name} | _detection_received={self._detection_received}'
-            )
-
-            if drive_status in (DriveStatus.SCANNING, DriveStatus.DEPARTING):
-                pass  # Still moving — wait
-
-            elif drive_status == DriveStatus.STOPPED:
-                if self._detection_received:
-                    # Bush detected — advance to next subtask (HARVESTING)
-                    self.get_logger().info('Drive stopped at bush — advancing to HARVESTING subtask')
-                    self.current_sub_task_index += 1
-                    self._transition_status(RobotStatusEnum.DESTINATION_REACHED)
-                else:
-                    # No detection — row end
-                    self.get_logger().info('Drive stopped without detection — row end, requesting next task')
-                    self._need_row_navigation = True
-                    self.drive_client.reset()
-                    self._send_task_trigger()
-                    self._transition_status(RobotStatusEnum.JOB_DONE)
-
-            elif drive_status in (DriveStatus.CANCELED, DriveStatus.ERROR):
-                self.get_logger().error(f'DriveClient error/canceled | drive_status={drive_status.name}')
-                self._transition_status(RobotStatusEnum.ERROR)
-
-    def _subtask_docking(self):
-        """
-        Handle the DOCKING subtask.
-
-        DESTINATION_REACHED → START_DOCKING → 1s delay → send dock_robot → DOCKING
-        """
-        dock_id = (
-            self.current_sub_task.dock_goal.dock_id
-            if self.current_sub_task and self.current_sub_task.dock_goal
-            else 'None'
-        )
-        self.get_logger().debug(f"_subtask_docking | status={self.current_status.name} | dock_id='{dock_id}'")
-
-        if self.current_status == RobotStatusEnum.DESTINATION_REACHED:
-            self._transition_status(RobotStatusEnum.START_DOCKING)
-
-        elif self.current_status == RobotStatusEnum.START_DOCKING:
-            self.get_logger().info('Started docking')
-            time.sleep(1.0)
-            if self.docking_action_client.send_docking_goal(self.current_sub_task):
-                self._transition_status(RobotStatusEnum.DOCKING)
-            else:
-                self.get_logger().error(
-                    f'Failed to send docking goal | '
-                    f"subtask='{self.current_sub_task.description if self.current_sub_task else 'None'}'"
-                )
-                self._transition_status(RobotStatusEnum.ERROR)
-
-    def _subtask_undocking(self):
-        """
-        Handle the UNDOCKING subtask (called from charging, unloading, startup, or standalone).
-
-        Arm safety gate at START_UNDOCKING:
-          Arm must be confirmed STOW before the undocking goal is sent.
-          If not: send STOW goal, arm_stow_pending=True, return.
-          _handle_manipulator re-enters this method once STOW is confirmed.
-
-        START_UNDOCKING → (STOW gate) → send undock_robot → UNDOCKING
-        DONE_UNDOCKING  → clear state → JOB_DONE
-        """
-        self.get_logger().debug(
-            f'_subtask_undocking | status={self.current_status.name} | '
-            f'last_undocking_subtask={"set" if self.last_undocking_subtask else "None"} | '
-            f'undocking_after_task_type={self.undocking_after_task_type} | '
-            f"last_confirmed_arm='{self.last_confirmed_arm_command}' | "
-            f'arm_stow_pending={self.arm_stow_pending}'
-        )
-
-        if self.current_status == RobotStatusEnum.START_UNDOCKING:
-            # ---- Arm safety gate ----
-            if self.last_confirmed_arm_command != ArmCommand.GO_STOW:
-                if not self.arm_stow_pending:
-                    self.get_logger().info(
-                        f"Arm not in STOW (last='{self.last_confirmed_arm_command}') — sending STOW before undocking"
-                    )
-                    undock_ref = self.current_sub_task or self.last_undocking_subtask
-                    if self.manipulator_client.send_stow_goal(undock_ref):
-                        self.arm_stow_pending = True
-                    else:
-                        self.get_logger().error('Failed to send STOW goal before undocking — ERROR')
-                        self._transition_status(RobotStatusEnum.ERROR)
-                else:
-                    self.get_logger().debug('Arm STOW already in progress — waiting before undocking')
-                return  # Hold at START_UNDOCKING until STOW confirmed
-
-            # ---- Arm confirmed STOW — proceed ----
-            self.get_logger().info('Starting undocking — arm confirmed STOW')
-
-            undock_subtask = self.current_sub_task if self.current_sub_task else self.last_undocking_subtask
-            dock_type = (
-                undock_subtask.undock_goal.dock_type if undock_subtask and undock_subtask.undock_goal else 'None'
-            )
-            self.get_logger().debug(
-                f'Undocking subtask | '
-                f'source={"current_sub_task" if self.current_sub_task else "last_undocking_subtask"} | '
-                f"dock_type='{dock_type}'"
-            )
-
-            if self.undocking_action_client.send_undocking_goal(undock_subtask):
-                self._transition_status(RobotStatusEnum.UNDOCKING)
-            else:
-                self.get_logger().error(
-                    f'Failed to send undocking goal | undocking_after_task_type={self.undocking_after_task_type}'
-                )
-                self._transition_status(RobotStatusEnum.ERROR)
-
-        elif self.current_status == RobotStatusEnum.DONE_UNDOCKING:
-            self.get_logger().info('Undocking done')
-            self.last_undocking_subtask = None
-            self.undocking_after_task_type = None
-            self._transition_status(RobotStatusEnum.JOB_DONE)
-
-    def _subtask_harvesting(self):
-        """
-        Handle the HARVESTING subtask using ManipulatorTaskActionClient.
-
-        DESTINATION_REACHED → READY gate → START_HARVESTING → HARVESTING
-          → (via _handle_manipulator) → DONE_HARVESTING
-          → STOW gate → JOB_DONE
-
-        Arm gates mirror husky_operations_manager.py exactly.
-        """
-        self.get_logger().debug(
-            f'_subtask_harvesting | status={self.current_status.name} | '
-            f'arm_ready_pending={self.arm_ready_pending} | '
-            f'arm_stow_pending={self.arm_stow_pending} | '
-            f"last_confirmed_arm='{self.last_confirmed_arm_command}'"
-        )
-
-        if self.current_status == RobotStatusEnum.DESTINATION_REACHED:
-            # ---- READY gate ----
-            if self.last_confirmed_arm_command != ArmCommand.GO_READY:
-                if not self.arm_ready_pending:
-                    self.get_logger().info(
-                        f"Arm not in READY (last='{self.last_confirmed_arm_command}') — sending READY before harvesting"
-                    )
-                    if self.manipulator_client.send_ready_goal(self.current_sub_task):
-                        self.arm_ready_pending = True
-                    else:
-                        self.get_logger().error('Failed to send READY goal before harvesting — ERROR')
-                        self._transition_status(RobotStatusEnum.ERROR)
-                else:
-                    self.get_logger().debug('Arm READY already in progress — waiting')
-                return  # Hold at DESTINATION_REACHED until READY confirmed
-
-            # Arm confirmed READY — proceed to harvesting
             self._transition_status(RobotStatusEnum.START_HARVESTING)
+            return
 
-        elif self.current_status == RobotStatusEnum.START_HARVESTING:
-            if self.manipulator_client.get_status() == RobotStatusEnum.HARVESTING:
-                self.get_logger().warning('Harvest goal send skipped — manipulator already active')
-                return
-            self.get_logger().info('Sending harvest goal to manipulator')
-            if self.manipulator_client.send_harvesting_goal(self.current_sub_task):
-                self._transition_status(RobotStatusEnum.HARVESTING)
-            else:
-                self.get_logger().error('Failed to send harvest goal — ERROR')
-                self._transition_status(RobotStatusEnum.ERROR)
-
-        elif self.current_status == RobotStatusEnum.HARVESTING:
-            # Result handled asynchronously by _handle_manipulator → DONE_HARVESTING
-            self.get_logger().debug('Harvesting in progress — waiting for manipulator result')
-
-        elif self.current_status == RobotStatusEnum.DONE_HARVESTING:
-            # ---- STOW gate (guarded with arm_stow_pending to prevent re-increment) ----
-            if not self.arm_stow_pending and self.last_confirmed_arm_command != ArmCommand.GO_STOW:
-                new_load = min(self.current_load_status + self.loading_increment, 100.0)
-                self.get_logger().debug(
-                    f'Load update | {self.current_load_status:.1f}% → {new_load:.1f}% (+{self.loading_increment:.1f}%)'
+        if self.current_status == RobotStatusEnum.START_HARVESTING:
+            if SIMULATE_HARVEST:
+                self.sim_harvest_ticks = 0
+                self.get_logger().warning(
+                    f'No harvest goal sent (simulated) — pretending to cut for '
+                    f'{SIM_HARVEST_SEC:.0f}s'
                 )
-                self.current_load_status = new_load
-                self.get_logger().info(f'Load status: {self.current_load_status:.1f}%')
+                self._transition_status(RobotStatusEnum.HARVESTING)
+                return
 
-                self.get_logger().info('Harvesting done — sending arm to STOW')
-                if self.manipulator_client.send_stow_goal(self.current_sub_task):
-                    self.arm_stow_pending = True
-                else:
-                    self.get_logger().error('Failed to send STOW goal after harvesting — ERROR')
-                    self._transition_status(RobotStatusEnum.ERROR)
-                return  # Hold until STOW confirmed
+            if not self._require_server(
+                'the arm (manipulator_action_server)', self.manipulator_client.client
+            ):
+                return
 
-            # STOW confirmed — advance to JOB_DONE
-            if self.last_confirmed_arm_command == ArmCommand.GO_STOW and not self.arm_stow_pending:
-                self.get_logger().info('Arm stowed after harvest — transitioning to JOB_DONE')
-                self._transition_status(RobotStatusEnum.JOB_DONE)
+            subtask = self._subtask_of(SubTask.HARVESTING)
+            if subtask is None:
+                subtask = self._new_subtask(SubTask.HARVESTING, 'Executing harvest sequence')
+            if not self.manipulator_client.send_harvesting_goal(subtask):
+                self.get_logger().error(
+                    'Could not ask the arm to harvest — is the manipulator action '
+                    'server running?'
+                )
+                self._transition_status(RobotStatusEnum.ERROR)
+                return
+            self._transition_status(RobotStatusEnum.HARVESTING)
+            return
 
-    def _subtask_charging(self):
-        """
-        Handle the CHARGING subtask.
+        if self.current_status == RobotStatusEnum.DONE_HARVESTING:
+            self._after_harvest()
 
-        DONE_DOCKING → START_CHARGING → CHARGING (poll battery) → DONE_CHARGING
-        → store undocking subtask → START_UNDOCKING → _subtask_undocking → JOB_DONE
-        """
-        battery_pct = self._normalize_battery(self.battery_status.percentage)
-        self.get_logger().debug(
-            f'_subtask_charging | status={self.current_status.name} | '
-            f'battery={battery_pct:.1f}% | full_threshold={self.battery_full_threshold}%'
+    def _start_move(self) -> None:
+        """Issue whichever motion the current motion_source owns."""
+        if self.motion_source == 'nav':
+            if self.nav_goal_sent:
+                return
+            if self.navigation.is_navigation_active():
+                self.get_logger().warning('Navigation send skipped — already active')
+                return
+            if not self._may_start_motion('nav'):
+                self._transition_status(RobotStatusEnum.ERROR)
+                return
+            if not self._require_server(
+                'Nav2 (NavigateThroughPoses)', self.navigation.client
+            ):
+                return
+            if not self._send_nav_goal():
+                self.get_logger().error(
+                    'Could not send the navigation goal — is Nav2 running?'
+                )
+                self._transition_status(RobotStatusEnum.ERROR)
+                return
+            self.nav_goal_sent = True
+            self._transition_status(RobotStatusEnum.MOVING)
+            return
+
+        if self.motion_source == 'align':
+            if not self._may_start_motion('align'):
+                self._transition_status(RobotStatusEnum.ERROR)
+                return
+            self.align_active = True
+            self.get_logger().info(
+                f'Turning to face along row {self.row_index} '
+                f'({math.degrees(self.align_target_theta or 0.0):.0f} degrees)'
+            )
+            self._transition_status(RobotStatusEnum.MOVING)
+            return
+
+        not_ready: list[str] = []
+        if not self.drive_client.is_ready():
+            not_ready.append(f'robot pose TF ({ODOM_FRAME} -> {BASE_FRAME})')
+        if not self.drive_client.is_camera_tf_ready():
+            not_ready.append('camera TF')
+        if not_ready:
+            self.get_logger().info(
+                f'Camera drive not ready yet — waiting for {" and ".join(not_ready)}',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        if not self._may_start_motion('drive'):
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
+        # Snapshot before starting: harvested_count is cumulative across rows, so
+        # "did we find a new bush" is only meaningful against this baseline.
+        self.park_count_snapshot = self.drive_client.get_status().harvested_count
+
+        if self.pending_move == 'scan':
+            self.drive_client.scan()
+        else:
+            # resume() departs and re-enters SCANNING on its own — do not also
+            # call scan() here (drive.py ends DEPARTING with scan()).
+            self.drive_client.resume()
+
+        self._transition_status(RobotStatusEnum.MOVING)
+
+    def _after_harvest(self) -> None:
+        """Row over, interrupt needed, or straight on to the next bush."""
+        if self.row_over:
+            if not self._ensure_arm(ArmCommand.GO_STOW):
+                return
+            self._advance_row()
+            return
+
+        if self._battery_is_low() or self.current_load_status >= 100.0:
+            if not self._ensure_arm(ArmCommand.GO_STOW):
+                return
+            why = 'battery low' if self._battery_is_low() else 'bin full'
+            self.get_logger().info(f'Pausing this row — {why}')
+            self._transition_status(RobotStatusEnum.JOB_DONE)
+            return
+
+        self.pending_move = 'resume'
+        self.motion_source = 'drive'
+        self._transition_status(RobotStatusEnum.START_MOVING)
+
+    def _advance_row(self) -> None:
+        next_index = self.row_index + 1
+        self.row_progress_pose = None
+        self.row_over = False
+
+        # A finished row is real progress, so the recovery budget starts over.
+        self._note_progress()
+
+        if next_index < len(ROWS):
+            self.row_index = next_index
+            self.get_logger().info(
+                f'Row {self.row_index - 1} finished — moving on to row {next_index} '
+                f'of {len(ROWS) - 1}'
+            )
+        else:
+            self.farm_exhausted = True
+            self.get_logger().info('Last row finished — heading to the unloading dock')
+
+        self._transition_status(RobotStatusEnum.JOB_DONE)
+
+    def _next_nav_target(self) -> WayPoint:
+        """Resume at the furthest point already covered in this row, otherwise
+        start at the row's start point."""
+        if self.row_progress_pose is not None:
+            return _pose_to_waypoint(self.row_progress_pose)
+        return _row_start_waypoint(ROWS[self.row_index])
+
+    def _send_nav_goal(self) -> bool:
+        # The MOVING subtask belongs to the current task. Its waypoints are
+        # refreshed here rather than reused, because the target differs between
+        # the first attempt, a retry, and a resume part-way down a row.
+        subtask = self._subtask_of(SubTask.MOVING)
+        if subtask is None:
+            subtask = self._new_subtask(SubTask.MOVING, 'Navigate')
+        subtask.data = self._nav_waypoints(self.nav_target_wp)
+
+        task = _make_task(
+            self.current_task.task_id if self.current_task else 0,
+            self.current_task_type or TaskEnum.HARVESTING_TASK,
+            subtask.description,
+            [subtask],
+            self.current_load_status,
+            target_node_id=self.nav_target_wp.node_id,
         )
+        return self.navigation.send_goal(task)
+
+    # =========================================================================
+    # TASK: CHARGING
+    # =========================================================================
+
+    def _task_charging(self) -> None:
+        """
+        JOB_START -(STOW)-> START_DOCKING -> DOCKING -> DONE_DOCKING
+                  -> START_CHARGING -> CHARGING -> DONE_CHARGING
+                  -> START_UNDOCKING -> UNDOCKING -> DONE_UNDOCKING -> JOB_DONE
+        """
+        if self.current_status == RobotStatusEnum.JOB_START:
+            if not self._ensure_arm(ArmCommand.GO_STOW):
+                return
+            self.active_dock = DOCK_CONFIGS[CHARGING_DOCK_NAME]
+            self.dock_goal_sent = False
+            self._transition_status(RobotStatusEnum.START_DOCKING)
+            return
+
+        if self.current_status == RobotStatusEnum.START_DOCKING:
+            self._send_dock_goal()
+            return
 
         if self.current_status == RobotStatusEnum.DONE_DOCKING:
             self._transition_status(RobotStatusEnum.START_CHARGING)
+            return
 
-        elif self.current_status == RobotStatusEnum.START_CHARGING:
+        if self.current_status == RobotStatusEnum.START_CHARGING:
+            self.charge_last_pct = self._battery_pct()
+            self.charge_stall_ticks = 0
+            self.get_logger().info(
+                f'Docked at the charger at {self._battery_pct():.0f}% — waiting for '
+                f'{BATTERY_FULL_THRESHOLD:.0f}%'
+            )
             self._transition_status(RobotStatusEnum.CHARGING)
-            self.get_logger().info('Charging started')
+            return
 
-        elif self.current_status == RobotStatusEnum.CHARGING:
-            self.get_logger().info(f'Battery charging: {battery_pct:.1f}%', throttle_duration_sec=10.0)
-            if battery_pct >= self.battery_full_threshold:
-                self.get_logger().info(f'Battery charged: {battery_pct:.1f}%')
-                self._transition_status(RobotStatusEnum.DONE_CHARGING)
+        if self.current_status == RobotStatusEnum.CHARGING:
+            self._monitor_charging()
+            return
 
-        elif self.current_status == RobotStatusEnum.DONE_CHARGING:
-            self.get_logger().debug('DONE_CHARGING — storing last_undocking_subtask and triggering undocking')
-            self.last_undocking_subtask = self.current_sub_task
-            self.undocking_after_task_type = Task.CHARGING_TASK
+        if self.current_status == RobotStatusEnum.DONE_CHARGING:
+            self._note_progress()
+            self.undock_goal_sent = False
             self._transition_status(RobotStatusEnum.START_UNDOCKING)
-            self._subtask_undocking()
+            return
 
-        elif self.current_status == RobotStatusEnum.DONE_UNDOCKING:
-            self.get_logger().debug('DONE_UNDOCKING in charging context — delegating to _subtask_undocking')
-            self._subtask_undocking()
+        if self.current_status == RobotStatusEnum.START_UNDOCKING:
+            self._send_undock_goal(f'Undock from {self.active_dock.instance_name}')
+            return
 
-    def _subtask_unloading(self):
+        if self.current_status == RobotStatusEnum.DONE_UNDOCKING:
+            self.get_logger().info('Charged and clear of the dock — back to work')
+            self._transition_status(RobotStatusEnum.JOB_DONE)
+
+    def _monitor_charging(self) -> None:
         """
-        Handle the UNLOADING subtask via UnloaderActionClient.
+        Wait for a full battery, but only while the battery is actually filling.
 
-        DONE_DOCKING  → START_UNLOADING → send_goal(END) → UNLOADING
-        UNLOADING     → poll unloader status:
-                         DONE_UNLOADING + not _unloader_at_end
-                           → _unloader_at_end=True, delay, send_goal(HOME)
-                         DONE_UNLOADING + _unloader_at_end
-                           → current_load_status=0, → DONE_UNLOADING
-        DONE_UNLOADING → store undocking subtask → START_UNDOCKING → JOB_DONE
-        DONE_UNDOCKING → delegate to _subtask_undocking → JOB_DONE
+        There is no fixed deadline here — the pack decides how long it takes.
+        What is bounded is progress: a charger that is off, a bad contact or a
+        wedged BMS all look identical from here, and none of them get better by
+        waiting longer. The epsilon matters because the BMS reports fractional
+        percent, so drifting noise must not be mistaken for charging.
         """
-        self.get_logger().debug(
-            f'_subtask_unloading | status={self.current_status.name} | '
-            f'current_load={self.current_load_status:.1f}% | '
-            f'_unloader_at_end={self._unloader_at_end}'
+        pct = self._battery_pct()
+        if pct is None:
+            return  # staleness is handled in timer_callback
+
+        if pct >= BATTERY_FULL_THRESHOLD:
+            self.get_logger().info(f'Battery full at {pct:.1f}%')
+            self._transition_status(RobotStatusEnum.DONE_CHARGING)
+            return
+
+        if self.charge_last_pct is None or pct > self.charge_last_pct + CHARGE_PROGRESS_EPSILON:
+            self.charge_last_pct = pct
+            self.charge_stall_ticks = 0
+        else:
+            self.charge_stall_ticks += 1
+
+        stalled_for = self.charge_stall_ticks * TIMER_PERIOD_SEC
+        if stalled_for > CHARGE_NO_PROGRESS_TIMEOUT_SEC:
+            self.get_logger().error(
+                f'Battery has sat at {pct:.1f}% for {stalled_for:.0f}s — it is not '
+                'charging. Check the charger and the dock contacts.'
+            )
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
+        self.get_logger().info(
+            f'Charging: {pct:.1f}% of {BATTERY_FULL_THRESHOLD:.0f}%',
+            throttle_duration_sec=10.0,
         )
+
+    # =========================================================================
+    # TASK: UNLOADING
+    # =========================================================================
+
+    def _task_unloading(self) -> None:
+        """
+        Same dock/undock chain as charging, with the carriage sequence in the
+        middle. END -> wait -> HOME is three steps inside one UNLOADING state,
+        which RobotStatusEnum cannot express, so unload_step tracks them.
+        """
+        if self.current_status == RobotStatusEnum.JOB_START:
+            if not self._ensure_arm(ArmCommand.GO_STOW):
+                return
+            self.active_dock = DOCK_CONFIGS[UNLOADING_DOCK_NAME]
+            self.dock_goal_sent = False
+            self._transition_status(RobotStatusEnum.START_DOCKING)
+            return
+
+        if self.current_status == RobotStatusEnum.START_DOCKING:
+            self._send_dock_goal()
+            return
 
         if self.current_status == RobotStatusEnum.DONE_DOCKING:
             self._transition_status(RobotStatusEnum.START_UNLOADING)
+            return
 
-        elif self.current_status == RobotStatusEnum.START_UNLOADING:
-            self.get_logger().info('Sending unloader END goal')
-            self._unloader_at_end = False
-            if self.unloader_action_client.send_goal(OperateUnloader.Goal.END):
-                self._transition_status(RobotStatusEnum.UNLOADING)
-            else:
-                self.get_logger().error('Failed to send unloader END goal — ERROR')
-                self._transition_status(RobotStatusEnum.ERROR)
+        if self.current_status == RobotStatusEnum.START_UNLOADING:
+            self.unload_step = 'END'
+            self.unload_goal_sent = False
+            self.unload_wait_ticks = 0
+            self.unload_step_ticks = 0
+            self._transition_status(RobotStatusEnum.UNLOADING)
+            return
 
-        elif self.current_status == RobotStatusEnum.UNLOADING:
-            unloader_status = self.unloader_action_client.get_status()
+        if self.current_status == RobotStatusEnum.UNLOADING:
+            self._run_unload_sequence()
+            return
 
-            if unloader_status == RobotStatusEnum.DONE_UNLOADING:
-                if not self._unloader_at_end:
-                    self.get_logger().info(f'Unloader AT_END — delaying {self.unloading_home_delay_s:.1f}s then HOME')
-                    self._unloader_at_end = True
-                    time.sleep(self.unloading_home_delay_s)
-                    if not self.unloader_action_client.send_goal(OperateUnloader.Goal.HOME):
-                        self.get_logger().error('Failed to send unloader HOME goal — ERROR')
-                        self._transition_status(RobotStatusEnum.ERROR)
-                    # Status will return to UNLOADING on next tick (client resets internally)
-                else:
-                    # HOME confirmed — carriage returned
-                    self.get_logger().info('Unloader AT_HOME — unloading complete')
-                    self.current_load_status = 0.0
-                    self.unloader_action_client.reset()
-                    self._transition_status(RobotStatusEnum.DONE_UNLOADING)
-
-            elif unloader_status == RobotStatusEnum.ERROR:
-                self.get_logger().error('Unloader reported ERROR — transitioning to ERROR')
-                self.unloader_action_client.reset()
-                self._transition_status(RobotStatusEnum.ERROR)
-
-        elif self.current_status == RobotStatusEnum.DONE_UNLOADING:
-            self.get_logger().debug('DONE_UNLOADING — storing last_undocking_subtask and triggering undocking')
-            self.last_undocking_subtask = self.current_sub_task
-            self.undocking_after_task_type = Task.UNLOADING_TASK
-            self.get_logger().info('Unloading done, starting undocking')
+        if self.current_status == RobotStatusEnum.DONE_UNLOADING:
+            self._note_progress()
+            self.undock_goal_sent = False
             self._transition_status(RobotStatusEnum.START_UNDOCKING)
-            self._subtask_undocking()
+            return
 
-        elif self.current_status == RobotStatusEnum.DONE_UNDOCKING:
-            self.get_logger().debug('DONE_UNDOCKING in unloading context — delegating to _subtask_undocking')
-            self._subtask_undocking()
+        if self.current_status == RobotStatusEnum.START_UNDOCKING:
+            self._send_undock_goal(f'Undock from {self.active_dock.instance_name}')
+            return
 
-    # =========================================================================
-    # SENSOR STATUS HELPERS
-    # =========================================================================
+        if self.current_status == RobotStatusEnum.DONE_UNDOCKING:
+            self.get_logger().info('Unloading complete')
+            self._transition_status(RobotStatusEnum.JOB_DONE)
 
-    def _set_battery_status(self, robot_status: RobotStatus):
-        robot_status.battery_level = self.battery_status.percentage
-        if self.battery_status.capacity > 0.0 and self.battery_status.current > 0.0:
-            battery_pct = self._normalize_battery(self.battery_status.percentage)
-            time_remaining = self.battery_status.capacity * (battery_pct / 100.0) / self.battery_status.current
-            robot_status.operation_hours_after_charging = self._format_time_remaining(time_remaining)
-        else:
-            robot_status.operation_hours_after_charging = '00 hours 00 minutes remaining approx...'
+    def _sim_unloader_status(self) -> RobotStatusEnum:
+        """
+        Stand in for UnloaderActionClient.get_status() with no carriage present.
 
-    def _set_estop_status(self, robot_status: RobotStatus):
-        robot_status.online_flag = self.estop_status.data if self.estop_status.data else OnlineFlagEnum.ONLINE.value
+        Reports UNLOADING while the tick count runs, DONE_UNLOADING once it
+        expires — the same two values the real client reports, so the caller
+        needs no sim branch.
+        """
+        self.sim_unloader_ticks += 1
+        if self.sim_unloader_ticks * TIMER_PERIOD_SEC < SIM_UNLOADER_SEC:
+            return RobotStatusEnum.UNLOADING
 
-    def _set_location_status(self, robot_status: RobotStatus):
-        if self.pose_status and self.pose_status.pose:
-            robot_status.topo_map_position = self.pose_status.pose.pose.position
-            robot_status.topo_map_orientation = self.pose_status.pose.pose.orientation
+        self.sim_unloader_ticks = 0
+        return RobotStatusEnum.DONE_UNLOADING
 
-    # =========================================================================
-    # UTILITY
-    # =========================================================================
+    def _run_unload_sequence(self) -> None:
+        if self.unload_step == 'WAIT':
+            self.unload_wait_ticks += 1
+            if self.unload_wait_ticks * TIMER_PERIOD_SEC >= POST_UNLOAD_DELAY_SEC:
+                self.get_logger().info('Wait over — sending the carriage back home')
+                self.unload_step = 'HOME'
+                self.unload_goal_sent = False
+                self.unload_step_ticks = 0
+            return
 
-    def _transition_status(self, new_status: RobotStatusEnum):
-        """No-op if already in new_status; otherwise log and update."""
-        if self.current_status != new_status:
-            self.previous_status = self.current_status
-            self.current_status = new_status
-            self.get_logger().info(f'Status: {self.previous_status.name} → {self.current_status.name}')
+        # END and HOME each get their own clock. The whole UNLOADING state cannot
+        # share one, because the wait in the middle is deliberate.
+        self.unload_step_ticks += 1
+        waited = self.unload_step_ticks * TIMER_PERIOD_SEC
+        if waited > TIMEOUT_UNLOAD_STEP_SEC:
+            self.get_logger().error(
+                f'Unloader carriage has not reached {self.unload_step} after '
+                f'{waited:.0f}s — giving up on it'
+            )
+            self.unloader_client.reset()
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
 
-    def _normalize_battery(self, percentage: float) -> float:
-        """Normalise 0-1 BMS percentage to 0-100."""
-        return percentage * 100.0 if percentage <= 1.0 else percentage
-
-    def _format_time_remaining(self, hours: float) -> str:
-        seconds = int(hours * 3600)
-        minutes, seconds = divmod(seconds, 60)
-        hours_i, minutes = divmod(minutes, 60)
-        return f'{hours_i:02} hours {minutes:02} minutes remaining approximately.'
-
-    def _calculate_distance(self, x1: float, y1: float, x2: float, y2: float) -> float:
-        return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
-
-    def _is_robot_at_target(self) -> bool:
-        """Return True if the robot is within 0.25 m of the final subtask waypoint."""
-        if not (self.current_sub_task and self.pose_status):
-            return False
-
-        robot_pos = self.pose_status.pose.pose.position
-        waypoints_list = [WayPoint(**wp) if isinstance(wp, dict) else wp for wp in self.current_sub_task.data]
-        if not waypoints_list:
-            return False
-        target_wp = waypoints_list[-1]
-        distance = self._calculate_distance(robot_pos.x, robot_pos.y, target_wp.x, target_wp.y)
-
-        self.get_logger().debug(
-            f'_is_robot_at_target | '
-            f'robot=({robot_pos.x:.3f}, {robot_pos.y:.3f}) | '
-            f'target=({target_wp.x:.3f}, {target_wp.y:.3f}) | '
-            f'distance={distance:.3f}m threshold=0.25m'
+        target = (
+            OperateUnloader.Goal.END if self.unload_step == 'END'
+            else OperateUnloader.Goal.HOME
         )
-        return distance <= 0.25
 
+        if not self.unload_goal_sent:
+            if SIMULATE_UNLOADER:
+                self.sim_unloader_ticks = 0
+                self.unload_goal_sent = True
+                self.get_logger().warning(
+                    f'No unloader goal sent (simulated) — pretending the carriage '
+                    f'moves to {self.unload_step} over {SIM_UNLOADER_SEC:.0f}s'
+                )
+                return
+            if not self._require_server(
+                'the unloader (operate_unloader)', self.unloader_client.client
+            ):
+                return
+            if not self.unloader_client.send_goal(target):
+                self.get_logger().error(
+                    f'Unloader rejected the goal to go to {self.unload_step}'
+                )
+                self._transition_status(RobotStatusEnum.ERROR)
+                return
+            self.unload_goal_sent = True
+            return
 
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
+        status = (
+            self._sim_unloader_status() if SIMULATE_UNLOADER
+            else self.unloader_client.get_status()
+        )
+
+        if status == RobotStatusEnum.ERROR:
+            self.get_logger().error(f'Unloader failed on the way to {self.unload_step}')
+            self.unloader_client.reset()
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
+        if status != RobotStatusEnum.DONE_UNLOADING:
+            return
+
+        if not SIMULATE_UNLOADER:
+            self.unloader_client.reset()
+
+        if self.unload_step == 'END':
+            self.get_logger().info(
+                f'Carriage at the end — waiting {POST_UNLOAD_DELAY_SEC:.0f}s for the '
+                'load to clear before bringing it home'
+            )
+            self.unload_step = 'WAIT'
+            self.unload_wait_ticks = 0
+            return
+
+        self.current_load_status = 0.0
+        self.unload_step = None
+        self.get_logger().info('Carriage home — bin recorded as empty')
+        self._transition_status(RobotStatusEnum.DONE_UNLOADING)
+
+    # =========================================================================
+    # SHARED DOCK / UNDOCK HELPERS
+    # =========================================================================
+
+    def _send_dock_goal(self) -> None:
+        if self.dock_goal_sent:
+            return
+
+        if not self._may_start_motion('dock'):
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
+        if not self._require_server(
+            'the docking server (dock_robot)', self.docking_action_client.client
+        ):
+            return
+
+        dock_id = self.active_dock.instance_name
+
+        subtask = self._subtask_of(SubTask.DOCKING)
+        if subtask is None:
+            subtask = self._new_subtask(SubTask.DOCKING, f'Dock at {dock_id}')
+        # active_dock can change between building the task and sending the goal
+        # (error recovery re-picks it), so the goal is rebuilt from it here.
+        subtask.description = f'Dock at {dock_id}'
+        subtask.dock_goal = _make_dock_goal(dock_id)
+
+        self.get_logger().info(f"Driving to dock '{dock_id}'")
+        if not self.docking_action_client.send_docking_goal(subtask):
+            self.get_logger().error(f'Failed to send docking goal for {dock_id}')
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
+        self.dock_goal_sent = True
+        self._transition_status(RobotStatusEnum.DOCKING)
+
+    def _send_undock_goal(self, description: str) -> None:
+        if self.undock_goal_sent:
+            return
+
+        if not self._may_start_motion('undock'):
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
+        # A missing undock server is the one case that does not halt: backing out
+        # is a TF closed-loop drive on cmd_vel and needs no server at all, which
+        # is exactly what the fallback is for.
+        if not self.undocking_action_client.client.server_is_ready():
+            self._start_reverse_drive('Undock server is not running')
+            return
+
+        # Startup undocking runs before any task exists, so there may be nothing
+        # to draw the subtask from.
+        subtask = self._subtask_of(SubTask.UNDOCKING)
+        if subtask is None:
+            subtask = self._new_subtask(SubTask.UNDOCKING, description)
+        subtask.description = description
+        subtask.undock_goal = _make_undock_goal(
+            self.active_dock.type, _max_undocking_time()
+        )
+
+        if not self.undocking_action_client.send_undocking_goal(subtask):
+            # The undock server never took the goal, which is exactly the case
+            # the reverse-drive fallback exists for. Previously this went
+            # straight to ERROR and the fallback was only reachable when a goal
+            # was accepted and then aborted.
+            self._start_reverse_drive('Undock server did not accept the goal')
+            return
+
+        self.undock_goal_sent = True
+        self._transition_status(RobotStatusEnum.UNDOCKING)
+
+    # =========================================================================
+    # ERROR RECOVERY
+    # =========================================================================
+
+    def _handle_error_recovery(self) -> None:
+        """
+        Cancel whatever was moving, clear pending arm goals, return to IDLE.
+
+        Two deliberate differences from the production node's version:
+          * no time.sleep() — cancellation is polled across ticks, so the loop
+            keeps battery, pose and TF live while it settles
+          * capped — production waits for an operator to send a new task, but
+            this node re-picks its own work, so an uncapped recovery would drive
+            straight back into the same fault forever
+        """
+        if self.recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
+            self.get_logger().error(
+                f'Tried to recover {MAX_RECOVERY_ATTEMPTS} times without getting '
+                'anywhere — stopping for good. A person needs to look at this.'
+            )
+            self._transition_status(RobotStatusEnum.ABNORMAL)
+            return
+
+        # Cancel once on entry, not on every tick.
+        if self.error_settle_ticks == 0:
+            self._cancel_active_motion()
+
+        self.error_settle_ticks += 1
+        settling = self.error_settle_ticks * TIMER_PERIOD_SEC
+
+        # Poll instead of sleeping: hold in ERROR until the cancels land, but not
+        # forever — a cancel whose callback never fires would hold here for good.
+        still_moving: list[str] = []
+        if self.navigation.is_navigation_active():
+            still_moving.append('navigation')
+        if self.reverse_drive_active and self.reverse_drive_client.is_active():
+            still_moving.append('reverse drive')
+        if self.drive_client is not None and self.drive_client.is_active():
+            still_moving.append('camera drive')
+
+        if still_moving:
+            if settling > TIMEOUT_ERROR_SETTLE_SEC:
+                self.get_logger().error(
+                    f'{" and ".join(still_moving)} did not stop within '
+                    f'{TIMEOUT_ERROR_SETTLE_SEC:.0f}s — cannot confirm the robot is '
+                    'stationary, stopping for good'
+                )
+                self.error_settle_ticks = 0
+                self._transition_status(RobotStatusEnum.ABNORMAL)
+                return
+            self.get_logger().info(
+                f'Waiting for {" and ".join(still_moving)} to stop',
+                throttle_duration_sec=1.0,
+            )
+            return
+
+        # Everything has stopped. Do not start over while a sensor is still
+        # missing: recovery would return to IDLE, the missing sensor would fault
+        # again on the next tick, and the whole budget would be gone in seconds.
+        # Hold here instead — stopped, cancelled and saying so — until it returns.
+        stale = self._stale_sensors()
+        if stale:
+            self.get_logger().error(
+                f'Stopped and waiting for {" and ".join(stale)} to come back',
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        self.error_settle_ticks = 0
+        self.recovery_attempts += 1
+        self.get_logger().warning(
+            f'Recovery attempt {self.recovery_attempts} of {MAX_RECOVERY_ATTEMPTS} '
+            '— everything stopped, starting over from idle'
+        )
+
+        self._reset_all_clients()
+        self._clear_goal_latches()
+
+        # The arm is marked unknown on purpose. reset() only clears this node's
+        # copy of the client state; a goal that was already running on the arm
+        # may have left it anywhere, so it gets re-stowed before the robot moves.
+        self.last_confirmed_arm_command = ArmCommand.UNKNOWN
+        self.arm_stow_pending = False
+        self.arm_ready_pending = False
+
+        # Drop the task too. _handle_task_start builds a fresh one from whatever
+        # the battery, the load and the row index say once we are back in IDLE.
+        self.current_task_type = None
+        self.current_task = None
+
+        self._transition_status(RobotStatusEnum.IDLE)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = LavenderHarvestNode()
+    node = TestLavenderHarvestNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

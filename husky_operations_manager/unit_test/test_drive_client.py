@@ -14,7 +14,7 @@ Parameters are hardcoded for field tuning. No YAML loading.
 
 Run:
   ros2 run husky_operations_manager test_drive_client \
-    --ros-args -r __ns:=/a200_0284 -r /tf:=tf -r /tf_static:=tf_static \
+    --ros-args -r __ns:=/a300_00036 -r /tf:=tf -r /tf_static:=tf_static \
     --log-level DriveClient:=debug
 """
 
@@ -47,13 +47,13 @@ _STATUS_NAMES = {
 
 # --- TF frames resolved at startup, merged into DriveConfig once available ---
 BASE_FRAME = 'base_link'
-CAMERA_FRAME = 'arm_camera_color_frame'
-ODOM_FRAME = 'base_mocap'  # TF frame for drive.py's TF-based target-pose lookup
+CAMERA_FRAME = 'camera_1_color_optical_frame'
+ODOM_FRAME = 'map'  # TF frame for drive.py's TF-based target-pose lookup
 
 STATIC_DRIVE_PARAMS = {
     # --- Subscriptions ---
-    'detection_topic': 'manipulators/arm_detection/image_annotated/detection_pose',
-    'odom_topic': 'ground_truth/odom',
+    'detection_topic': 'sensors/camera_1/detection/image_annotated/detection_pose',
+    'odom_topic': 'platform/odom/filtered',  # 'ground_truth/odom',
     # --- cmd_vel ---
     'base_frame': BASE_FRAME,
     'cmd_vel_rate': 10.0,  # Hz — republish rate between detections
@@ -66,7 +66,7 @@ STATIC_DRIVE_PARAMS = {
     # --- Departure ---
     'departure_clearance': 0.2,  # m — distance past bush before next scan
     # --- No-detection timeout ---
-    'no_detection_distance': 0.60,  # m — row end assumed after this distance
+    'no_detection_distance': 1.50,  # m — row end assumed after this distance
     # --- PD target-pose controller (drive.py) ---
     'ang_tol': 0.05,  # rad — final-heading tolerance (~3deg)
     'k_v_p': 0.2,
@@ -92,6 +92,8 @@ HARVEST_SIMULATION_DURATION_SEC = 30.0  # seconds — simulated harvest activity
 # =============================================================================
 # Test Node
 # =============================================================================
+
+# TODO: Get bushrow_theta from robots odom at the start of the node.
 
 
 class TestDriveNode(Node):
@@ -167,6 +169,18 @@ class TestDriveNode(Node):
 
         self._start_timer.cancel()
         self._start_timer = None
+
+        # Row heading taken from the first odom yaw — assumes the robot is parked
+        # pointing down the row. Latched once, never re-sampled on resume(): the
+        # robot's yaw drifts as it corrects toward each bush, so re-sampling would
+        # rotate the row assumption a little further every cycle.
+        odom_yaw = self._drive_client.get_status().current_yaw
+        self._drive_client.set_bushrow_theta(odom_yaw)
+        self.get_logger().info(
+            f'bushrow_theta latched from first odom yaw: {odom_yaw:.4f}rad '
+            f'({math.degrees(odom_yaw):.1f}deg)'
+        )
+
         self.get_logger().info('Odom received — calling DriveClient scan()')
         self._drive_client.scan()
 
