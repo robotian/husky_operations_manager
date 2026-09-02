@@ -15,30 +15,27 @@ Deprecated-method notes
 """
 
 import os
-from dataclasses import dataclass
 import time
-from typing import Optional, Tuple
+from dataclasses import dataclass
 
+import cv2
 import numpy as np
-import torch
-from PIL import Image as PILImage
-from torchvision import models, transforms
 
 # ROS 2
 import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-
-# ROS 2 messages
-from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+import torch
+from ament_index_python import get_package_share_directory
 
 # cv_bridge: converts sensor_msgs/Image <-> numpy array
 # apt: ros-jazzy-cv-bridge
 from cv_bridge import CvBridge
-import cv2
+from PIL import Image as PILImage
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from ament_index_python import get_package_share_directory
-
+# ROS 2 messages
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
+from torchvision import models, transforms
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. Config
