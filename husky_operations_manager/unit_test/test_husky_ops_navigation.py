@@ -1,7 +1,7 @@
 import math
-import time
 
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
@@ -11,14 +11,12 @@ from std_msgs.msg import Bool
 from status_interfaces.msg import RobotStatus, Task, SubTask, UndockGoal, WayPoint
 
 from husky_operations_manager.enum import (
-    OnlineFlagEnum, 
-    RobotStatusEnum, 
-    NavigationStatus, 
-    ReverseDriveStatus, 
-    DockingParamFetcherStatus
+    OnlineFlagEnum,
+    RobotStatusEnum,
+    NavigationStatus,
+    ReverseDriveStatus,
 )
-from husky_operations_manager.dataclass import DockingConfig, DockInstanceConfig, DockPluginConfig
-from husky_operations_manager.docking_param_fetcher import DockingParamFetcher
+from husky_operations_manager.dataclass import DockInstanceConfig, DockPose, ReverseDriveConfig
 from husky_operations_manager.action_clients.reverse_drive_client import ReverseDriveClient
 from husky_operations_manager.action_clients.docking import DockingActionClient
 from husky_operations_manager.action_clients.navigation import NavigationActionClient
@@ -55,63 +53,25 @@ class HuskyOperationsManager(Node):
         self.robot_state_pub = self.create_publisher(
             RobotStatus, f'{self.namespace}/status/robot', 10)
 
-        # These are set to None here and populated once DockingParamFetcher completes.
-        # All action clients depend on DockingConfig so they cannot be created until
-        # _on_docking_config_ready fires.
-        self.docking_config: DockingConfig | None = None
-        self.active_dock:   DockInstanceConfig | None = None
-        self.active_plugin: DockPluginConfig | None = None
-        self.reverse_drive_client: ReverseDriveClient | None = None
-
-        # 30s window for docking_server to become available before clean shutdown
-        self._CONFIG_POLL_TIMEOUT_SEC: float = 30.0
-
-        # Fetch all params from docking_server asynchronously.
-        # _poll_docking_config checks readiness every 0.5s and fires
-        # _on_docking_config_ready once the config is built.
-        self._param_fetcher = DockingParamFetcher(self)
-        self._param_fetcher.fetch()
-        self._config_poll_start_time: float = self.get_clock().now().nanoseconds / 1e9
-        self._config_poll_timer = self.create_timer(0.5, self._poll_docking_config)
-
-    def _on_docking_config_ready(self):
-        """
-        Called once DockingParamFetcher reports DONE.
-
-        Resolves active_dock and active_plugin from index 0 of the respective lists.
-        Initialises all action clients (they require DockingConfig at construction)
-        and starts the main 1Hz timer and the initial position check timer.
-
-        TODO: Update active_dock and active_plugin values based on the assigned dock
-        to each robot in multi-robot setup
-        """
-        self.docking_config = self._param_fetcher.get_config()
-
-        # Index 0 is used as the single global dock and plugin throughout the node.
-        # Multi-dock support would require changing these to per-task lookups.
-        self.active_dock   = self.docking_config.dock_configs[self.docking_config.docks[0]]
-        self.active_plugin = self.docking_config.plugin_configs[self.docking_config.dock_plugins[0]]
+        # Motion / dock configuration is read synchronously from ROS params
+        # (config.yaml) — see _build_motion_config.
+        self.motion_config: ReverseDriveConfig = self._build_motion_config()
+        self.active_dock_name: str | None = None
 
         self.get_logger().info(
-            f"DockingConfig ready | "
-            f"dock='{self.active_dock.instance_name}' | "
-            f"plugin='{self.active_plugin.plugin_name}'"
-        )
-        self.get_logger().debug(
-            f"DockingConfig detail | "
-            f"dock_type='{self.active_dock.type}' | "
-            f"staging_x_offset={self.active_plugin.staging_x_offset} | "
-            f"v_linear_min={self.docking_config.controller_v_linear_min} | "
-            f"dock_backwards={self.docking_config.dock_backwards}"
+            f"Motion config loaded | "
+            f"docks={list(self.motion_config.dock_configs.keys())} | "
+            f"charging='{self._dock_for_charging}' unloading='{self._dock_for_unloading}' | "
+            f"dock_backwards={self.motion_config.dock_backwards}"
         )
 
-        # Initialise action clients now that DockingConfig is available
+        # All action clients depend on motion_config
         self.navigation              = NavigationActionClient(self)
         self.docking_action_client   = DockingActionClient(self)
         self.undocking_action_client = UndockingActionClient(self)
         # ReverseDriveClient is the fallback when undock_robot action fails.
         # It drives the robot in reverse using TF closed-loop feedback.
-        self.reverse_drive_client    = ReverseDriveClient(self, self.docking_config)
+        self.reverse_drive_client    = ReverseDriveClient(self, self.motion_config)
 
         # Delay the initial position check to allow the pose subscription to
         # receive its first message before comparing against the dock position.
@@ -123,47 +83,74 @@ class HuskyOperationsManager(Node):
 
         self.get_logger().info("Husky Operations Manager ready.")
 
-    def _poll_docking_config(self):
-        """
-        Polls DockingParamFetcher every 0.5s.
+    # --- Typed parameter reads (avoid `Parameter.value` being `Any | None`) ---
 
-        Cancels itself on DONE or when the 30s timeout window is exceeded.
-        On DONE, fires _on_docking_config_ready which initialises all clients
-        and starts the main timers.
+    def _p_str(self, name: str) -> str:
+        return self.get_parameter(name).get_parameter_value().string_value
 
-        On ERROR, resets the fetcher and retries fetch() on the next timer tick
-        until the 30s deadline is reached, at which point the node shuts down
-        cleanly — it cannot operate without docking config.
-        """
-        status = self._param_fetcher.get_status()
-        self.get_logger().debug(f"DockingParamFetcher poll | status={status.name}")
+    def _p_int(self, name: str) -> int:
+        return self.get_parameter(name).get_parameter_value().integer_value
 
-        if status == DockingParamFetcherStatus.DONE:
-            self._config_poll_timer.cancel()
-            self._on_docking_config_ready()
-            return
+    def _p_float(self, name: str) -> float:
+        return self.get_parameter(name).get_parameter_value().double_value
 
-        if status == DockingParamFetcherStatus.ERROR:
-            elapsed = self.get_clock().now().nanoseconds / 1e9 - self._config_poll_start_time
+    def _p_bool(self, name: str) -> bool:
+        return self.get_parameter(name).get_parameter_value().bool_value
 
-            if elapsed >= self._CONFIG_POLL_TIMEOUT_SEC:
-                self.get_logger().error(
-                    f"DockingParamFetcher failed — "
-                    f"docking_server unavailable after {self._CONFIG_POLL_TIMEOUT_SEC:.0f}s | "
-                    f"elapsed={elapsed:.1f}s — shutting down"
-                )
-                self._config_poll_timer.cancel()
-                self.destroy_node()
-                rclpy.shutdown()
-                return
+    def _p_str_list(self, name: str) -> list[str]:
+        return list(self.get_parameter(name).get_parameter_value().string_array_value)
 
-            # Within timeout window — reset and retry on next timer tick
-            self.get_logger().warning(
-                f"DockingParamFetcher ERROR — retrying | "
-                f"elapsed={elapsed:.1f}s / {self._CONFIG_POLL_TIMEOUT_SEC:.0f}s"
+    def _p_float_list(self, name: str) -> list[float]:
+        return [float(v) for v in self.get_parameter(name).get_parameter_value().double_array_value]
+
+    def _build_motion_config(self) -> ReverseDriveConfig:
+        """Build a ReverseDriveConfig from the `motion.*` ROS params in config.yaml."""
+        m = 'motion'
+        dock_names = self._p_str_list(f'{m}.dock_names')
+
+        dock_configs: dict[str, DockInstanceConfig] = {}
+        for name in dock_names:
+            p = f'{m}.dock_configs.{name}'
+            self.declare_parameter(f'{p}.type', 'simple_charging_dock')
+            self.declare_parameter(f'{p}.frame', 'map')
+            self.declare_parameter(f'{p}.pose', [0.0, 0.0, 0.0])
+            pose = self._p_float_list(f'{p}.pose')
+            dock_configs[name] = DockInstanceConfig(
+                instance_name=name,
+                type=self._p_str(f'{p}.type'),
+                frame=self._p_str(f'{p}.frame'),
+                pose=DockPose(x=pose[0], y=pose[1], theta=pose[2]),
             )
-            self._param_fetcher.reset()
-            self._param_fetcher.fetch()
+
+        self._dock_for_charging  = self._p_str(f'{m}.dock_for_charging')
+        self._dock_for_unloading = self._p_str(f'{m}.dock_for_unloading')
+
+        return ReverseDriveConfig(
+            dock_configs=dock_configs,
+            staging_x_offset=self._p_float(f'{m}.staging_x_offset'),
+            staging_yaw_offset=self._p_float(f'{m}.staging_yaw_offset'),
+            base_frame=self._p_str(f'{m}.base_frame'),
+            controller_frequency=self._p_float(f'{m}.controller_frequency'),
+            v_linear_min=self._p_float(f'{m}.v_linear_min'),
+            v_angular_max=self._p_float(f'{m}.v_angular_max'),
+            linear_tolerance=self._p_float(f'{m}.linear_tolerance'),
+            angular_tolerance=self._p_float(f'{m}.angular_tolerance'),
+            dock_backwards=self._p_bool(f'{m}.dock_backwards'),
+        )
+
+    def _dock(self, name: str | None) -> DockInstanceConfig | None:
+        """Look up a dock instance config by name, or None if unknown/unset."""
+        if not name:
+            return None
+        return self.motion_config.dock_configs.get(name)
+
+    def _resolve_task_dock_name(self, task_type: int | None) -> str | None:
+        """Map a task type to its configured dock name (motion.dock_for_*)."""
+        if task_type == Task.CHARGING_TASK:
+            return self._dock_for_charging
+        if task_type == Task.UNLOADING_TASK:
+            return self._dock_for_unloading
+        return None
 
     # =========================================================================
     # PARAMS AND VARIABLES INITIALIZATION
@@ -183,19 +170,33 @@ class HuskyOperationsManager(Node):
         self.declare_parameter('timing.initial_position_check_delay', 2.0)
         self.declare_parameter('server.action_server_timeout', 5.0)
 
+        # Motion / dock config (replaces the old docking_server fetch).
+        self.declare_parameter('motion.dock_names', ['husky_charger'])
+        self.declare_parameter('motion.dock_for_charging', 'husky_charger')
+        self.declare_parameter('motion.dock_for_unloading', 'unloading_station')
+        self.declare_parameter('motion.staging_x_offset', -1.5)
+        self.declare_parameter('motion.staging_yaw_offset', 0.0)
+        self.declare_parameter('motion.base_frame', 'base_link')
+        self.declare_parameter('motion.controller_frequency', 50.0)
+        self.declare_parameter('motion.v_linear_min', 0.15)
+        self.declare_parameter('motion.v_angular_max', 0.25)
+        self.declare_parameter('motion.linear_tolerance', 0.05)
+        self.declare_parameter('motion.angular_tolerance', 0.1)
+        self.declare_parameter('motion.dock_backwards', False)
+
     def _get_paramters(self):
         """Read all declared parameters into instance variables."""
-        self.navigation_max_retries = int(self.get_parameter('navigation.max_retries').value)
-        self.navigation_retry_delay = float(self.get_parameter('navigation.retry_delay').value)
-        self.docking_max_retries    = int(self.get_parameter('docking.max_retries').value)
-        self.docking_retry_delay    = float(self.get_parameter('docking.retry_delay').value)
-        self.docking_threshold      = float(self.get_parameter('docking.threshold').value)
-        self.battery_low_threshold  = float(self.get_parameter('battery.low_threshold').value)
-        self.battery_full_threshold = float(self.get_parameter('battery.full_threshold').value)
-        self.loading_increment      = float(self.get_parameter('loading.increment').value)
-        self.timing_timer_period                 = float(self.get_parameter('timing.timer_period').value)
-        self.timing_initial_position_check_delay = float(self.get_parameter('timing.initial_position_check_delay').value)
-        self.server_action_server_timeout        = float(self.get_parameter('server.action_server_timeout').value)
+        self.navigation_max_retries = self._p_int('navigation.max_retries')
+        self.navigation_retry_delay = self._p_float('navigation.retry_delay')
+        self.docking_max_retries    = self._p_int('docking.max_retries')
+        self.docking_retry_delay    = self._p_float('docking.retry_delay')
+        self.docking_threshold      = self._p_float('docking.threshold')
+        self.battery_low_threshold  = self._p_float('battery.low_threshold')
+        self.battery_full_threshold = self._p_float('battery.full_threshold')
+        self.loading_increment      = self._p_float('loading.increment')
+        self.timing_timer_period                 = self._p_float('timing.timer_period')
+        self.timing_initial_position_check_delay = self._p_float('timing.initial_position_check_delay')
+        self.server_action_server_timeout        = self._p_float('server.action_server_timeout')
 
         self.get_logger().debug(f"Parameters loaded | "
             f"nav_retries={self.navigation_max_retries} nav_delay={self.navigation_retry_delay}s | "
@@ -254,6 +255,12 @@ class HuskyOperationsManager(Node):
         self.navigation_retry_count = 0   # Reset to 0 on success or after max reached
         self.docking_retry_count    = 0   # Reset to 0 on success or after max reached
 
+        # --- Non-blocking dwell deadlines (replaces time.sleep) ---
+        self._dwell_deadlines: dict = {}
+
+        # --- Battery current EMA (for remaining-runtime estimate) ---
+        self._battery_current_ema: float | None = None
+
         # --- Job duration (used for unloading/charging timers) ---
         self.job_start_time = None   # rclpy clock time when current job phase started
         self.job_duration   = 0.0    # Duration in seconds for current phase
@@ -282,6 +289,8 @@ class HuskyOperationsManager(Node):
         self.pose_status    = PoseWithCovarianceStamped()
         self.imu_status     = Imu()
         self.estop_status   = Bool()
+        # True once a real message has arrived on the pose topic.
+        self._pose_received = False
 
     def _init_subscriptions(self):
         """Create all ROS2 subscriptions."""
@@ -375,9 +384,10 @@ class HuskyOperationsManager(Node):
             if self.current_status == RobotStatusEnum.JOB_DONE:
                 self._transition_status(RobotStatusEnum.IDLE)
         
-        # On Node start verify the load with server
+        # On node start, seed load from the first task message (server is the
+        # source of truth). Read msg, not self.task, which is still empty here.
         if self.last_handled_task_id is None:
-            self.current_load_status = self.task.crop_load
+            self.current_load_status = msg.crop_load
 
         self.task = msg
 
@@ -438,24 +448,25 @@ class HuskyOperationsManager(Node):
 
     def _initial_position_check_timer(self):
         """
-        Fires once after timing_initial_position_check_delay.
+        Fires every timing_initial_position_check_delay until the check completes.
 
-        Waits until pose data is available, then cancels itself and runs
-        check_initial_position. If pose is still None the timer continues
-        firing until it arrives.
+        Holds until a real pose message has arrived, then runs
+        check_initial_position and cancels itself once it has initialised.
         """
-        if self.pose_status is None:
-            self.get_logger().warning("Waiting for pose data...")
+        if not self._pose_received:
+            self.get_logger().warning("Waiting for pose data...", throttle_duration_sec=2.0)
             return
-        self.init_check_timer.cancel()
         self.check_initial_position()
+        if self.is_initialized:
+            self.init_check_timer.cancel()
 
     def check_initial_position(self):
         """
         Determine whether the robot starts at a docking station.
 
-        With a single dock in DockingConfig, active_dock is used directly.
-        With multiple docks, the nearest one by Euclidean distance is used.
+        Computes the Euclidean distance to every dock in motion_config and picks
+        the nearest. If that nearest dock is within docking_threshold the robot
+        started docked there and active_dock_name is set for startup undocking.
 
         Sets startup_undock_complete=True if the robot is NOT at a dock, so the
         node can skip the startup undocking sequence and proceed directly to tasks.
@@ -463,48 +474,38 @@ class HuskyOperationsManager(Node):
         if self.is_initialized:
             return
 
-        if not self.pose_status or not self.pose_status.pose:
-            self.get_logger().warning("No pose data — retrying in 1s")
-            time.sleep(1.0)
-            self.check_initial_position()
+        if not self._pose_received:
+            self.get_logger().warning("check_initial_position called before pose data — deferring")
             return
 
-        #  # TODO: Implement this logic once new station is added for unloading.
-        #  # Find nearest dock — use index 0 if only one dock, else find closest
-        # dock_configs = self.docking_config.dock_configs
-        # if len(dock_configs) == 1:
-        #     charger_dock_pose = self.active_dock
-        # else:
-        #     charger_dock_pose = min(
-        #         dock_configs.values(),
-        #         key=lambda d: self._calculate_distance(
-        #             current_pos.x, current_pos.y, d.dock_x, d.dock_y)
-        #     )
-
-        charger_dock_pose = self.active_dock
         current_pos = self.pose_status.pose.pose.position
 
-        distance = self._calculate_distance(
-            current_pos.x, current_pos.y,
-            charger_dock_pose.dock_x, charger_dock_pose.dock_y)
+        nearest_name: str | None = None
+        nearest_dist = float('inf')
+        for name, dock in self.motion_config.dock_configs.items():
+            d = self._calculate_distance(
+                current_pos.x, current_pos.y, dock.pose.x, dock.pose.y)
+            self.get_logger().debug(
+                f"Dock '{name}' at ({dock.pose.x:.3f}, {dock.pose.y:.3f}) — dist={d:.3f}m"
+            )
+            if d < nearest_dist:
+                nearest_dist = d
+                nearest_name = name
 
         self.get_logger().info(
-            f"Initial Robot position: ({current_pos.x:.3f}, {current_pos.y:.3f}), "
-            f"Dock Name: '{charger_dock_pose.instance_name}' | "
-            f"Distance to dock: {distance:.3f}m")
-
-        self.get_logger().debug(
-            f"Dock position: ({charger_dock_pose.dock_x:.3f}, {charger_dock_pose.dock_y:.3f}) | "
-            f"docking_threshold={self.docking_threshold}m | "
-            f"num_docks={len(self.docking_config.dock_configs)}"
+            f"Initial Robot position: ({current_pos.x:.3f}, {current_pos.y:.3f}) | "
+            f"nearest dock '{nearest_name}' at {nearest_dist:.3f}m | "
+            f"docking_threshold={self.docking_threshold}m"
         )
 
         # TODO: validate the if condition so that undocking can occur when the robot
         # pose shows robot is anywhere between dock pose and staging pose along x-axis
         # of robot.
-        if distance <= self.docking_threshold:
+        if nearest_name is not None and nearest_dist <= self.docking_threshold:
             self.is_at_docking_station = True
-            self.get_logger().info("Robot at dock - will undock before tasks")
+            self.active_dock_name = nearest_name
+            self.get_logger().info(
+                f"Robot at dock '{nearest_name}' — will undock before tasks")
         else:
             self.is_at_docking_station = False
             self.startup_undock_complete = True
@@ -528,8 +529,9 @@ class HuskyOperationsManager(Node):
         if not self.is_initialized or self.startup_undock_complete:
             return
 
-        if self.docking_config is None:
-            self.get_logger().warning("_handle_startup_undocking called but docking_config is None")
+        if self.active_dock_name is None:
+            self.get_logger().warning(
+                "_handle_startup_undocking called but active_dock_name is not set")
             return
 
         self.get_logger().debug(
@@ -545,17 +547,24 @@ class HuskyOperationsManager(Node):
         elif self.current_status == RobotStatusEnum.START_UNDOCKING:
             robot_status.task = "Startup: Undocking"
 
-            # Compute max_undocking_time from docking config rather than hardcoding.
-            # Formula: distance to staging pose / minimum speed * safety factor of 2
-            dock_type          = self.active_dock.type
-            staging_x_offset   = self.active_plugin.staging_x_offset
-            v_linear       = self.docking_config.controller_v_linear_max
-            max_undocking_time = (abs(staging_x_offset) / max(v_linear, 0.01)) * 1.25
+            # Compute max_undocking_time from motion config rather than hardcoding.
+            # Formula: distance to staging pose / minimum speed * safety factor 1.25
+            dock = self._dock(self.active_dock_name)
+            if dock is None:
+                self.get_logger().error(
+                    f"Startup undocking — unknown dock '{self.active_dock_name}' — ERROR")
+                self._transition_status(RobotStatusEnum.ERROR)
+                return
+
+            dock_type          = dock.type
+            staging_x_offset   = self.motion_config.staging_x_offset
+            v_linear_min       = self.motion_config.v_linear_min
+            max_undocking_time = (abs(staging_x_offset) / max(v_linear_min, 0.01)) * 1.25
 
             self.get_logger().debug(
-                f"Startup UndockGoal | dock_type='{dock_type}' | "
+                f"Startup UndockGoal | dock='{self.active_dock_name}' type='{dock_type}' | "
                 f"staging_x_offset={staging_x_offset} | "
-                f"v_linear_min={v_linear} | "
+                f"v_linear_min={v_linear_min} | "
                 f"max_undocking_time={max_undocking_time:.1f}s"
             )
 
@@ -884,7 +893,8 @@ class HuskyOperationsManager(Node):
         """
         self.get_logger().warning(
             f"Navigation failed | retry {self.navigation_retry_count + 1}/{self.navigation_max_retries} | "
-            f"current_node={self.current_node_id}"
+            f"current_node={self.current_node_id}",
+            throttle_duration_sec=2.0
         )
 
         # If robot is physically at the target despite nav failure, treat as success
@@ -898,12 +908,13 @@ class HuskyOperationsManager(Node):
             return
 
         if self.navigation_retry_count < self.navigation_max_retries:
+            # Non-blocking dwell — re-checked on the next timer tick
+            if not self._wait_ready('nav_retry', self.navigation_retry_delay):
+                return
             self.navigation_retry_count += 1
             self.get_logger().info(
-                f"Retrying navigation in {self.navigation_retry_delay:.1f}s | "
-                f"attempt {self.navigation_retry_count}/{self.navigation_max_retries}"
+                f"Retrying navigation | attempt {self.navigation_retry_count}/{self.navigation_max_retries}"
             )
-            time.sleep(self.navigation_retry_delay)
             self._retry_navigation()
         else:
             self.get_logger().error(
@@ -940,7 +951,6 @@ class HuskyOperationsManager(Node):
             return
 
         self.navigation.reset()
-        time.sleep(self.navigation_retry_delay)
 
         if self.navigation.send_goal(self.current_task):
             self._transition_status(RobotStatusEnum.MOVING)
@@ -995,16 +1005,18 @@ class HuskyOperationsManager(Node):
                    if self.current_sub_task and self.current_sub_task.dock_goal else 'unknown')
         self.get_logger().error(
             f"Docking failed | retry {self.docking_retry_count + 1}/{self.docking_max_retries} | "
-            f"dock_id='{dock_id}'"
+            f"dock_id='{dock_id}'",
+            throttle_duration_sec=2.0
         )
 
         if self.docking_retry_count < self.docking_max_retries:
+            # Non-blocking dwell — re-checked on the next timer tick
+            if not self._wait_ready('dock_retry', self.docking_retry_delay):
+                return
             self.docking_retry_count += 1
             self.get_logger().info(
-                f"Retrying docking in {self.docking_retry_delay:.1f}s | "
-                f"attempt {self.docking_retry_count}/{self.docking_max_retries}"
+                f"Retrying docking | attempt {self.docking_retry_count}/{self.docking_max_retries}"
             )
-            time.sleep(self.docking_retry_delay)
             self._retry_docking()
         else:
             self.get_logger().error(
@@ -1110,10 +1122,10 @@ class HuskyOperationsManager(Node):
         self.undocking_action_client.reset()
         self.get_logger().warning(
             f"Undocking failed — starting reverse drive to staging pose | "
-            f"dock='{self.active_dock.instance_name if self.active_dock else 'unknown'}'"
+            f"dock='{self.active_dock_name or 'unknown'}'"
         )
 
-        if self.reverse_drive_client.drive_to_staging():
+        if self.active_dock_name and self.reverse_drive_client.drive_to_staging(self.active_dock_name):
             # drive_to_staging returns True when REVERSING begins successfully
             self.reverse_drive_active = True
             self.get_logger().debug(
@@ -1121,10 +1133,11 @@ class HuskyOperationsManager(Node):
             )
             self._transition_status(RobotStatusEnum.UNDOCKING)
         else:
-            # Returns False when dock_backwards=True or already reversing
+            # Returns False when dock_backwards=True, dock unknown, or already reversing
             self.get_logger().error(
                 f"ReverseDriveClient refused to start — "
-                f"dock_backwards={self.docking_config.dock_backwards if self.docking_config else 'unknown'}"
+                f"dock='{self.active_dock_name}' "
+                f"dock_backwards={self.motion_config.dock_backwards}"
             )
             self._transition_status(RobotStatusEnum.ERROR)
 
@@ -1214,20 +1227,27 @@ class HuskyOperationsManager(Node):
         self.get_logger().warning(
             f"Error recovery | status={self.current_status.name} | "
             f"task_id={self.last_handled_task_id} | "
-            f"subtask_type={self.last_handled_subtask_type}"
+            f"subtask_type={self.last_handled_subtask_type}",
+            throttle_duration_sec=2.0
         )
 
         nav_status = self.navigation.get_navigation_status()
         self.get_logger().debug(f"Error recovery | nav_status={nav_status.name}")
 
         if nav_status in [NavigationStatus.ACTIVE, NavigationStatus.ACCEPTED]:
-            self.get_logger().info("Cancelling active navigation during error recovery")
-            try:
-                self.navigation.cancel_goal()
-                # Brief wait to allow Nav2 to process the cancellation before resetting
-                time.sleep(self.navigation_retry_delay)
-            except Exception as e:
-                self.get_logger().warning(f"Navigation cancel raised exception: {e}")
+            # Cancel once (when the dwell is first armed), then wait non-blocking
+            # for Nav2 to process the cancellation before resetting state.
+            if 'err_recovery' not in self._dwell_deadlines:
+                self.get_logger().info("Cancelling active navigation during error recovery")
+                try:
+                    self.navigation.cancel_goal()
+                except Exception as e:  # noqa: BLE001 - defensive: cancel must never abort recovery
+                    self.get_logger().warning(f"Navigation cancel raised exception: {e}")
+            if not self._wait_ready('err_recovery', self.navigation_retry_delay):
+                return
+
+        # Clear any lingering dwell deadline from the cancel path above
+        self._dwell_deadlines.pop('err_recovery', None)
 
         # Reset subtask state so the next task starts clean
         self.current_sub_task       = None
@@ -1305,9 +1325,11 @@ class HuskyOperationsManager(Node):
             self._transition_status(RobotStatusEnum.START_DOCKING)
 
         elif self.current_status == RobotStatusEnum.START_DOCKING:
+            # Brief non-blocking pause to let the robot fully stop before docking.
+            # Re-checked on the next timer tick until the delay has elapsed.
+            if not self._wait_ready('dock_start', 1.0):
+                return
             self.get_logger().info("Started docking")
-            # Brief pause to allow the robot to fully stop before docking starts
-            time.sleep(1.0)
             if self.docking_action_client.send_docking_goal(self.current_sub_task):
                 self._transition_status(RobotStatusEnum.DOCKING)
             else:
@@ -1470,8 +1492,11 @@ class HuskyOperationsManager(Node):
         elif self.current_status == RobotStatusEnum.DONE_CHARGING:
             # Store the charging subtask so _subtask_undocking can retrieve its UndockGoal.
             # The STOW gate inside _subtask_undocking will fire if arm is not already stowed.
+            self.active_dock_name = self._resolve_task_dock_name(
+                self.current_task.task_type if self.current_task else None)
             self.get_logger().debug(
-                "DONE_CHARGING — storing last_undocking_subtask and triggering undocking"
+                f"DONE_CHARGING — dock='{self.active_dock_name}', "
+                "storing last_undocking_subtask and triggering undocking"
             )
             self.last_undocking_subtask    = self.current_sub_task
             self.undocking_after_task_type = Task.CHARGING_TASK
@@ -1535,8 +1560,11 @@ class HuskyOperationsManager(Node):
         elif self.current_status == RobotStatusEnum.DONE_UNLOADING:
             # Reset load to 0 and store undocking subtask before triggering undocking.
             # The STOW gate inside _subtask_undocking will fire if arm is not already stowed.
+            self.active_dock_name = self._resolve_task_dock_name(
+                self.current_task.task_type if self.current_task else None)
             self.get_logger().debug(
-                "DONE_UNLOADING — storing last_undocking_subtask and triggering undocking"
+                f"DONE_UNLOADING — dock='{self.active_dock_name}', "
+                "storing last_undocking_subtask and triggering undocking"
             )
             self.last_undocking_subtask    = self.current_sub_task
             self.undocking_after_task_type = Task.UNLOADING_TASK
@@ -1561,23 +1589,46 @@ class HuskyOperationsManager(Node):
         """
         Populate battery fields in the outgoing RobotStatus.
 
-        Estimates remaining operation time from capacity, current draw, and
-        battery percentage. Falls back to a zero-string if BMS data is unavailable.
+        Estimates remaining runtime at the present discharge rate:
+          remaining_ah / |current|
+        remaining_ah is BatteryState.charge when provided, otherwise
+        capacity * percentage. current is EMA-smoothed and its magnitude used
+        (BatteryState.current is negative while discharging); while charging or
+        idle (|current| ~ 0) the estimate is not published.
         """
-        robot_status.battery_level = self.battery_status.percentage
-        if self.battery_status.capacity > 0.0 and self.battery_status.current > 0.0:
-            battery_pct = self._normalize_battery(self.battery_status.percentage)
-            # Remaining time (hours) = remaining capacity (Ah) / current draw (A)
-            time_remaining = (self.battery_status.capacity * (battery_pct / 100.0) /
-                              self.battery_status.current)
-            robot_status.operation_hours_after_charging = self._format_time_remaining(time_remaining)
+        battery_pct = self._normalize_battery(self.battery_status.percentage)
+        robot_status.battery_level = battery_pct
+
+        placeholder = "00 hours 00 minutes remaining approx..."
+
+        if self.battery_status.charge > 0.0:
+            remaining_ah = self.battery_status.charge
+        elif self.battery_status.capacity > 0.0:
+            remaining_ah = self.battery_status.capacity * (battery_pct / 100.0)
         else:
-            robot_status.operation_hours_after_charging = "00 hours 00 minutes remaining approx..."
+            robot_status.operation_hours_after_charging = placeholder
+            return
+
+        current_mag = abs(self.battery_status.current)
+        if self._battery_current_ema is None:
+            self._battery_current_ema = current_mag
+        else:
+            alpha = 0.1
+            self._battery_current_ema = (
+                alpha * current_mag + (1.0 - alpha) * self._battery_current_ema)
+
+        if self._battery_current_ema < 0.01:
+            robot_status.operation_hours_after_charging = placeholder
+            return
+
+        hours_remaining = remaining_ah / self._battery_current_ema
+        robot_status.operation_hours_after_charging = self._format_time_remaining(hours_remaining)
 
     def _set_estop_status(self, robot_status: RobotStatus):
-        """Map emergency stop signal to online_flag in the outgoing RobotStatus."""
+        """Map the emergency-stop signal to online_flag in the outgoing RobotStatus."""
         robot_status.online_flag = (
-            self.estop_status.data if self.estop_status.data else OnlineFlagEnum.ONLINE.value)
+            OnlineFlagEnum.EMERGENCY_STOP.value if self.estop_status.data
+            else OnlineFlagEnum.ONLINE.value)
 
     def _set_location_status(self, robot_status: RobotStatus):
         """Populate position and orientation fields from the latest ground-truth pose."""
@@ -1588,6 +1639,24 @@ class HuskyOperationsManager(Node):
     # =========================================================================
     # UTILITY METHODS
     # =========================================================================
+
+    def _wait_ready(self, key: str, delay: float) -> bool:
+        """
+        Non-blocking dwell. Replaces time.sleep() in the retry/dwell paths.
+
+        First call for `key` arms a deadline `delay` seconds ahead on the ROS
+        clock. Returns False until it passes, then clears it and returns True
+        once. Caller returns early while False and re-checks next timer tick.
+        """
+        now = self.get_clock().now()
+        deadline = self._dwell_deadlines.get(key)
+        if deadline is None:
+            self._dwell_deadlines[key] = now + Duration(seconds=delay)
+            return False
+        if now >= deadline:
+            del self._dwell_deadlines[key]
+            return True
+        return False
 
     def _is_robot_at_target(self):
         """

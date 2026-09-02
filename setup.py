@@ -33,8 +33,7 @@ setup(
             'husky_operations_manager = husky_operations_manager.husky_operations_manager:main',
 
             # Unit Test nodes
-            'reverse_navigation_node = husky_operations_manager.unit_test.reverse_navigation_node:main',
-            'docking_param_fetcher = husky_operations_manager.unit_test.test_docking_param_fetcher:main',
+            'reverse_navigation_node = husky_operations_manager.unit_test.test_reverse_navigation:main',
             'test_harvest_ops = husky_operations_manager.unit_test.test_husky_ops_navigation:main',
             'test_navigation_client = husky_operations_manager.unit_test.test_navigation_client:main',
             'test_docking_client = husky_operations_manager.unit_test.test_docking_client:main',

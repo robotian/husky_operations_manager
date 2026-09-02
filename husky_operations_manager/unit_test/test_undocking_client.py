@@ -7,9 +7,12 @@ Exercises the full undocking sequence:
   2. If the undocking action fails (ERROR), fall back to ReverseDriveClient
      which drives the robot in reverse using TF closed-loop feedback.
 
+Motion / dock configuration is read synchronously from `motion.*` ROS params
+(same layout as husky_operations_manager's config.yaml).
+
 Usage:
     ros2 run husky_operations_manager test_undocking_client \
-        --ros-args --params-file config/test_undocking_client.yaml \
+        --ros-args --params-file config/config.yaml \
         -r __ns:=/husky_0
 """
 
@@ -18,8 +21,11 @@ from rclpy.node import Node
 from status_interfaces.msg import SubTask, UndockGoal
 
 from husky_operations_manager.enum import RobotStatusEnum, ReverseDriveStatus
-from husky_operations_manager.dataclass import DockingConfig, DockInstanceConfig, DockPluginConfig
-from husky_operations_manager.docking_param_fetcher import DockingParamFetcher
+from husky_operations_manager.dataclass import (
+    DockInstanceConfig,
+    DockPose,
+    ReverseDriveConfig,
+)
 from husky_operations_manager.action_clients.undocking import UndockingActionClient
 from husky_operations_manager.action_clients.reverse_drive_client import ReverseDriveClient
 
@@ -59,18 +65,15 @@ class TestUndockingNode(Node):
         self._reverse_active    = False
         self._test_complete     = False
 
-        # Populated once DockingParamFetcher finishes
-        self.docking_config: DockingConfig | None       = None
-        self.active_dock:    DockInstanceConfig | None  = None
-        self.active_plugin:  DockPluginConfig | None    = None
+        # Clients — depend on motion_config
+        self.undocking_client     = UndockingActionClient(self)
+        self.reverse_drive_client = ReverseDriveClient(self, self.motion_config)
 
-        self.undocking_client: UndockingActionClient | None = None
-        self.reverse_drive_client: ReverseDriveClient | None  = None
-
-        # Fetch docking params from docking_server before building clients
-        self._param_fetcher = DockingParamFetcher(self)
-        self._param_fetcher.fetch()
-        self._config_poll_timer = self.create_timer(0.5, self._poll_docking_config)
+        self._main_timer = self.create_timer(self._timer_period, self._timer_callback)
+        self.get_logger().info(
+            f"Main timer started — beginning undocking test | "
+            f"active_dock='{self._active_dock_name}'"
+        )
 
     # =========================================================================
     # PARAMETER DECLARATION / READ
@@ -82,82 +85,71 @@ class TestUndockingNode(Node):
         self.declare_parameter('undocking.max_undocking_time', 30.0)
         self.declare_parameter('timing.timer_period',          1.0)
 
+        # Motion / dock config — per-dock leaves declared in _build_motion_config
+        self.declare_parameter('motion.dock_names', ['husky_charger'])
+        self.declare_parameter('motion.active_dock', '')
+        self.declare_parameter('motion.dock_for_charging', 'husky_charger')
+        self.declare_parameter('motion.dock_for_unloading', 'unloading_station')
+        self.declare_parameter('motion.staging_x_offset', -1.5)
+        self.declare_parameter('motion.staging_yaw_offset', 0.0)
+        self.declare_parameter('motion.base_frame', 'base_link')
+        self.declare_parameter('motion.controller_frequency', 50.0)
+        self.declare_parameter('motion.v_linear_min', 0.15)
+        self.declare_parameter('motion.v_angular_max', 0.25)
+        self.declare_parameter('motion.linear_tolerance', 0.05)
+        self.declare_parameter('motion.angular_tolerance', 0.1)
+        self.declare_parameter('motion.dock_backwards', False)
+
     def _read_parameters(self):
         """Read declared parameters into instance variables."""
         self._dock_type           = str(self.get_parameter('undocking.dock_type').value)
         self._max_undocking_time  = float(self.get_parameter('undocking.max_undocking_time').value)
         self._timer_period        = float(self.get_parameter('timing.timer_period').value)
 
+        self.motion_config = self._build_motion_config()
+
+        active = str(self.get_parameter('motion.active_dock').value)
+        names  = list(self.motion_config.dock_configs.keys())
+        self._active_dock_name = active if active in self.motion_config.dock_configs else names[0]
+
         self.get_logger().info(
             f"Parameters | dock_type='{self._dock_type}' | "
             f"max_undocking_time={self._max_undocking_time}s | "
-            f"timer_period={self._timer_period}s"
+            f"timer_period={self._timer_period}s | "
+            f"docks={names} | active_dock='{self._active_dock_name}'"
         )
 
-    # =========================================================================
-    # DOCKING CONFIG POLLING
-    # =========================================================================
+    def _build_motion_config(self) -> ReverseDriveConfig:
+        """Build a ReverseDriveConfig from the `motion.*` ROS params."""
+        m = 'motion'
+        dock_names = list(self.get_parameter(f'{m}.dock_names').value)
 
-    def _poll_docking_config(self):
-        """
-        Poll DockingParamFetcher every 0.5 s.
-
-        Cancels itself on DONE or ERROR. On DONE, fires _on_docking_config_ready
-        which constructs the action clients and starts the main timer.
-        """
-        from husky_operations_manager.enum import DockingParamFetcherStatus
-        status = self._param_fetcher.get_status()
-        self.get_logger().debug(f"DockingParamFetcher poll | status={status.name}")
-
-        if status == DockingParamFetcherStatus.DONE:
-            self._config_poll_timer.cancel()
-            self._on_docking_config_ready()
-
-        elif status == DockingParamFetcherStatus.ERROR:
-            self._config_poll_timer.cancel()
-            self.get_logger().error(
-                "DockingParamFetcher failed — cannot build ReverseDriveClient. "
-                "Running with UndockingActionClient only."
+        dock_configs: dict[str, DockInstanceConfig] = {}
+        for name in dock_names:
+            p = f'{m}.dock_configs.{name}'
+            self.declare_parameter(f'{p}.type', 'simple_charging_dock')
+            self.declare_parameter(f'{p}.frame', 'map')
+            self.declare_parameter(f'{p}.pose', [0.0, 0.0, 0.0])
+            pose = list(self.get_parameter(f'{p}.pose').value)
+            dock_configs[name] = DockInstanceConfig(
+                instance_name=name,
+                type=str(self.get_parameter(f'{p}.type').value),
+                frame=str(self.get_parameter(f'{p}.frame').value),
+                pose=DockPose(x=float(pose[0]), y=float(pose[1]), theta=float(pose[2])),
             )
-            self._build_clients_without_config()
 
-    def _on_docking_config_ready(self):
-        """Build action clients with full DockingConfig and start main timer."""
-        self.docking_config = self._param_fetcher.get_config()
-        self.active_dock    = self.docking_config.dock_configs[self.docking_config.docks[0]]
-        self.active_plugin  = self.docking_config.plugin_configs[self.docking_config.dock_plugins[0]]
-
-        self.get_logger().info(
-            f"DockingConfig ready | "
-            f"dock='{self.active_dock.instance_name}' | "
-            f"plugin='{self.active_plugin.plugin_name}' | "
-            f"staging_x_offset={self.active_plugin.staging_x_offset} | "
-            f"dock_backwards={self.docking_config.dock_backwards}"
+        return ReverseDriveConfig(
+            dock_configs=dock_configs,
+            staging_x_offset=float(self.get_parameter(f'{m}.staging_x_offset').value),
+            staging_yaw_offset=float(self.get_parameter(f'{m}.staging_yaw_offset').value),
+            base_frame=str(self.get_parameter(f'{m}.base_frame').value),
+            controller_frequency=float(self.get_parameter(f'{m}.controller_frequency').value),
+            v_linear_min=float(self.get_parameter(f'{m}.v_linear_min').value),
+            v_angular_max=float(self.get_parameter(f'{m}.v_angular_max').value),
+            linear_tolerance=float(self.get_parameter(f'{m}.linear_tolerance').value),
+            angular_tolerance=float(self.get_parameter(f'{m}.angular_tolerance').value),
+            dock_backwards=bool(self.get_parameter(f'{m}.dock_backwards').value),
         )
-
-        self.undocking_client     = UndockingActionClient(self)
-        self.reverse_drive_client = ReverseDriveClient(self, self.docking_config)
-
-        self._start_main_timer()
-
-    def _build_clients_without_config(self):
-        """
-        Build only UndockingActionClient when DockingParamFetcher fails.
-
-        ReverseDriveClient cannot be created without DockingConfig, so the
-        fallback path will not be available in this run.
-        """
-        self.undocking_client = UndockingActionClient(self)
-        self.get_logger().warning(
-            "ReverseDriveClient NOT available (no DockingConfig). "
-            "Only UndockingActionClient will be used."
-        )
-        self._start_main_timer()
-
-    def _start_main_timer(self):
-        """Create the 1 Hz main control timer and kick off the undocking sequence."""
-        self._main_timer = self.create_timer(self._timer_period, self._timer_callback)
-        self.get_logger().info("Main timer started — beginning undocking test")
 
     # =========================================================================
     # MAIN CONTROL LOOP
@@ -199,31 +191,18 @@ class TestUndockingNode(Node):
     # =========================================================================
 
     def _send_undocking_goal(self):
-        """Build a SubTask with UndockGoal from params and send to UndockingActionClient."""
-        if self.undocking_client is None:
-            self.get_logger().error("UndockingActionClient not yet initialised — waiting")
-            return
+        """Build a SubTask with UndockGoal from motion_config and send it."""
+        dock = self.motion_config.dock_configs.get(self._active_dock_name)
+        dock_type = dock.type if dock and dock.type else self._dock_type
 
-        # Use dock_type from DockingConfig if available, otherwise fall back to param
-        dock_type = (
-            self.active_dock.type
-            if self.active_dock and self.active_dock.type
-            else self._dock_type
+        staging_x_offset   = self.motion_config.staging_x_offset
+        v_linear_min       = self.motion_config.v_linear_min
+        max_undocking_time = (abs(staging_x_offset) / max(v_linear_min, 0.01)) * 1.25
+
+        self.get_logger().debug(
+            f"max_undocking_time from config | staging_x_offset={staging_x_offset} | "
+            f"v_linear_min={v_linear_min} | result={max_undocking_time:.1f}s"
         )
-
-        # Compute max_undocking_time from DockingConfig when possible
-        if self.active_plugin and self.docking_config:
-            staging_x_offset  = self.active_plugin.staging_x_offset or 0.7
-            v_linear_min      = self.docking_config.controller_v_linear_min or 0.01
-            max_undocking_time = (abs(staging_x_offset) / max(v_linear_min, 0.01)) * 2.0
-            self.get_logger().debug(
-                f"max_undocking_time computed from config | "
-                f"staging_x_offset={staging_x_offset} | "
-                f"v_linear_min={v_linear_min} | "
-                f"result={max_undocking_time:.1f}s"
-            )
-        else:
-            max_undocking_time = self._max_undocking_time
 
         undock_goal = UndockGoal(
             dock_type=dock_type,
@@ -240,13 +219,11 @@ class TestUndockingNode(Node):
             f"max_undocking_time={max_undocking_time:.1f}s"
         )
 
-        success = self.undocking_client.send_undocking_goal(subtask)
-
-        if success:
-            self.get_logger().info("✓ Undocking goal sent — monitoring UndockingActionClient")
+        if self.undocking_client.send_undocking_goal(subtask):
+            self.get_logger().info("Undocking goal sent — monitoring UndockingActionClient")
             self._phase = self._PHASE_UNDOCKING
         else:
-            self.get_logger().error("✗ Failed to send undocking goal")
+            self.get_logger().error("Failed to send undocking goal")
             self._phase = self._PHASE_DONE
 
     # =========================================================================
@@ -268,20 +245,19 @@ class TestUndockingNode(Node):
             )
 
         if status == RobotStatusEnum.DONE_UNDOCKING:
-            self.get_logger().info("✓ Undocking SUCCEEDED via UndockingActionClient")
+            self.get_logger().info("Undocking SUCCEEDED via UndockingActionClient")
             self.undocking_client.reset()
             self._phase = self._PHASE_DONE
 
         elif status == RobotStatusEnum.ERROR:
             self.get_logger().warning(
-                "✗ UndockingActionClient reported ERROR — "
+                "UndockingActionClient reported ERROR — "
                 "attempting ReverseDriveClient fallback"
             )
             self.undocking_client.reset()
             self._start_reverse_drive()
 
         elif status in (RobotStatusEnum.IDLE, RobotStatusEnum.START_UNDOCKING):
-            # Still waiting for the action server to respond
             self.get_logger().debug(f"Waiting for undocking to begin | status={status.name}")
 
     # =========================================================================
@@ -289,49 +265,34 @@ class TestUndockingNode(Node):
     # =========================================================================
 
     def _start_reverse_drive(self):
-        """
-        Activate ReverseDriveClient as fallback when undocking action fails.
-
-        Falls through to DONE immediately if ReverseDriveClient is unavailable
-        (e.g. DockingConfig was not fetched successfully).
-        """
-        if self.reverse_drive_client is None:
-            self.get_logger().error(
-                "ReverseDriveClient not available — cannot attempt reverse drive fallback"
-            )
-            self._phase = self._PHASE_DONE
-            return
-
+        """Activate ReverseDriveClient as fallback when the undocking action fails."""
         self.get_logger().info("Starting ReverseDriveClient fallback...")
 
-        if self.reverse_drive_client.drive_to_staging():
-            self.get_logger().info("✓ ReverseDriveClient started — monitoring reverse drive")
+        if self.reverse_drive_client.drive_to_staging(self._active_dock_name):
+            self.get_logger().info("ReverseDriveClient started — monitoring reverse drive")
             self._reverse_active = True
             self._phase          = self._PHASE_REVERSE
         else:
             self.get_logger().error(
-                "✗ ReverseDriveClient refused to start "
-                f"(dock_backwards={self.docking_config.dock_backwards if self.docking_config else 'unknown'})"
+                "ReverseDriveClient refused to start "
+                f"(dock='{self._active_dock_name}' "
+                f"dock_backwards={self.motion_config.dock_backwards})"
             )
             self._phase = self._PHASE_DONE
 
     def _poll_reverse_drive(self):
         """Poll ReverseDriveClient and advance phase on terminal status."""
-        if self.reverse_drive_client is None:
-            self._phase = self._PHASE_DONE
-            return
-
         status = self.reverse_drive_client.get_status()
         self.get_logger().info(f"Reverse drive status: {status.name}")
 
         if status == ReverseDriveStatus.DONE:
-            self.get_logger().info("✓ Reverse drive SUCCEEDED — robot reached staging pose")
+            self.get_logger().info("Reverse drive SUCCEEDED — robot reached staging pose")
             self._reverse_active = False
             self.reverse_drive_client.reset()
             self._phase = self._PHASE_DONE
 
         elif status == ReverseDriveStatus.ERROR:
-            self.get_logger().error("✗ Reverse drive FAILED — both undocking paths exhausted")
+            self.get_logger().error("Reverse drive FAILED — both undocking paths exhausted")
             self._reverse_active = False
             self.reverse_drive_client.reset()
             self._phase = self._PHASE_DONE
@@ -350,21 +311,15 @@ class TestUndockingNode(Node):
     # =========================================================================
 
     def _finish_test(self):
-        """
-        Cancel the main timer, clean up any active goals, and shut the node down.
-
-        Called irrespective of outcome (success, error, or fallback failure) so
-        the process always exits cleanly without requiring Ctrl-C.
-        """
+        """Cancel the main timer, clean up any active goals, and shut the node down."""
         self._test_complete = True
         self._main_timer.cancel()
         self.get_logger().info(
-            "══════════════════════════════════════\n"
+            "======================================\n"
             "  Undocking test sequence complete.\n"
             "  Shutting down node.\n"
-            "══════════════════════════════════════"
+            "======================================"
         )
-        # Cancel any goals that may still be in-flight before tearing down
         self.cancel_active_goals()
         self.destroy_node()
         rclpy.shutdown()

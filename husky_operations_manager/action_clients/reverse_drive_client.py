@@ -13,7 +13,7 @@ from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.node import Node
 from rclpy.time import Time
 
-from husky_operations_manager.dataclass import DockingConfig
+from husky_operations_manager.dataclass import DockInstanceConfig, ReverseDriveConfig
 from husky_operations_manager.enum import ReverseDriveStatus
 
 warnings.filterwarnings("ignore", category=SyntaxWarning,module="angles.*")
@@ -24,34 +24,37 @@ with warnings.catch_warnings():
 
 def _yaw_from_quaternion(q: Quaternion) -> float:
     _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
-    return yaw  
+    return yaw
 
 
 class ReverseDriveClient:
-    """Drives robot in reverse to staging pose using TF closed-loop feedback."""
+    """Drives robot in reverse to a staging pose using TF closed-loop feedback.
 
-    def __init__(self, node: Node, config: DockingConfig) -> None:
+    Holds no dock identity between runs. The caller selects a dock per run via
+    drive_to_staging(dock_name); the staging pose is computed at that point.
+    """
+
+    def __init__(self, node: Node, config: ReverseDriveConfig) -> None:
         self.node      = node
         self.config    = config
         self.logger    = RcutilsLogger(self.__class__.__name__)
         self.namespace = self.node.get_namespace().rstrip('/')
 
-        self._status:     ReverseDriveStatus = ReverseDriveStatus.IDLE
-        self._done:       bool               = False
-        self._start_time: float | None       = None
-
-        # Resolve active dock and plugin
-        self._dock   = config.dock_configs[config.docks[0]]
-        self._plugin = config.plugin_configs[config.dock_plugins[0]]
+        self._status:       ReverseDriveStatus         = ReverseDriveStatus.IDLE
+        self._done:         bool                       = False
+        self._start_time:   float | None               = None
+        self._active_dock:  DockInstanceConfig | None  = None
+        self._staging_pose: PoseStamped | None         = None
 
         # Speed and tolerances directly from config
-        self._lin_speed = config.controller_v_linear_min
-        self._ang_speed = config.controller_v_angular_max
-        self._lin_tol   = config.undock_linear_tolerance
-        self._ang_tol   = config.undock_angular_tolerance
+        self._lin_speed = config.v_linear_min
+        self._ang_speed = config.v_angular_max
+        self._lin_tol   = config.linear_tolerance
+        self._ang_tol   = config.angular_tolerance
 
-        # Timeout: abs(staging_x_offset) / v_linear_min * 2.0
-        self._timeout = (abs(self._plugin.staging_x_offset) / self._lin_speed) * 1.25
+        # Timeout: abs(staging_x_offset) / v_linear_min * 1.25
+        # max() guards against a zero v_linear_min in config.
+        self._timeout = (abs(config.staging_x_offset) / max(config.v_linear_min, 0.01)) * 1.25
 
         # TF
         self._tf_buffer   = tf2_ros.Buffer()
@@ -65,9 +68,6 @@ class ReverseDriveClient:
             PoseStamped, f'{self.namespace}/reverse_nav/staging_pose', 10
         )
 
-        # Pre-compute and latch staging pose
-        self._staging_pose = self._compute_staging_pose()
-
         # Control timer — idles until drive_to_staging() is called
         self._control_timer = self.node.create_timer(
             1.0 / config.controller_frequency,
@@ -76,9 +76,7 @@ class ReverseDriveClient:
 
         self.logger.info(
             f"ReverseDriveClient Started | "
-            f"dock='{self._dock.instance_name}' | "
-            f"staging=({self._staging_pose.pose.position.x:.3f}, "
-            f"{self._staging_pose.pose.position.y:.3f}) | "
+            f"docks={list(config.dock_configs.keys())} | "
             f"speed={self._lin_speed} m/s | timeout={self._timeout:.1f}s"
         )
 
@@ -86,7 +84,7 @@ class ReverseDriveClient:
     # Public
     # ------------------------------------------------------------------
 
-    def drive_to_staging(self) -> bool:
+    def drive_to_staging(self, dock_name: str) -> bool:
         if self._status == ReverseDriveStatus.REVERSING:
             self.logger.warning("drive_to_staging() ignored — already active")
             return False
@@ -99,10 +97,21 @@ class ReverseDriveClient:
             self._status = ReverseDriveStatus.ERROR
             return False
 
-        self._done       = False
-        self._start_time = None
-        self._status     = ReverseDriveStatus.REVERSING
-        self.logger.info("Reverse drive started")
+        dock = self.config.dock_configs.get(dock_name)
+        if dock is None:
+            self.logger.error(
+                f"drive_to_staging() — unknown dock '{dock_name}' | "
+                f"known={list(self.config.dock_configs.keys())}"
+            )
+            self._status = ReverseDriveStatus.ERROR
+            return False
+
+        self._active_dock  = dock
+        self._staging_pose = self._compute_staging_pose(dock)
+        self._done         = False
+        self._start_time   = None
+        self._status       = ReverseDriveStatus.REVERSING
+        self.logger.info(f"Reverse drive started | dock='{dock_name}'")
         return True
 
     def cancel(self) -> None:
@@ -118,19 +127,21 @@ class ReverseDriveClient:
         return self._status == ReverseDriveStatus.REVERSING
 
     def reset(self) -> None:
-        self._status     = ReverseDriveStatus.IDLE
-        self._done       = False
-        self._start_time = None
+        self._status       = ReverseDriveStatus.IDLE
+        self._done         = False
+        self._start_time   = None
+        self._active_dock  = None
+        self._staging_pose = None
         self.logger.info("ReverseDriveClient reset to IDLE")
 
     # ------------------------------------------------------------------
     # Staging pose
     # ------------------------------------------------------------------
 
-    def _compute_staging_pose(self) -> PoseStamped:
-        staging_x     = self._dock.dock_x + math.cos(self._dock.dock_theta) * self._plugin.staging_x_offset
-        staging_y     = self._dock.dock_y + math.sin(self._dock.dock_theta) * self._plugin.staging_x_offset
-        staging_theta = self._dock.dock_theta + self._plugin.staging_yaw_offset
+    def _compute_staging_pose(self, dock: DockInstanceConfig) -> PoseStamped:
+        staging_x     = dock.pose.x + math.cos(dock.pose.theta) * self.config.staging_x_offset
+        staging_y     = dock.pose.y + math.sin(dock.pose.theta) * self.config.staging_x_offset
+        staging_theta = dock.pose.theta + self.config.staging_yaw_offset
 
         # Converting euler angle to Quaternion
         x, y, z, w = quaternion_from_euler(0.0, 0.0, staging_theta)
@@ -138,7 +149,7 @@ class ReverseDriveClient:
         q.w, q.x, q.y, q.z = float(w), float(x), float(y), float(z)
 
         pose = PoseStamped()
-        pose.header.frame_id  = self._dock.frame
+        pose.header.frame_id  = dock.frame
         pose.header.stamp     = self.node.get_clock().now().to_msg()
         pose.pose.position.x  = staging_x
         pose.pose.position.y  = staging_y
@@ -156,7 +167,7 @@ class ReverseDriveClient:
     # ------------------------------------------------------------------
 
     def _control_loop(self) -> None:
-        if self._status != ReverseDriveStatus.REVERSING:
+        if self._status != ReverseDriveStatus.REVERSING or self._staging_pose is None:
             return
 
         self._staging_pose.header.stamp = self.node.get_clock().now().to_msg()
@@ -182,7 +193,7 @@ class ReverseDriveClient:
             elapsed = time.monotonic() - self._start_time
             self._shutdown(success=True, msg=f"Staging pose reached in {elapsed:.2f}s")
             return
-        
+
         self._publish_cmd_vel(cmd)
 
     # ------------------------------------------------------------------
@@ -233,11 +244,6 @@ class ReverseDriveClient:
         except Exception as e:
             self.logger.error(f"TF base_frame lookup failed: {e}")
             return False
-
-        # tf_yaw = _yaw_from_quaternion(tf.transform.rotation)
-        # t      = tf.transform.translation
-        # lx     = math.cos(tf_yaw) * target.pose.position.x - math.sin(tf_yaw) * target.pose.position.y + t.x
-        # ly     = math.sin(tf_yaw) * target.pose.position.x + math.cos(tf_yaw) * target.pose.position.y + t.y
 
         local_target = tf2_geometry_msgs.do_transform_pose(target.pose, tf)
         lx = local_target.position.x

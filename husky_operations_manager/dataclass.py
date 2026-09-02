@@ -1,4 +1,5 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+
 from geometry_msgs.msg import PoseStamped
 
 
@@ -53,83 +54,28 @@ class Docks:
 
 
 @dataclass
-class DockPluginConfig:
-    plugin_name: str
-    plugin: str
-    docking_threshold: float
-    staging_x_offset: float
-    staging_yaw_offset: float
-    use_external_detection_pose: bool
-    external_detection_timeout: float
-    external_detection_translation_x: float
-    external_detection_translation_y: float
-    external_detection_rotation_roll: float
-    external_detection_rotation_pitch: float
-    external_detection_rotation_yaw: float
-    filter_coef: float
-    detector_service_name: str
-    detector_service_timeout: float
-    subscribe_toggle: bool
-    use_battery_status: bool
-    use_stall_detection: bool
-    stall_velocity_threshold: float
-    stall_effort_threshold: float
-    charging_threshold: float
-    rotate_to_dock: bool
-    dock_direction: str
-
-
-@dataclass
 class DockInstanceConfig:
     instance_name: str
     type: str
     frame: str
-    pose: list
-    id: str
-    dock_x: float
-    dock_y: float
-    dock_theta: float
+    pose: DockPose
 
 
 @dataclass
-class DockingConfig:
-    # Raw lists from docking_server
-    dock_plugins: list
-    docks: list
-
-    # Fetched configs keyed by name
-    plugin_configs: dict  # plugin_name → DockPluginConfig
-    dock_configs: dict  # dock_name   → DockInstanceConfig
-
-    # Top-level params
+class ReverseDriveConfig:
+    # Every dock the client can reverse to, keyed by instance name. The caller
+    # selects one per run via drive_to_staging(dock_name) — the client holds no
+    # dock identity between runs. Each dock's `type` doubles as its plugin name.
+    dock_configs: dict[str, DockInstanceConfig]
+    staging_x_offset: float
+    staging_yaw_offset: float
     base_frame: str
-    fixed_frame: str
     controller_frequency: float
-    initial_perception_timeout: float
-    wait_charge_timeout: float
-    dock_approach_timeout: float
-    undock_linear_tolerance: float
-    undock_angular_tolerance: float
-    max_retries: int
+    v_linear_min: float
+    v_angular_max: float
+    linear_tolerance: float
+    angular_tolerance: float
     dock_backwards: bool
-    dock_prestaging_tolerance: float
-
-    # Controller params
-    controller_k_phi: float
-    controller_k_delta: float
-    controller_v_linear_min: float
-    controller_v_linear_max: float
-    controller_v_angular_max: float
-    controller_slowdown_radius: float
-    controller_use_collision_detection: bool
-    controller_costmap_topic: str
-    controller_footprint_topic: str
-    controller_transform_tolerance: float
-    controller_projection_time: float
-    controller_simulation_time_step: float
-    controller_dock_collision_threshold: float
-    controller_rotate_to_heading_angular_vel: float
-    controller_rotate_to_heading_max_angular_accel: float
 
 
 @dataclass
@@ -142,7 +88,7 @@ class ManipulatorTaskFeedback:
     feedback_message: str
     execution_time: float
     num_retries: int
-    arm_pose: PoseStamped = field(default_factory=PoseStamped)
+    arm_pose: PoseStamped
 
 
 @dataclass

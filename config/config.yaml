@@ -34,7 +34,39 @@
     # Server timeout
     server:
       action_server_timeout: 5.0  # seconds
-  
+
+    # Motion / dock configuration.
+    # FALLBACK ONLY. The launch file translates the Nav2 docking_server block
+    # from nav2.yaml into these motion.* params and applies it AFTER this file,
+    # so nav2.yaml wins for every key it provides. The values below are used
+    # only when nav2.yaml is missing or a key is absent from it.
+    # dock_for_charging / dock_for_unloading are NOT in nav2.yaml and are always
+    # taken from here.
+    motion:
+      dock_names: ['husky_charger', 'unloading_station']
+      dock_configs:
+        husky_charger:
+          type: 'simple_charging_dock'
+          frame: 'map'
+          pose: [0.0, 0.0, 0.0]           # x, y, theta — overridden by nav2.yaml
+        unloading_station:
+          type: 'simple_charging_dock'
+          frame: 'map'
+          pose: [0.0, 0.0, 0.0]           # x, y, theta — overridden by nav2.yaml
+      # task_type -> dock name (owned here, not in nav2.yaml)
+      dock_for_charging: 'husky_charger'
+      dock_for_unloading: 'unloading_station'
+      # staging pose offsets (shared by all docks)
+      staging_x_offset: -1.5
+      staging_yaw_offset: 0.0
+      base_frame: 'base_link'
+      controller_frequency: 50.0
+      v_linear_min: 0.15
+      v_angular_max: 0.25
+      linear_tolerance: 0.05
+      angular_tolerance: 0.1
+      dock_backwards: false
+
 /*/reverse_navigation_node:
   ros__parameters:
   

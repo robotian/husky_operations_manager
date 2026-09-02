@@ -1,5 +1,6 @@
 from enum import Enum
 
+
 class TaskEnum(Enum):
     """Tasks types in the system."""
 
@@ -111,14 +112,3 @@ class ReverseDriveStatus(Enum):
     DONE      = 2
     CANCELED  = 3
     ERROR     = 4
- 
- 
-class DockingParamFetcherStatus(Enum):
-    """ Status enum for DockingParamFetcher. """
-    IDLE      = 0
-    LISTING   = 1
-    FETCHING  = 2
-    RESOLVING = 3
-    COMPUTING = 4
-    DONE      = 5
-    ERROR     = 6
