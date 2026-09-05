@@ -1,17 +1,15 @@
-import warnings
-
 import math
 import time
+import warnings
 
 import tf2_geometry_msgs
 import tf2_ros
-from tf_transformations import euler_from_quaternion, quaternion_from_euler
-
 from geometry_msgs.msg import PoseStamped, Quaternion, Twist, TwistStamped
 from rclpy.duration import Duration
 from rclpy.impl.rcutils_logger import RcutilsLogger
 from rclpy.node import Node
 from rclpy.time import Time
+from tf_transformations import euler_from_quaternion, quaternion_from_euler
 
 from husky_operations_manager.dataclass import DockInstanceConfig, ReverseDriveConfig
 from husky_operations_manager.enum import ReverseDriveStatus
@@ -51,6 +49,11 @@ class ReverseDriveClient:
         self._ang_speed = config.v_angular_max
         self._lin_tol   = config.linear_tolerance
         self._ang_tol   = config.angular_tolerance
+        # Decelerate within this distance of the staging pose so a slow control
+        # tick cannot overshoot. Speed never drops below _min_speed_frac of
+        # _lin_speed so the robot keeps creeping to the line.
+        self._slowdown_radius = 0.5
+        self._min_speed_frac  = 0.25
 
         # Timeout: abs(staging_x_offset) / v_linear_min * 1.25
         # max() guards against a zero v_linear_min in config.
@@ -221,19 +224,16 @@ class ReverseDriveClient:
     def _compute_command(
         self, cmd: Twist, target: PoseStamped, robot_pose: PoseStamped
     ) -> bool:
-        """Compute reverse cmd_vel toward target. Returns True when goal reached."""
-        dist = math.hypot(
-            robot_pose.pose.position.x - target.pose.position.x,
-            robot_pose.pose.position.y - target.pose.position.y,
-        )
-        yaw_err = shortest_angular_distance(
-            _yaw_from_quaternion(robot_pose.pose.orientation),
-            _yaw_from_quaternion(target.pose.orientation),
-        )
+        """
+        Compute reverse cmd_vel toward the staging pose. Returns True once the
+        robot has reached OR passed the staging line along its own reverse axis.
 
-        if dist < self._lin_tol and abs(yaw_err) < self._ang_tol:
-            return True
-
+        Progress is measured in the robot base frame: local_x is the staging pose
+        ahead of the robot, so it starts negative (staging behind) and rises
+        toward 0 as the robot reverses. Success at local_x >= -linear_tolerance —
+        an overshoot (local_x > 0) still counts, so the robot can never fail by
+        driving past the point and running away from it.
+        """
         try:
             tf = self._tf_buffer.lookup_transform(
                 self.config.base_frame,
@@ -249,9 +249,20 @@ class ReverseDriveClient:
         lx = local_target.position.x
         ly = local_target.position.y
 
+        # Reached or passed the staging line — stop.
+        if lx >= -self._lin_tol:
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+            return True
+
+        remaining = -lx  # positive reverse distance still to travel
+        speed = self._lin_speed * max(
+            self._min_speed_frac, min(1.0, remaining / self._slowdown_radius)
+        )
+
         heading_error = shortest_angular_distance(math.pi, math.atan2(ly, lx))
 
-        cmd.linear.x  = -self._lin_speed
+        cmd.linear.x  = -speed
         cmd.angular.z = max(-self._ang_speed,
                             min(self._ang_speed,
                                 self._ang_speed * (heading_error / math.pi)))
@@ -262,7 +273,7 @@ class ReverseDriveClient:
         msg.header.stamp    = self.node.get_clock().now().to_msg()
         msg.header.frame_id = self.config.base_frame
         msg.twist           = twist
-        self.logger.info(f"Sending msg: {msg}", throttle_duration_sec=1.0)
+        self.logger.debug(f"Sending msg: {msg}", throttle_duration_sec=1.0)
         self._cmd_vel_pub.publish(msg)
 
     # ------------------------------------------------------------------

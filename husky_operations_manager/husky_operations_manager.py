@@ -1,10 +1,12 @@
 import math
 
 import rclpy
-from geometry_msgs.msg import PoseWithCovarianceStamped
+import tf2_ros
+from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
 from sensor_msgs.msg import BatteryState, Imu, NavSatFix
 from status_interfaces.msg import RobotStatus, SubTask, Task, UndockGoal, WayPoint
 from std_msgs.msg import Bool
@@ -181,6 +183,29 @@ class HuskyOperationsManager(Node):
         self.declare_parameter('timing.initial_position_check_delay', 2.0)
         self.declare_parameter('server.action_server_timeout', 5.0)
 
+        # Startup "am I docked?" check. The robot map pose is projected into each
+        # dock's frame; it is treated as docked if it sits in the staging corridor
+        # (staging_x_offset - x_tol <= local_x <= x_tol), close to the dock axis
+        # (|local_y| <= lat_tol) and roughly aligned (|yaw - dock.theta| <= yaw_tol).
+        self.declare_parameter('startup.dock_x_tol', 0.30)
+        self.declare_parameter('startup.dock_lat_tol', 0.40)
+        self.declare_parameter('startup.dock_yaw_tol', 0.35)
+        # The decision is committed only after this many consecutive TF pose
+        # samples agree within pose_stable_eps metres.
+        self.declare_parameter('startup.pose_stable_count', 3)
+        self.declare_parameter('startup.pose_stable_eps', 0.05)
+        # Startup undocking (undock_robot + reverse-drive fallback) attempts before
+        # giving up and holding in ERROR for manual intervention.
+        self.declare_parameter('startup.undock_max_retries', 3)
+
+        # TF pose staleness: warn (throttled) if the map->base transform is older
+        # than this. The transform is still used.
+        self.declare_parameter('pose.tf_max_age', 1.0)
+
+        # Max time to wait for any arm goal (STOW / READY / harvest) result before
+        # giving up and transitioning to ERROR.
+        self.declare_parameter('arm.goal_timeout', 60.0)
+
         # Motion / dock config (replaces the old docking_server fetch).
         # Per-dock leaves (motion.dock_configs.<name>.*) are declared in
         # _build_motion_config once motion.dock_names is known.
@@ -211,6 +236,15 @@ class HuskyOperationsManager(Node):
         self.timing_initial_position_check_delay = self._p_float('timing.initial_position_check_delay')
         self.server_action_server_timeout = self._p_float('server.action_server_timeout')
 
+        self.startup_dock_x_tol = self._p_float('startup.dock_x_tol')
+        self.startup_dock_lat_tol = self._p_float('startup.dock_lat_tol')
+        self.startup_dock_yaw_tol = self._p_float('startup.dock_yaw_tol')
+        self.startup_pose_stable_count = self._p_int('startup.pose_stable_count')
+        self.startup_pose_stable_eps = self._p_float('startup.pose_stable_eps')
+        self.startup_undock_max_retries = self._p_int('startup.undock_max_retries')
+        self.pose_tf_max_age = self._p_float('pose.tf_max_age')
+        self.arm_goal_timeout = self._p_float('arm.goal_timeout')
+
         self.get_logger().debug(
             f'Parameters loaded | '
             f'nav_retries={self.navigation_max_retries} nav_delay={self.navigation_retry_delay}s | '
@@ -237,11 +271,19 @@ class HuskyOperationsManager(Node):
         """
         # --- Startup ---
         self.is_initialized = False  # True after check_initial_position runs
-        self.is_at_docking_station = False  # True if robot started within docking_threshold
+        self.is_at_docking_station = False  # True if robot started in a dock's staging corridor
         self.startup_undock_complete = False  # True once startup undocking path is done
         # Also used to distinguish startup vs task
         # context in _handle_undocking and
         # _handle_reverse_drive
+        # TF pose stability gate for the startup docked/not-docked decision
+        self._pose_stable_samples = 0
+        self._last_stable_xy: tuple[float, float] | None = None
+        # Startup-undock attempt counter + hard-hold flag. Each fresh
+        # IDLE -> START_UNDOCKING counts as one attempt; past the ceiling the node
+        # holds in ERROR (error recovery does not bounce it back to IDLE).
+        self._startup_undock_attempts = 0
+        self._startup_undock_failed = False
 
         # --- Robot state ---
         self.current_status = RobotStatusEnum.IDLE
@@ -258,12 +300,19 @@ class HuskyOperationsManager(Node):
         self.last_handled_task_id: int | None = None
         self.last_handled_task_type: int | None = None
         self.last_handled_subtask_type: int | None = None
+        # De-dupes the "New Task" log line — separate from last_handled_task_id,
+        # which only updates once the task actually starts.
+        self._last_logged_task_id: int | None = None
 
         # Current topological map node the robot occupies; updated on DESTINATION_REACHED
         self.current_node_id = 0
         # Load level 0-100%; incremented by loading_increment per harvest cycle,
         # reset to 0 after successful unloading
         self.current_load_status = 0.0
+        # One-shot: seed current_load_status from the first Task message's
+        # crop_load so a restart keeps the basket level. Never re-seeded (a
+        # harvest/unload owns the value after that).
+        self._load_seeded = False
 
         # --- Retry counters ---
         self.navigation_retry_count = 0  # Reset to 0 on success or after max reached
@@ -278,6 +327,11 @@ class HuskyOperationsManager(Node):
         # --- Battery current EMA (for remaining-runtime estimate) ---
         self._battery_current_ema: float | None = None
 
+        # --- Charge current EMA (for charge-completion ETA) ---
+        # Kept separate from _battery_current_ema, which tracks discharge
+        # magnitude. Reset to None at the start of every charging session.
+        self._charge_current_ema: float | None = None
+
         # --- Job duration (used for unloading/charging timers) ---
         self.job_start_time = None  # rclpy clock time when current job phase started
         self.job_duration = 0.0  # Duration in seconds for current phase
@@ -289,6 +343,11 @@ class HuskyOperationsManager(Node):
         self.last_undocking_subtask: SubTask | None = None
         # Tracks which task type triggered undocking (CHARGING_TASK or UNLOADING_TASK)
         self.undocking_after_task_type: int | None = None
+        # timer_callback runs the state machine and then publishes once, so a
+        # status set and cleared inside one tick never reaches the wire. The
+        # server frees the dock on DONE_UNDOCKING, so that status has to be
+        # published: this flag holds it for one tick before JOB_DONE.
+        self.done_undocking_published: bool = False
 
         # --- Reverse drive ---
         # Set True when ReverseDriveClient.drive_to_staging() starts.
@@ -297,17 +356,28 @@ class HuskyOperationsManager(Node):
         self.reverse_drive_active: bool = False
 
         # --- Arm state ---
-        # Tracks the last successfully confirmed arm command so STOW can be
-        # verified before undocking and READY before harvesting without issuing
-        # redundant goals when the arm is already in the correct configuration.
-        # Boot assumption: arm is in STOW at startup (safe default).
+        # Tracks the last arm command the manipulator server REPORTED as complete.
+        # NOTE: trust-on-report — set purely from the action returning success,
+        # with no joint-state / arm-pose confirmation. A server that reports OK
+        # without the arm reaching the configuration will be believed. Closed-loop
+        # verification needs the arm's joint-states interface (out of scope here).
+        # Boot value UNKNOWN forces an explicit STOW before the first gated move.
         self.last_confirmed_arm_command: str = ArmCommand.UNKNOWN
         # True while waiting for a STOW goal to complete via _handle_manipulator.
-        # Gates _subtask_undocking from proceeding until arm is safe.
+        # Gates undocking, moving, docking and error recovery.
         self.arm_stow_pending: bool = False
         # True while waiting for a READY goal to complete via _handle_manipulator.
         # Gates _subtask_harvesting from advancing past DESTINATION_REACHED.
         self.arm_ready_pending: bool = False
+        # True when the current ERROR was caused by an arm failure (goal rejected,
+        # ABORTED, or timed out). Error recovery must NOT re-command an untrusted
+        # arm — the node holds in ERROR until restarted.
+        self._error_from_arm: bool = False
+        # True when the current ERROR was caused by low battery. Error recovery
+        # holds in ERROR (arm still gets stowed) until a CHARGING_TASK arrives —
+        # it must not bounce straight back to IDLE, which would just re-trigger
+        # the same low-battery check on the next tick.
+        self._error_from_low_battery: bool = False
 
         self.get_logger().debug('State variables initialised')
 
@@ -316,26 +386,28 @@ class HuskyOperationsManager(Node):
         self.battery_status = BatteryState()
         self.task = Task()
         self.gps_status = NavSatFix()
-        self.pose_status = PoseWithCovarianceStamped()
+        # Robot pose in the map frame, refreshed from TF each timer tick.
+        # None until the first successful map -> base_frame lookup.
+        self.pose_status: PoseStamped | None = None
         self.imu_status = Imu()
         self.estop_status = Bool()
-        # True once a real message has arrived on the pose topic. pose_status is
-        # a non-None empty message at boot, so an 'is None' check is not enough.
+        # True once at least one TF pose lookup has succeeded.
         self._pose_received = False
 
     def _init_subscriptions(self):
-        """Create all ROS2 subscriptions."""
+        """Create all ROS2 subscriptions and the TF listener."""
+        # Robot pose is taken from TF (map -> base frame), refreshed each timer
+        # tick by _update_pose_from_tf. Replaces the ground_truth/pose topic.
+        self._pose_reference_frame = 'map'
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
         # Battery state — used for low-battery detection and charge completion checks
         self.battery_sub = self.create_subscription(
             BatteryState,
             f'{self.namespace}/platform/bms/state',
             lambda msg: setattr(self, 'battery_status', msg),
             qos_profile_sensor_data,
-        )
-
-        # Ground-truth pose — used for initial dock distance check and navigation target check
-        self.pose_sub = self.create_subscription(
-            PoseWithCovarianceStamped, f'{self.namespace}/ground_truth/pose', self._pose_callback, 10
         )
 
         # IMU — stored but not currently used in state machine logic
@@ -404,7 +476,13 @@ class HuskyOperationsManager(Node):
         )
 
         if is_new_task:
-            self.get_logger().info(f'New Task: {msg.description} (ID: {msg.task_id})')
+            # Log once per task_id, not on every republish. last_handled_task_id
+            # only updates once the task actually starts (_handle_task_start), so
+            # while the node holds in ERROR (e.g. low battery) a stuck task_id can
+            # otherwise re-log "New Task" on every JobPublisher republish.
+            if msg.task_id != self._last_logged_task_id:
+                self.get_logger().info(f'New Task: {msg.description} (ID: {msg.task_id})')
+                self._last_logged_task_id = msg.task_id
             self.current_sub_task_index = 0
             self.last_handled_subtask_type = None
             # self.current_load_status = msg.crop_load
@@ -416,11 +494,15 @@ class HuskyOperationsManager(Node):
             if self.current_status == RobotStatusEnum.JOB_DONE:
                 self._transition_status(RobotStatusEnum.IDLE)
 
-        # On node start, seed load from the first task message (server is the
-        # source of truth for basket load across a restart). Read msg, not
-        # self.task, which is still the empty default here.
-        if self.last_handled_task_id is None:
+        # Seed load once from the first task message (server is the source of
+        # truth for basket level across a restart). A dedicated one-shot flag —
+        # not last_handled_task_id, which only advances once a task actually
+        # starts, so while the node is held before start it would otherwise
+        # re-clobber current_load_status on every republish.
+        if not self._load_seeded:
             self.current_load_status = msg.crop_load
+            self._load_seeded = True
+            self.get_logger().info(f'Load seeded from task: {self.current_load_status:.1f}')
 
         self.task = msg
 
@@ -440,7 +522,9 @@ class HuskyOperationsManager(Node):
         robot_status.header.stamp = self.get_clock().now().to_msg()
         robot_status.robot_namespace = self.namespace.replace(r'/', '')
 
-        # Update sensor fields before routing so all paths see fresh data
+        # Refresh pose from TF, then update sensor fields before routing so all
+        # paths see fresh data
+        self._update_pose_from_tf()
         self._set_battery_status(robot_status)
         self._set_estop_status(robot_status)
         self._set_location_status(robot_status)
@@ -458,7 +542,7 @@ class HuskyOperationsManager(Node):
         # ERROR and ABNORMAL are handled before startup check so a fault during
         # startup undocking is also covered by _handle_error_recovery
         if self.current_status in [RobotStatusEnum.ERROR, RobotStatusEnum.ABNORMAL]:
-            self._handle_error_recovery()
+            self._handle_error_recovery(robot_status)
         elif not self.startup_undock_complete:
             self._handle_startup_undocking(robot_status)
         else:
@@ -471,12 +555,48 @@ class HuskyOperationsManager(Node):
         self.robot_state_pub.publish(robot_status)
 
     # =========================================================================
-    # SUBSCRIPTION CALLBACK
+    # POSE (TF)
     # =========================================================================
 
-    def _pose_callback(self, msg):
-        """Store latest ground-truth pose for dock distance checks and target validation."""
-        self.pose_status = msg
+    def _update_pose_from_tf(self):
+        """
+        Refresh self.pose_status from the map -> base_frame transform.
+
+        Called each timer tick. On a lookup failure the last good pose is kept
+        and _pose_received is left unchanged.
+        """
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self._pose_reference_frame,
+                self.motion_config.base_frame,
+                Time(),
+                timeout=Duration(seconds=0.1),
+            )
+        except Exception as e:  # noqa: BLE001 - any TF failure: keep last good pose
+            self.get_logger().warning(
+                f'Pose TF lookup {self._pose_reference_frame} -> '
+                f'{self.motion_config.base_frame} failed: {e}',
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        # Staleness check — warn only, the transform is still used
+        stamp = Time.from_msg(tf.header.stamp)
+        age = (self.get_clock().now() - stamp).nanoseconds / 1e9
+        if age > self.pose_tf_max_age:
+            self.get_logger().warning(
+                f'Pose TF is stale: {age:.2f}s old (> {self.pose_tf_max_age:.1f}s) — '
+                f'{self._pose_reference_frame} -> {self.motion_config.base_frame}',
+                throttle_duration_sec=2.0,
+            )
+
+        pose = PoseStamped()
+        pose.header = tf.header
+        pose.pose.position.x = tf.transform.translation.x
+        pose.pose.position.y = tf.transform.translation.y
+        pose.pose.position.z = tf.transform.translation.z
+        pose.pose.orientation = tf.transform.rotation
+        self.pose_status = pose
         self._pose_received = True
 
     # =========================================================================
@@ -487,62 +607,128 @@ class HuskyOperationsManager(Node):
         """
         Fires every timing_initial_position_check_delay until the check completes.
 
-        Holds until a real pose message has arrived, then runs
+        Holds until a TF pose is available AND has been stable for
+        startup_pose_stable_count consecutive samples, then runs
         check_initial_position and cancels itself once it has initialised.
         """
+        self._update_pose_from_tf()
         if not self._pose_received:
-            self.get_logger().warning('Waiting for pose data...', throttle_duration_sec=2.0)
+            self.get_logger().warning('Waiting for pose TF...', throttle_duration_sec=2.0)
+            return
+        if not self._pose_is_stable():
+            self.get_logger().warning(
+                f'Waiting for stable pose '
+                f'({self._pose_stable_samples}/{self.startup_pose_stable_count})',
+                throttle_duration_sec=2.0,
+            )
             return
         self.check_initial_position()
         if self.is_initialized:
             self.init_check_timer.cancel()
 
+    def _pose_is_stable(self) -> bool:
+        """
+        True once the TF pose has moved less than startup_pose_stable_eps between
+        startup_pose_stable_count consecutive samples. Any larger jump resets the
+        counter. Guards the startup docked/not-docked decision against a
+        not-yet-converged localisation estimate.
+        """
+        if self.pose_status is None:
+            return False
+        p = self.pose_status.pose.position
+        if self._last_stable_xy is None:
+            self._last_stable_xy = (p.x, p.y)
+            self._pose_stable_samples = 1
+            return False
+        moved = math.hypot(p.x - self._last_stable_xy[0], p.y - self._last_stable_xy[1])
+        self._last_stable_xy = (p.x, p.y)
+        if moved <= self.startup_pose_stable_eps:
+            self._pose_stable_samples += 1
+        else:
+            self._pose_stable_samples = 1
+        return self._pose_stable_samples >= self.startup_pose_stable_count
+
+    @staticmethod
+    def _yaw_from_quaternion(q) -> float:
+        """Extract the yaw (Z) angle from a geometry_msgs Quaternion."""
+        return math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
+
+    def _project_into_dock_frame(self, rx, ry, ryaw, dock):
+        """
+        Return (local_x, local_y, local_yaw) of the robot expressed in the dock's
+        frame. local_x points from the dock along its heading (dock -> approach),
+        local_y is left of it, local_yaw is the heading error vs the dock.
+        """
+        dx, dy, dth = dock.pose.x, dock.pose.y, dock.pose.theta
+        c, s = math.cos(dth), math.sin(dth)
+        ox, oy = rx - dx, ry - dy
+        local_x = c * ox + s * oy
+        local_y = -s * ox + c * oy
+        local_yaw = math.atan2(math.sin(ryaw - dth), math.cos(ryaw - dth))
+        return local_x, local_y, local_yaw
+
     def check_initial_position(self):
         """
         Determine whether the robot starts at a docking station.
 
-        Computes the Euclidean distance to every dock in motion_config and picks
-        the nearest. If that nearest dock is within docking_threshold the robot
-        started docked there and active_dock_name is set for startup undocking.
+        Projects the robot's map pose into each dock's frame. The robot is
+        treated as docked at a dock when it sits in that dock's staging corridor:
+          staging_x_offset - dock_x_tol <= local_x <= dock_x_tol
+          |local_y|  <= dock_lat_tol
+          |local_yaw| <= dock_yaw_tol
+        If several docks match, the one with local_x closest to 0 (nearest the
+        contact pose) wins.
 
-        Sets startup_undock_complete=True if the robot is NOT at a dock, so the
-        node can skip the startup undocking sequence and proceed directly to tasks.
+        Sets startup_undock_complete=True if the robot is NOT in any dock's
+        corridor, so the node skips the startup undocking sequence.
         """
         if self.is_initialized:
             return
 
-        if not self._pose_received:
-            self.get_logger().warning('check_initial_position called before pose data — deferring')
+        if not self._pose_received or self.pose_status is None:
+            self.get_logger().warning('check_initial_position called before pose TF — deferring')
             return
 
-        current_pos = self.pose_status.pose.pose.position
+        p = self.pose_status.pose
+        rx, ry = p.position.x, p.position.y
+        ryaw = self._yaw_from_quaternion(p.orientation)
+        staging_x = self.motion_config.staging_x_offset
 
-        nearest_name: str | None = None
-        nearest_dist = float('inf')
+        docked_name: str | None = None
+        docked_lx = 0.0
         for name, dock in self.motion_config.dock_configs.items():
-            d = self._calculate_distance(current_pos.x, current_pos.y, dock.pose.x, dock.pose.y)
-            self.get_logger().debug(f"Dock '{name}' at ({dock.pose.x:.3f}, {dock.pose.y:.3f}) — dist={d:.3f}m")
-            if d < nearest_dist:
-                nearest_dist = d
-                nearest_name = name
+            lx, ly, lyaw = self._project_into_dock_frame(rx, ry, ryaw, dock)
+            lo = min(staging_x - self.startup_dock_x_tol, self.startup_dock_x_tol)
+            hi = max(staging_x - self.startup_dock_x_tol, self.startup_dock_x_tol)
+            in_corridor = (
+                lo <= lx <= hi
+                and abs(ly) <= self.startup_dock_lat_tol
+                and abs(lyaw) <= self.startup_dock_yaw_tol
+            )
+            self.get_logger().debug(
+                f"Dock '{name}' | local=({lx:.3f}, {ly:.3f}, {math.degrees(lyaw):.1f}deg) | "
+                f'in_corridor={in_corridor}'
+            )
+            if in_corridor and (docked_name is None or abs(lx) < abs(docked_lx)):
+                docked_name = name
+                docked_lx = lx
 
         self.get_logger().info(
-            f'Initial Robot position: ({current_pos.x:.3f}, {current_pos.y:.3f}) | '
-            f"nearest dock '{nearest_name}' at {nearest_dist:.3f}m | "
-            f'docking_threshold={self.docking_threshold}m'
+            f'Initial robot pose: ({rx:.3f}, {ry:.3f}, {math.degrees(ryaw):.1f}deg) | '
+            f"docked at '{docked_name}'" + (f' (local_x={docked_lx:.3f}m)' if docked_name else '')
         )
 
-        # TODO: validate the if condition so that undocking can occur when the robot
-        # pose shows robot is anywhere between dock pose and staging pose along x-axis
-        # of robot.
-        if nearest_name is not None and nearest_dist <= self.docking_threshold:
+        if docked_name is not None:
             self.is_at_docking_station = True
-            self.active_dock_name = nearest_name
-            self.get_logger().info(f"Robot at dock '{nearest_name}' — will undock before tasks")
+            self.active_dock_name = docked_name
+            self.get_logger().info(f"Robot in staging corridor of dock '{docked_name}' — will undock before tasks")
         else:
             self.is_at_docking_station = False
             self.startup_undock_complete = True
-            self.get_logger().info('Robot ready for tasks')
+            self.get_logger().info('Robot not at any dock — ready for tasks')
 
         self.is_initialized = True
 
@@ -572,7 +758,22 @@ class HuskyOperationsManager(Node):
         )
 
         if self.current_status == RobotStatusEnum.IDLE:
-            self.get_logger().info('Starting startup undocking...')
+            if self._startup_undock_attempts >= self.startup_undock_max_retries:
+                self._startup_undock_failed = True
+                self.get_logger().error(
+                    f'Startup undocking failed {self._startup_undock_attempts}x '
+                    f'(max {self.startup_undock_max_retries}) — holding in ERROR for manual '
+                    'intervention. Check the dock config (undock_robot dock_type must be a '
+                    'registered plugin) and the reverse-drive path.',
+                    throttle_duration_sec=5.0,
+                )
+                self._transition_status(RobotStatusEnum.ERROR)
+                return
+            self._startup_undock_attempts += 1
+            self.get_logger().info(
+                f'Starting startup undocking '
+                f'(attempt {self._startup_undock_attempts}/{self.startup_undock_max_retries})...'
+            )
             self._transition_status(RobotStatusEnum.START_UNDOCKING)
             robot_status.task = 'Startup: Preparing to undock'
 
@@ -677,16 +878,14 @@ class HuskyOperationsManager(Node):
         """
         Check battery and interrupt task if level is critical.
 
-        Returns True if the caller should abort the current tick (battery is low
-        or recovery is in progress). Returns False to continue normally.
+        Returns True if the caller should abort the current tick (battery is
+        low). Returns False to continue normally.
 
-        Low battery during a non-CHARGING_TASK:
-          - Cancel navigation if active
-          - Transition to ERROR so JobPublisher sends a CHARGING_TASK
-
-        Low battery recovery:
-          - When in ERROR and a CHARGING_TASK arrives, transition back to IDLE
-            so the task can be executed without waiting for _handle_error_recovery
+        NOTE: this only runs while current_status != ERROR/ABNORMAL — timer_callback
+        routes those statuses to _handle_error_recovery instead, which is why the
+        exit from a low-battery ERROR is handled there (via _error_from_low_battery),
+        not here. Do not try to recover from ERROR in this method: it will never see
+        a CHARGING_TASK because it is not called while in ERROR.
         """
         if not self.task or not self.current_task:
             return False
@@ -708,14 +907,9 @@ class HuskyOperationsManager(Node):
             if self.current_status in [RobotStatusEnum.START_MOVING, RobotStatusEnum.MOVING]:
                 self.get_logger().warning('Cancelling navigation due to low battery')
                 self.navigation.cancel_goal()
+            self._error_from_low_battery = True
             self._transition_status(RobotStatusEnum.ERROR)
             return True
-
-        # Bypass _handle_error_recovery for low-battery recovery — a CHARGING_TASK
-        # arriving while in ERROR means JobPublisher has handled the situation
-        if self.current_status == RobotStatusEnum.ERROR and self.current_task.task_type == Task.CHARGING_TASK:
-            self.get_logger().info(f'Recovering from low battery — CHARGING_TASK received | battery={battery_pct:.1f}%')
-            self._transition_status(RobotStatusEnum.IDLE)
 
         return False
 
@@ -838,6 +1032,7 @@ class HuskyOperationsManager(Node):
             # Clear any stale undocking state from a previous task
             self.last_undocking_subtask = None
             self.undocking_after_task_type = None
+            self.done_undocking_published = False
             self._transition_status(RobotStatusEnum.JOB_START)
 
         elif self.current_status == RobotStatusEnum.JOB_DONE:
@@ -1246,17 +1441,70 @@ class HuskyOperationsManager(Node):
             self.reverse_drive_client.reset()
             self._transition_status(RobotStatusEnum.IDLE)
 
-    def _handle_manipulator(self, robot_status: RobotStatus):
+    # =========================================================================
+    # ARM SAFETY
+    # =========================================================================
+
+    def _arm_stow_ref(self) -> SubTask:
+        """A SubTask to attach to a STOW goal when no task subtask is in play."""
+        ref = self.current_sub_task or self.last_undocking_subtask
+        if isinstance(ref, SubTask):
+            return ref
+        st = SubTask()
+        st.description = 'Arm STOW gate'
+        return st
+
+    def _arm_goal_watch(self, active: bool):
+        """Arm or clear the arm-goal result timeout (key 'arm_goal')."""
+        if active:
+            self._dwell_deadlines.setdefault(
+                'arm_goal', self.get_clock().now() + Duration(seconds=self.arm_goal_timeout)
+            )
+        else:
+            self._dwell_deadlines.pop('arm_goal', None)
+
+    def _arm_stow_gate(self) -> bool:
+        """
+        Shared arm-safety gate. Returns True when the arm is confirmed in STOW.
+
+        Otherwise dispatches a STOW goal once, sets arm_stow_pending and the goal
+        timeout, and returns False so the caller holds and re-checks next tick.
+        _handle_manipulator clears the flag on completion.
+
+        Used by _subtask_moving, _subtask_docking and _handle_error_recovery. The
+        undock flow keeps its own callback-driven variant in _subtask_undocking
+        for same-tick continuation.
+        """
+        if self.last_confirmed_arm_command == ArmCommand.GO_STOW:
+            return True
+        if not self.arm_stow_pending:
+            self.get_logger().info(
+                f"Arm not in STOW (last='{self.last_confirmed_arm_command}') — sending STOW"
+            )
+            if self.manipulator_client.send_stow_goal(self._arm_stow_ref()):
+                self.arm_stow_pending = True
+                self._arm_goal_watch(True)
+            else:
+                self.get_logger().error('Failed to send STOW goal — transitioning to ERROR')
+                self._error_from_arm = True
+                self._transition_status(RobotStatusEnum.ERROR)
+        else:
+            self.get_logger().debug('Arm STOW in progress — waiting')
+        return False
+
+    def _handle_manipulator(self, robot_status: RobotStatus | None = None):
         """
         Monitor ManipulatorTaskActionClient for pending STOW, READY, or START_HARVEST goals.
 
-        Called from _process_action_clients every tick while any arm operation is pending.
+        Called from _process_action_clients every tick while any arm operation is pending,
+        and directly from _handle_startup_undocking / _handle_error_recovery.
 
         Context-aware completion handling:
           STOW completion:
             - START_UNDOCKING context → arm is safe, re-enter _subtask_undocking to proceed
             - DONE_HARVESTING context → arm is safe, _subtask_harvesting will advance to
                                         JOB_DONE on the next tick
+            - START_MOVING / START_DOCKING / ERROR / ABNORMAL → gate clears, caller re-checks
           READY completion:
             - DESTINATION_REACHED context → arm is prepared, _subtask_harvesting will
                                             advance to START_HARVESTING on the next tick
@@ -1264,8 +1512,9 @@ class HuskyOperationsManager(Node):
             - HARVESTING context → harvest cycle complete, transition to DONE_HARVESTING
                                    so _subtask_harvesting can begin STOW on next tick
 
-        ERROR in any arm command transitions the node to ERROR — proceeding with an
-        arm in an unknown configuration is unsafe regardless of context.
+        ERROR in any arm command — or an arm goal exceeding arm_goal_timeout —
+        transitions the node to ERROR and marks _error_from_arm so recovery does
+        not re-command the arm.
         """
         arm_status = self.manipulator_client.get_status()
 
@@ -1278,12 +1527,31 @@ class HuskyOperationsManager(Node):
         )
 
         # ----------------------------------------------------------------
+        # Arm goal result timeout
+        # ----------------------------------------------------------------
+        deadline = self._dwell_deadlines.get('arm_goal')
+        if deadline is not None and self.get_clock().now() >= deadline and arm_status != RobotStatusEnum.ERROR:
+            self.get_logger().error(
+                f'Arm goal timed out after {self.arm_goal_timeout:.0f}s | '
+                f'context={self.current_status.name} | '
+                f'stow_pending={self.arm_stow_pending} ready_pending={self.arm_ready_pending}'
+            )
+            self.arm_stow_pending = False
+            self.arm_ready_pending = False
+            self._arm_goal_watch(False)
+            self.manipulator_client.reset()
+            self._error_from_arm = True
+            self._transition_status(RobotStatusEnum.ERROR)
+            return
+
+        # ----------------------------------------------------------------
         # STOW completion
         # ----------------------------------------------------------------
         if self.arm_stow_pending and arm_status == RobotStatusEnum.DONE_HARVESTING:
             self.get_logger().info(f'Arm STOW confirmed | context={self.current_status.name}')
             self.arm_stow_pending = False
             self.last_confirmed_arm_command = ArmCommand.GO_STOW
+            self._arm_goal_watch(False)
             self.manipulator_client.reset()
 
             if self.current_status == RobotStatusEnum.START_UNDOCKING:
@@ -1298,6 +1566,17 @@ class HuskyOperationsManager(Node):
                     'STOW confirmed in DONE_HARVESTING context — '
                     '_subtask_harvesting will advance to JOB_DONE on next tick'
                 )
+            elif self.current_status in (
+                RobotStatusEnum.START_MOVING,
+                RobotStatusEnum.START_DOCKING,
+                RobotStatusEnum.ERROR,
+                RobotStatusEnum.ABNORMAL,
+            ):
+                # Gated by _arm_stow_gate — the calling handler re-checks
+                # last_confirmed_arm_command == GO_STOW on the next tick.
+                self.get_logger().debug(
+                    f'STOW confirmed in {self.current_status.name} context — gate clears next tick'
+                )
             else:
                 self.get_logger().warning(
                     f'STOW confirmed in unexpected context={self.current_status.name} — no action taken'
@@ -1310,6 +1589,7 @@ class HuskyOperationsManager(Node):
             self.get_logger().info(f'Arm READY confirmed | context={self.current_status.name}')
             self.arm_ready_pending = False
             self.last_confirmed_arm_command = ArmCommand.GO_READY
+            self._arm_goal_watch(False)
             self.manipulator_client.reset()
 
             if self.current_status == RobotStatusEnum.DESTINATION_REACHED:
@@ -1335,6 +1615,7 @@ class HuskyOperationsManager(Node):
             and self.current_status == RobotStatusEnum.HARVESTING
         ):
             self.get_logger().info('Harvest goal complete — transitioning to DONE_HARVESTING')
+            self._arm_goal_watch(False)
             self.manipulator_client.reset()
             self._transition_status(RobotStatusEnum.DONE_HARVESTING)
 
@@ -1350,24 +1631,50 @@ class HuskyOperationsManager(Node):
             )
             self.arm_stow_pending = False
             self.arm_ready_pending = False
+            self._arm_goal_watch(False)
             self.manipulator_client.reset()
+            self._error_from_arm = True
             self._transition_status(RobotStatusEnum.ERROR)
 
     # =========================================================================
     # ERROR HANDLING
     # =========================================================================
 
-    def _handle_error_recovery(self):
+    def _handle_error_recovery(self, robot_status: RobotStatus | None = None):
         """
         Attempt to recover from ERROR or ABNORMAL status.
 
-        Cancels any active navigation goal (with a brief wait for cancellation
-        to propagate), resets subtask state, and transitions to IDLE.
+        Cancels any active navigation goal (non-blocking wait for the cancel to
+        propagate), brings the arm to STOW, resets subtask state, → IDLE.
 
-        Note: Low-battery recovery bypasses this method — it is handled directly
-        in _check_and_handle_low_battery when a CHARGING_TASK arrives.
+        Arm-caused ERROR: if the ERROR came from an arm failure the arm is
+        untrusted — recovery does NOT re-command it and the node holds in ERROR
+        for manual intervention (restart).
+
+        Low-battery ERROR: the arm is still brought to STOW (safe to sit idle),
+        but the node holds in ERROR — it does NOT transition to IDLE — until a
+        CHARGING_TASK is the current task. This method is the only place that
+        exits a low-battery ERROR; _check_and_handle_low_battery never runs while
+        current_status == ERROR (timer_callback routes ERROR here instead), so it
+        cannot see a CHARGING_TASK arrive.
         """
         if self.current_status not in [RobotStatusEnum.ERROR, RobotStatusEnum.ABNORMAL]:
+            return
+
+        if self._error_from_arm:
+            self.get_logger().error(
+                'ERROR caused by arm failure — arm untrusted, holding for manual '
+                'intervention (restart node)',
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        if self._startup_undock_failed:
+            self.get_logger().error(
+                'Startup undocking exhausted its retries — holding in ERROR for manual '
+                'intervention (restart node)',
+                throttle_duration_sec=5.0,
+            )
             return
 
         self.get_logger().warning(
@@ -1395,15 +1702,34 @@ class HuskyOperationsManager(Node):
         # Clear any lingering dwell deadline from the cancel path above
         self._dwell_deadlines.pop('err_recovery', None)
 
-        # Clear any pending arm flags so the next task starts with a clean slate
-        self.arm_stow_pending = False
+        # A pending READY is abandoned; recovery drives the arm to STOW instead.
         self.arm_ready_pending = False
+
+        # Arm safety gate — hold in ERROR until the arm is confirmed STOW.
+        if not self._arm_stow_gate():
+            self._handle_manipulator(robot_status)
+            return
         self.manipulator_client.reset()
 
-        # Reset subtask state so the next task starts clean
+        # Low-battery ERROR: arm is now safely stowed, but stay in ERROR until
+        # JobPublisher actually sends a CHARGING_TASK. Recovering to IDLE here
+        # would just let _check_and_handle_low_battery re-trigger ERROR on the
+        # very next tick — an infinite bounce.
+        if self._error_from_low_battery:
+            if self.task and self.task.task_type == Task.CHARGING_TASK:
+                self.get_logger().info('Recovering from low battery — CHARGING_TASK received')
+                self._error_from_low_battery = False
+            else:
+                self.get_logger().warning(
+                    'Holding in ERROR — battery still low, waiting for a CHARGING_TASK',
+                    throttle_duration_sec=5.0,
+                )
+                return
+
+        # Clean up and idle
         self.current_sub_task = None
         self.current_sub_task_index = 0
-        self.get_logger().debug('Error recovery — reset subtask state, transitioning to IDLE')
+        self.get_logger().debug('Error recovery — arm stowed, reset subtask state, transitioning to IDLE')
         self._transition_status(RobotStatusEnum.IDLE)
 
     # =========================================================================
@@ -1420,6 +1746,9 @@ class HuskyOperationsManager(Node):
 
         Guards against sending a duplicate goal if navigation is already active —
         can happen if timer fires multiple times while waiting for goal acceptance.
+
+        Arm safety: the arm must be confirmed STOW before a navigation goal is
+        sent — navigating with the arm extended risks collisions / tip-over.
         """
         if not self.current_task:
             return
@@ -1434,6 +1763,9 @@ class HuskyOperationsManager(Node):
             self._transition_status(RobotStatusEnum.START_MOVING)
 
         elif self.current_status == RobotStatusEnum.START_MOVING:
+            # Arm safety gate — hold here until the arm is confirmed STOW
+            if not self._arm_stow_gate():
+                return
             # Guard: do not send a second goal if the previous one is still being accepted
             if self.navigation.is_navigation_active():
                 self.get_logger().warning(
@@ -1462,6 +1794,8 @@ class HuskyOperationsManager(Node):
 
         The 1s delay gives Nav2 time to decelerate fully before the docking
         controller starts, reducing the chance of a dock alignment failure.
+
+        Arm safety: the arm must be confirmed STOW before docking begins.
         """
         dock_id = (
             self.current_sub_task.dock_goal.dock_id
@@ -1474,6 +1808,9 @@ class HuskyOperationsManager(Node):
             self._transition_status(RobotStatusEnum.START_DOCKING)
 
         elif self.current_status == RobotStatusEnum.START_DOCKING:
+            # Arm safety gate — hold here until the arm is confirmed STOW
+            if not self._arm_stow_gate():
+                return
             # Brief non-blocking pause to let the robot fully stop before docking.
             # Re-checked on the next timer tick until the delay has elapsed.
             if not self._wait_ready('dock_start', 1.0):
@@ -1525,23 +1862,10 @@ class HuskyOperationsManager(Node):
 
         if self.current_status == RobotStatusEnum.START_UNDOCKING:
             # ---- Arm safety gate ----
-            # Arm must be confirmed STOW before undocking begins.
-            # If not already stowed, dispatch STOW now and hold here.
-            # _handle_manipulator will re-enter this method once confirmed.
-            if self.last_confirmed_arm_command != ArmCommand.GO_STOW:
-                if not self.arm_stow_pending:
-                    self.get_logger().info(
-                        f"Arm not in STOW (last='{self.last_confirmed_arm_command}') — sending STOW before undocking"
-                    )
-                    undock_ref = self.current_sub_task or self.last_undocking_subtask
-                    if self.manipulator_client.send_stow_goal(undock_ref):
-                        self.arm_stow_pending = True
-                    else:
-                        self.get_logger().error('Failed to send STOW goal before undocking — transitioning to ERROR')
-                        self._transition_status(RobotStatusEnum.ERROR)
-                else:
-                    self.get_logger().debug('Arm STOW already in progress — waiting before undocking')
-                return  # Hold at START_UNDOCKING until arm_stow_pending clears
+            # Arm must be confirmed STOW before undocking begins. _handle_manipulator
+            # re-enters this method once STOW is confirmed (START_UNDOCKING context).
+            if not self._arm_stow_gate():
+                return
 
             # ---- Arm confirmed STOW — proceed with undocking ----
             self.get_logger().info('Starting undocking — arm confirmed STOW')
@@ -1566,6 +1890,15 @@ class HuskyOperationsManager(Node):
                 self._transition_status(RobotStatusEnum.ERROR)
 
         elif self.current_status == RobotStatusEnum.DONE_UNDOCKING:
+            # Hold for one tick so DONE_UNDOCKING is actually published.
+            # timer_callback publishes once, after the state machine has run,
+            # so moving straight to JOB_DONE here would mean the server never
+            # sees DONE_UNDOCKING and never frees the dock.
+            if not self.done_undocking_published:
+                self.done_undocking_published = True
+                self.get_logger().debug('Undocking done — publishing DONE_UNDOCKING before JOB_DONE')
+                return
+
             # Undocking succeeded — clean up stored state and mark task complete
             self.get_logger().info('Undocking done')
             self.get_logger().debug(
@@ -1573,6 +1906,7 @@ class HuskyOperationsManager(Node):
             )
             self.last_undocking_subtask = None
             self.undocking_after_task_type = None
+            self.done_undocking_published = False
             self._transition_status(RobotStatusEnum.JOB_DONE)
 
     def _subtask_harvesting(self):
@@ -1610,8 +1944,10 @@ class HuskyOperationsManager(Node):
                     )
                     if self.manipulator_client.send_ready_goal(self.current_sub_task):
                         self.arm_ready_pending = True
+                        self._arm_goal_watch(True)
                     else:
                         self.get_logger().error('Failed to send READY goal before harvesting — transitioning to ERROR')
+                        self._error_from_arm = True
                         self._transition_status(RobotStatusEnum.ERROR)
                 else:
                     self.get_logger().debug('Arm READY already in progress — waiting')
@@ -1626,18 +1962,29 @@ class HuskyOperationsManager(Node):
                 self.get_logger().warning('Harvest goal send skipped — manipulator already active')
                 return
             self.get_logger().info('Sending harvest goal to manipulator')
-            if self.manipulator_client.send_harvesting_goal(self.current_sub_task):
-                self._transition_status(RobotStatusEnum.HARVESTING)
-            else:
-                self.get_logger().error('Failed to send harvest goal — transitioning to ERROR')
-                self._transition_status(RobotStatusEnum.ERROR)
+
+            self._transition_status(RobotStatusEnum.HARVESTING)
+
+            #NOTE: For tetsing commented below code
+            # if self.manipulator_client.send_harvesting_goal(self.current_sub_task):
+            #     self._transition_status(RobotStatusEnum.HARVESTING)
+            # else:
+            #     self.get_logger().error('Failed to send harvest goal — transitioning to ERROR')
+            #     self._transition_status(RobotStatusEnum.ERROR)
 
         elif self.current_status == RobotStatusEnum.HARVESTING:
             # Manipulator result is handled by _handle_manipulator via _process_action_clients.
             # When the goal succeeds, ManipulatorTaskActionClient sets its internal status to
             # DONE_HARVESTING, which _handle_manipulator detects and transitions the node
             # to DONE_HARVESTING. Nothing to do here — just wait.
+            #
+            # TEST STUB: the real harvest goal send is commented out above, so the
+            # manipulator never reports DONE_HARVESTING. Simulate a 30s harvest with a
+            # non-blocking dwell, then transition as the manipulator path would.
             self.get_logger().debug('Harvesting in progress — waiting for manipulator result')
+            if self._wait_ready('harvest_sim', 10.0):
+                self.get_logger().info('Harvest sim complete — transitioning to DONE_HARVESTING')
+                self._transition_status(RobotStatusEnum.DONE_HARVESTING)
 
         elif self.current_status == RobotStatusEnum.DONE_HARVESTING:
             # Update load before checking arm — load must be recorded regardless of
@@ -1656,8 +2003,10 @@ class HuskyOperationsManager(Node):
                 self.get_logger().info('Harvesting done — sending arm to STOW')
                 if self.manipulator_client.send_stow_goal(self.current_sub_task):
                     self.arm_stow_pending = True
+                    self._arm_goal_watch(True)
                 else:
                     self.get_logger().error('Failed to send STOW goal after harvesting — transitioning to ERROR')
+                    self._error_from_arm = True
                     self._transition_status(RobotStatusEnum.ERROR)
                 return  # Hold until STOW confirmed
 
@@ -1692,11 +2041,17 @@ class HuskyOperationsManager(Node):
 
         elif self.current_status == RobotStatusEnum.START_CHARGING:
             self._transition_status(RobotStatusEnum.CHARGING)
+            self._charge_current_ema = None  # Fresh ETA estimate per charging session
             self.get_logger().info('Charging started')
 
         elif self.current_status == RobotStatusEnum.CHARGING:
             # Throttled to avoid flooding logs at 1Hz during the charging wait
-            self.get_logger().info(f'Battery charging: {battery_pct:.1f}%', throttle_duration_sec=10.0)
+            eta = self._estimate_charge_eta(battery_pct)
+            eta_str = eta if eta is not None else '--:--:--'
+            self.get_logger().info(
+                f'Battery charging: {battery_pct:.1f}% | ETA {eta_str}',
+                throttle_duration_sec=10.0,
+            )
             if battery_pct >= self.battery_full_threshold:
                 self.get_logger().info(f'Battery charged: {battery_pct:.1f}%')
                 self._transition_status(RobotStatusEnum.DONE_CHARGING)
@@ -1841,6 +2196,54 @@ class HuskyOperationsManager(Node):
         hours_remaining = remaining_ah / self._battery_current_ema
         robot_status.operation_hours_after_charging = self._format_time_remaining(hours_remaining)
 
+    def _estimate_charge_eta(self, battery_pct: float) -> str | None:
+        """
+        Estimate time to reach battery_full_threshold while charging.
+
+        Uses the BMS energy balance:
+          remaining_ah / |charge_current|
+        remaining_ah is the Ah gap between the full-threshold target and the
+        present BatteryState.charge; if the BMS does not report charge, it is
+        approximated from capacity and the percentage gap. The charge current
+        is EMA-smoothed (alpha 0.1) so a momentary spike does not make the
+        estimate jump. Linear in current — the real CV-phase taper near full
+        is not modelled, so the estimate is optimistic close to the threshold.
+
+        Returns an 'HH:MM:SS' string, or None when the BMS lacks the fields
+        needed to estimate (no capacity, or charge current ~ 0).
+        """
+        capacity = self.battery_status.capacity
+        if capacity <= 0.0:
+            capacity = self.battery_status.design_capacity
+        if capacity <= 0.0:
+            return None
+
+        target_ah = capacity * (self.battery_full_threshold / 100.0)
+        if self.battery_status.charge > 0.0:
+            remaining_ah = target_ah - self.battery_status.charge
+        else:
+            remaining_ah = capacity * (self.battery_full_threshold - battery_pct) / 100.0
+
+        if remaining_ah <= 0.0:
+            return '00:00:00'
+
+        current_mag = abs(self.battery_status.current)
+        if self._charge_current_ema is None:
+            self._charge_current_ema = current_mag
+        else:
+            alpha = 0.1
+            self._charge_current_ema = alpha * current_mag + (1.0 - alpha) * self._charge_current_ema
+
+        if self._charge_current_ema < 0.01:
+            return None
+
+        eta_seconds = int((remaining_ah / self._charge_current_ema) * 3600)
+        minutes, seconds = divmod(eta_seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours > 99:
+            return '99:59:59'
+        return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+
     def _set_estop_status(self, robot_status: RobotStatus):
         """Map the emergency-stop signal to online_flag in the outgoing RobotStatus."""
         robot_status.online_flag = (
@@ -1848,10 +2251,10 @@ class HuskyOperationsManager(Node):
         )
 
     def _set_location_status(self, robot_status: RobotStatus):
-        """Populate position and orientation fields from the latest ground-truth pose."""
-        if self.pose_status and self.pose_status.pose:
-            robot_status.topo_map_position = self.pose_status.pose.pose.position
-            robot_status.topo_map_orientation = self.pose_status.pose.pose.orientation
+        """Populate position and orientation fields from the latest TF pose."""
+        if self.pose_status is not None:
+            robot_status.topo_map_position = self.pose_status.pose.position
+            robot_status.topo_map_orientation = self.pose_status.pose.orientation
 
     # =========================================================================
     # UTILITY METHODS
@@ -1886,11 +2289,11 @@ class HuskyOperationsManager(Node):
 
         Returns False if no subtask or pose data is available.
         """
-        if not (self.current_sub_task and self.pose_status):
+        if not self.current_sub_task or self.pose_status is None:
             self.get_logger().debug('_is_robot_at_target: no subtask or pose — returning False')
             return False
 
-        robot_position = self.pose_status.pose.pose.position
+        robot_position = self.pose_status.pose.position
         # Normalise waypoints in case the subtask data contains raw dicts
         waypoints_list = [WayPoint(**wp) if isinstance(wp, dict) else wp for wp in self.current_sub_task.data]
         target_wp = waypoints_list[-1]  # Final waypoint is the destination

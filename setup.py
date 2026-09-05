@@ -15,7 +15,7 @@ setup(
         ('share/' + package_name + '/config', glob('config/*')),
         ('share/' + package_name + '/data', glob('data/*')),
         ('share/' + package_name + '/mesh', glob('mesh/*')),
-        ('share/' + package_name + '/launch', glob('launch/*')),
+        ('share/' + package_name + '/launch', glob('launch/*.py')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

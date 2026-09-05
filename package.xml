@@ -7,6 +7,8 @@
   <maintainer email="vupadhye@mtu.edu">robot</maintainer>
   <license>Apache-2.0</license>
 
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
   <!-- Launch translates nav2.yaml's docking_server block into motion.* params -->
   <exec_depend>mtu32_bringup</exec_depend>
 

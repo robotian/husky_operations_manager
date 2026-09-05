@@ -29,11 +29,29 @@
     # Timing
     timing:
       timer_period: 1.0  # seconds - main loop frequency
-      initial_position_check_delay: 2.0  # seconds
+      initial_position_check_delay: 2.0  # seconds - also the pose-stability sample period
 
     # Server timeout
     server:
       action_server_timeout: 5.0  # seconds
+
+    # Startup "am I docked?" check. Robot map pose is projected into each dock's
+    # frame; docked if it sits in the staging corridor and is roughly aligned.
+    startup:
+      dock_x_tol: 0.30        # meters - +x slack in front of the dock contact pose
+      dock_lat_tol: 0.40      # meters - max |local_y| off the dock axis
+      dock_yaw_tol: 0.35      # radians (~20 deg) - max heading error vs dock.theta
+      pose_stable_count: 3    # consecutive TF samples that must agree
+      pose_stable_eps: 0.05   # meters - max move between samples to count as stable
+      undock_max_retries: 3   # startup undock attempts before holding in ERROR
+
+    # Robot pose source (TF map -> base_frame)
+    pose:
+      tf_max_age: 1.0         # seconds - warn (only) if the transform is older
+
+    # Arm
+    arm:
+      goal_timeout: 60.0      # seconds - STOW/READY/harvest goal with no result -> ERROR
 
     # Motion / dock configuration.
     # FALLBACK ONLY. The launch file translates the Nav2 docking_server block
