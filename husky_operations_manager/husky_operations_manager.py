@@ -4,6 +4,7 @@ import rclpy
 import tf2_ros
 from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
@@ -2341,11 +2342,21 @@ class HuskyOperationsManager(Node):
 
 
 def main():
-    rclpy.init()
-    node = HuskyOperationsManager()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    # Teardown lives in finally: rclpy.spin() raises on Ctrl-C (KeyboardInterrupt)
+    # or an external shutdown, so anything placed after it would never run.
+    node = None
+    try:
+        rclpy.init()
+        node = HuskyOperationsManager()
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        if node is not None:
+            node.destroy_node()
+        # Guarded: on Ctrl-C rclpy's signal handler has already shut the context down.
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
