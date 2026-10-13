@@ -160,14 +160,13 @@ class DockingActionClient:
         feedback: DockRobot.Feedback = feedback_msg.feedback
         feedback_state = feedback.state
 
-        # Map feedback state string
+        # DockRobot's feedback.state is the docking server's own phase (nav2_msgs/action/DockRobot: NONE 0,
+        # NAV_TO_STAGING_POSE 1, INITIAL_PERCEPTION 2, CONTROLLING 3, WAIT_FOR_CHARGE 4, RETRY 5), not a GoalStatus:
+        # it never means done. Only the result (SUCCEEDED) is DONE_DOCKING -- the server can still retry or abort
+        # after WAIT_FOR_CHARGE (no charging current), which used to be read as "docked".
         feedback_state_str = {
-            GoalStatus.STATUS_ACCEPTED: "ACCEPTED",
-            GoalStatus.STATUS_EXECUTING: "EXECUTING",
-            GoalStatus.STATUS_CANCELING: "CANCELING",
-            GoalStatus.STATUS_SUCCEEDED: "SUCCEEDED",
-            GoalStatus.STATUS_ABORTED: "ABORTED",
-            GoalStatus.STATUS_CANCELED: "CANCELED"
+            0: "NONE", 1: "NAV_TO_STAGING_POSE", 2: "INITIAL_PERCEPTION", 3: "CONTROLLING",
+            4: "WAIT_FOR_CHARGE", 5: "RETRY",
         }.get(feedback_state, "UNKNOWN")
 
         # Log only when state changes
@@ -179,8 +178,8 @@ class DockingActionClient:
                 f"Retries: {feedback.num_retries}"
             )
             self._docking_time = feedback.docking_time.sec
-            self._current_status = self.status_map.get(
-                feedback_state, self._current_status)
+            if self._current_status == RobotStatusEnum.START_DOCKING:
+                self._current_status = RobotStatusEnum.DOCKING
 
         # Update feedback data
         self._feedback_data = DockingFeedback(

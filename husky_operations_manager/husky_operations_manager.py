@@ -474,6 +474,16 @@ class HuskyOperationsManager(Node):
         New subtask: reset subtask index; if currently JOB_DONE, transition to IDLE
                      so _handle_task_start can pick up the next subtask
         """
+        # The operator's STOP (status_server stop_robot: task_id -1, description STOP, no job_schedule): whatever
+        # runs is cancelled and the task given up (FAILED:stopped, which the server treats as released, not as an
+        # attempt); nothing starts until a task with a real id arrives. Ignored while already idle.
+        if msg.task_id < 0 and msg.description == 'STOP' and not msg.job_schedule:
+            if self.current_status not in (RobotStatusEnum.IDLE, RobotStatusEnum.ERROR, RobotStatusEnum.EMERGENCY_STOP) \
+                    or self.current_task is not None:
+                self.get_logger().warning('STOP from the operator: cancelling the current task')
+                self._fail_current_task('stopped', 'by the operator')
+            return
+
         subtasks_summary = [(st.sub_task_id, st.type, st.description) for st in msg.sub_tasks]
         self.get_logger().debug(
             f'Received task | ID: {msg.task_id} | Type: {msg.task_type} | '
@@ -1303,6 +1313,13 @@ class HuskyOperationsManager(Node):
             self.docking_retry_count = 0
 
         elif status == RobotStatusEnum.ERROR:
+            if not self.current_sub_task or self.current_sub_task.type != SubTask.DOCKING \
+                    or self.current_status not in (RobotStatusEnum.START_DOCKING, RobotStatusEnum.DOCKING):
+                # a late result of an earlier dock goal (the subtask has moved on): not a reason to dock again
+                self.get_logger().warning(f'Docking client error outside the docking subtask (status '
+                                          f'{self.current_status.name}): ignored')
+                self.docking_action_client.reset()
+                return
             self.get_logger().debug(
                 f'Docking error — triggering retry | retry_count={self.docking_retry_count}/{self.docking_max_retries}'
             )
