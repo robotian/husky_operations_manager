@@ -5,7 +5,7 @@ import rclpy
 import tf2_ros
 from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
@@ -2554,14 +2554,25 @@ class HuskyOperationsManager(Node):
 def main():
     # Teardown lives in finally: rclpy.spin() raises on Ctrl-C (KeyboardInterrupt)
     # or an external shutdown, so anything placed after it would never run.
+    #
+    # Not rclpy.spin(): under use_sim_time it never returns after SIGTERM/SIGINT. The signal shuts the context
+    # down, but every timer runs on the ROS clock and /clock stops with the context, so the executor's wait has
+    # nothing left to wake it (the node ignored `kill` and launch's SIGINT until SIGKILL). spin_once with a
+    # wall-time timeout re-checks rclpy.ok() at least every 0.5 s.
     node = None
+    executor = None
     try:
         rclpy.init()
         node = HuskyOperationsManager()
-        rclpy.spin(node)
+        executor = SingleThreadedExecutor()
+        executor.add_node(node)
+        while rclpy.ok():
+            executor.spin_once(timeout_sec=0.5)
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        if executor is not None:
+            executor.shutdown()
         if node is not None:
             node.destroy_node()
         # Guarded: on Ctrl-C rclpy's signal handler has already shut the context down.
