@@ -11,20 +11,16 @@
       retry_delay: 3.0  # seconds
       threshold: 0.25  # meters - distance to consider "at dock"
 
-    # Undocking settings
-    undocking:
-      max_retries: 2
-      retry_delay: 3.0  # seconds
-      staging_threshold: 0.05  # meters - staging area crossing threshold
-
-    # Battery settings
+    # Battery settings. When to go charging is the fleet server's decision (status_server battery.low_threshold /
+    # critical_threshold); the robot only has a hard floor below which it gives its task up (FAILED:battery) and
+    # waits for a charging task. full_threshold applies when a charging task carries no charge_to.
     battery:
-      low_threshold: 50.0  # percent
+      critical_threshold: 10.0  # percent
       full_threshold: 99.0  # percent
 
-    # Loading settings
+    # Loading settings. 0: no crop load, no unloading tasks (the sim has no unloading station).
     loading:
-      increment: 20.0  # percent per load operation
+      increment: 0.0  # percent per harvested plant
 
     # Timing
     timing:
@@ -44,14 +40,24 @@
       pose_stable_count: 3    # consecutive TF samples that must agree
       pose_stable_eps: 0.05   # meters - max move between samples to count as stable
       undock_max_retries: 3   # startup undock attempts before holding in ERROR
+      check_dock: true        # false: never starts in a dock (e.g. a sim spawn), skip the check
 
     # Robot pose source (TF map -> base_frame)
     pose:
       tf_max_age: 1.0         # seconds - warn (only) if the transform is older
 
-    # Arm
+    # Arm (manipulator_action_server, arm_task_server). Timeouts on the node clock.
     arm:
-      goal_timeout: 60.0      # seconds - STOW/READY/harvest goal with no result -> ERROR
+      stow_timeout: 120.0     # seconds - a GO STOW with no result -> the task fails
+      ready_timeout: 120.0    # seconds - GO READY
+      harvest_timeout: 900.0  # seconds - START HARVEST (cut_stem: minutes)
+      send_retries: 3         # re-sends of a goal the server rejected (busy) or couldn't take (not up)
+      send_retry_delay: 5.0   # seconds between them
+
+    # Failure report: RobotStatus.task = FAILED:<kind>:<task_id>:<detail> with status ERROR, held this long
+    # (the fleet server polls at 1 Hz) before the node stows and returns to IDLE.
+    error:
+      report_hold: 5.0
 
     # Motion / dock configuration.
     # FALLBACK ONLY. The launch file translates the Nav2 docking_server block

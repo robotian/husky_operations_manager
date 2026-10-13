@@ -11,6 +11,7 @@ Nav2 does not define.
 """
 
 import os
+import tempfile
 
 import launch
 import yaml
@@ -23,8 +24,38 @@ from launch_ros.substitutions import FindPackageShare
 _logger = launch.logging.get_logger('husky_operations_manager.launch')
 
 
+ROBOT_YAML = '/etc/clearpath/robot.yaml'
+
+
+def _robot_yaml() -> dict:
+    try:
+        with open(ROBOT_YAML) as f:
+            return yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+
+
+def _robot_namespace() -> str:
+    """robot.yaml's system.ros2.namespace, else $ROBOT_NAMESPACE, else ''."""
+    ns = ((_robot_yaml().get('system') or {}).get('ros2') or {}).get('namespace') or os.environ.get('ROBOT_NAMESPACE', '')
+    return str(ns).strip('/')
+
+
+def _platform_model() -> str:
+    """The platform model (j100 / a200 / a300) from robot.yaml's serial number, else 'a300'."""
+    serial = str(_robot_yaml().get('serial_number') or '')
+    model = serial.replace('cpr-', '').split('-')[0]
+    return model or 'a300'
+
+
 def _default_nav2_params_file() -> str:
-    """Installed nav2.yaml from mtu32_bringup, or '' if that package is absent."""
+    """The Nav2 params this robot's docking server actually runs with: the file bringup_nav2_map.launch.py writes
+    (/tmp/<namespace>_nav2_map.yaml: the platform's nav2.yaml with the simulator's docks, when it runs in the
+    sim), else the platform's installed config/<platform>/nav2.yaml from mtu32_bringup, else ''."""
+    ns = _robot_namespace()
+    rewritten = os.path.join(tempfile.gettempdir(), f'{ns}_nav2_map.yaml') if ns else ''
+    if rewritten and os.path.isfile(rewritten):
+        return rewritten
     try:
         from ament_index_python.packages import (
             PackageNotFoundError,
@@ -32,7 +63,7 @@ def _default_nav2_params_file() -> str:
         )
         return os.path.join(
             get_package_share_directory('mtu32_bringup'),
-            'config', 'a300', 'nav2.yaml')
+            'config', _platform_model(), 'nav2.yaml')
     except (ImportError, PackageNotFoundError):
         return ''
 
@@ -53,6 +84,8 @@ def _translate_docking_params(nav2_file: str) -> dict:
     try:
         with open(nav2_file, 'r') as f:
             data = yaml.safe_load(f) or {}
+        if 'docking_server' not in data:  # a file written with a namespace root key
+            data = next((v for v in data.values() if isinstance(v, dict) and 'docking_server' in v), data)
         ds = data['docking_server']['ros__parameters']
     except (OSError, yaml.YAMLError, KeyError, TypeError) as e:
         _logger.warning(
@@ -124,22 +157,35 @@ def _translate_docking_params(nav2_file: str) -> dict:
 
 def _launch_setup(context, *args, **kwargs):
     config_file  = LaunchConfiguration('config_file').perform(context)
-    nav2_file    = LaunchConfiguration('nav2_params_file').perform(context)
+    nav2_file    = LaunchConfiguration('nav2_params_file').perform(context) or _default_nav2_params_file()
     docking_params = _translate_docking_params(nav2_file)
+
+    # The dock a charging task undocks from when the task doesn't say: the launch argument, else the first dock
+    # Nav2 knows (the one the robot's AprilTag matches in the sim), else config.yaml's.
+    dock_for_charging = LaunchConfiguration('dock_for_charging').perform(context)
+    if not dock_for_charging and docking_params.get('motion.dock_names'):
+        dock_for_charging = docking_params['motion.dock_names'][0]
+    extra = {'use_sim_time': LaunchConfiguration('use_sim_time').perform(context) == 'true'}
+    if dock_for_charging:
+        extra['motion.dock_for_charging'] = dock_for_charging
+    namespace = LaunchConfiguration('namespace').perform(context) or f'/{_robot_namespace()}'
 
     node = Node(
         package='husky_operations_manager',
         executable='husky_operations_manager',
-        namespace=LaunchConfiguration('namespace'),
+        namespace=namespace,
         name='husky_operations_manager',
         output='screen',
         # config.yaml first (defaults + dock_for_* mapping),
-        # nav2-derived motion.* second so it wins.
-        parameters=[config_file, docking_params],
+        # nav2-derived motion.* second so it wins, then the launch arguments.
+        parameters=[config_file, docking_params, extra],
         remappings=[
             ('/tf', 'tf'),
             ('/tf_static', 'tf_static'),
         ],
+        # a crash mid-task restarts the node: the fleet server republishes the task it was on
+        respawn=True,
+        respawn_delay=5.0,
     )
     return [node]
 
@@ -151,8 +197,20 @@ def generate_launch_description():
 
     namespace_arg = DeclareLaunchArgument(
         'namespace',
-        default_value='/a300_00036',
-        description='Robot namespace')
+        default_value='',
+        description="Robot namespace (default: robot.yaml's system.ros2.namespace)")
+
+    use_sim_time_arg = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value=os.environ.get('USE_SIM_TIME', 'false'),
+        choices=['true', 'false'],
+        description='Run on the simulator clock (default: $USE_SIM_TIME or false)')
+
+    dock_for_charging_arg = DeclareLaunchArgument(
+        'dock_for_charging',
+        default_value='',
+        description='Dock a charging task undocks from when the task does not say (default: the first dock in '
+                    'the Nav2 params file)')
 
     config_file_arg = DeclareLaunchArgument(
         'config_file',
@@ -161,12 +219,15 @@ def generate_launch_description():
 
     nav2_params_file_arg = DeclareLaunchArgument(
         'nav2_params_file',
-        default_value=_default_nav2_params_file(),
-        description='Nav2 params file (nav2.yaml) whose docking_server block '
-                    'is translated into motion.* params. Empty -> config.yaml only.')
+        default_value='',
+        description='Nav2 params file whose docking_server block is translated into motion.* params (default: '
+                    'the file bringup_nav2_map.launch.py wrote, /tmp/<namespace>_nav2_map.yaml, else the '
+                    "platform's nav2.yaml from mtu32_bringup)")
 
     return LaunchDescription([
         namespace_arg,
+        use_sim_time_arg,
+        dock_for_charging_arg,
         config_file_arg,
         nav2_params_file_arg,
         OpaqueFunction(function=_launch_setup),

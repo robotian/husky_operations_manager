@@ -27,10 +27,6 @@ class ArmCommand:
     UNKNOWN       = "UNKNOWN"
 
 
-# Commands that require a target_eef_pose to be populated in the goal
-_POSE_REQUIRED_COMMANDS = {ArmCommand.MOVE_EEF}
-
-
 class ManipulatorTaskActionClient:
     """Action client for controlling the robot arm."""
 
@@ -64,6 +60,10 @@ class ManipulatorTaskActionClient:
         self._feedback_data: ManipulatorTaskFeedback | None = None
         self._feedback_state: int = -1
         self._execution_time: float = 0.0
+        # Why the last goal ended in ERROR ('rejected', 'aborted', 'not available', 'result.success=false', ...)
+        # and whether the server REJECTED it (busy): the node re-sends those, and fails the task on the rest.
+        self.last_error: str = ''
+        self.last_rejected: bool = False
 
         # Initialize action client
         self.client = ActionClient(
@@ -121,15 +121,6 @@ class ManipulatorTaskActionClient:
         goal_msg = ManipulatorTask.Goal()
         goal_msg.arm_task = self._arm_command
 
-        # Warn if this command normally needs a pose but none was supplied
-        if self._arm_command in _POSE_REQUIRED_COMMANDS:
-            self.logger.warning(
-                f"Command '{self._arm_command}' requires a target_eef_pose. "
-                "Use send_move_eef_goal() to supply the pose. "
-                "Sending with default (zero) pose."
-            )
-            goal_msg.target_eef_pose = self._get_arm_pose()
-
         return self.send_goal(goal_msg)
 
     def send_move_eef_goal(
@@ -165,8 +156,12 @@ class ManipulatorTaskActionClient:
             f"Sending Manipulator Task goal: arm_task='{goal_msg.arm_task}'"
         )
 
-        if not self.client.wait_for_server(timeout_sec=30.0):
+        # Short: this blocks the node's single-threaded spin (no RobotStatus goes out meanwhile; 30 s tripped the
+        # fleet server's liveness watchdog). A server that isn't up yet is re-sent by the node.
+        self.last_error, self.last_rejected = '', False
+        if not self.client.wait_for_server(timeout_sec=2.0):
             self.logger.error("Manipulator action server not available.")
+            self.last_error = 'manipulator_action_server not available'
             self._current_status = RobotStatusEnum.ERROR
             return False
 
@@ -196,7 +191,9 @@ class ManipulatorTaskActionClient:
         self._feedback_data = None
         self._feedback_state = -1
         self._execution_time = 0.0
-        self.logger.info("Harvesting client reset to IDLE")
+        self.last_error = ''
+        self.last_rejected = False
+        self.logger.debug("Manipulator client reset to IDLE")
 
     def get_status(self) -> RobotStatusEnum:
         """Return the current manipulator task process status."""
@@ -252,13 +249,15 @@ class ManipulatorTaskActionClient:
         result = future.result()
         if not result:
             self.logger.error("Failed to receive goal handle for manipulator task.")
+            self.last_error = 'no goal handle'
             self._current_status = RobotStatusEnum.ERROR
             return
 
         self._goal_handle = result
 
         if not self._goal_handle.accepted:
-            self.logger.error("Manipulator Task goal was rejected by server.")
+            self.logger.error("Manipulator Task goal was rejected by server (busy).")
+            self.last_error, self.last_rejected = 'rejected (server busy)', True
             self._current_status = RobotStatusEnum.ERROR
             return
 
@@ -278,6 +277,7 @@ class ManipulatorTaskActionClient:
             self._current_status = RobotStatusEnum.IDLE
         else:
             self.logger.warning("Manipulator Task goal cancellation failed.")
+            self.last_error = 'cancel failed'
             self._current_status = RobotStatusEnum.ERROR
 
     def _feedback_callback(self, feedback_msg: ManipulatorTask_FeedbackMessage):
@@ -312,6 +312,7 @@ class ManipulatorTaskActionClient:
         response = future.result()
         if not response:
             self.logger.error("No result received from Manipulator Task action.")
+            self.last_error = 'no result'
             self._current_status = RobotStatusEnum.ERROR
             return
 
@@ -331,10 +332,15 @@ class ManipulatorTaskActionClient:
             f"Success: {result.success}"
         )
 
-        # Map to RobotStatusEnum
+        # Map to RobotStatusEnum; a SUCCEEDED goal whose result says success=false is a failure too
         self._current_status = self.result_status_map.get(
             status, RobotStatusEnum.ERROR
         )
+        if status == GoalStatus.STATUS_SUCCEEDED and not result.success:
+            self.last_error = 'result.success=false'
+            self._current_status = RobotStatusEnum.ERROR
+        elif status != GoalStatus.STATUS_SUCCEEDED:
+            self.last_error = status_name.lower()
 
         # Build final feedback object
         self._feedback_data = self._build_feedback_object(status_name)

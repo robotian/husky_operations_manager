@@ -2,6 +2,8 @@
 
 ROS2 package that manages the full operational lifecycle of a Clearpath Husky A300 robot performing lavender harvesting operations. The node drives a 27-state state machine that coordinates navigation, docking, undocking, arm control, loading, unloading, and charging — dispatching work to five underlying action clients and recovering from failures automatically.
 
+> **2026-10 (multirobot_sim):** the harvest stroke is real (`START HARVEST` → `arm_task_server` → `cut_stem`; the README below partly describes the old 10 s stub), arm goals have per-command timeouts (`arm.stow_timeout` / `ready_timeout` / `harvest_timeout`) and rejected / untaken goals are re-sent (`arm.send_retries`); a failed task is reported as `RobotStatus.task = FAILED:<kind>:<task_id>:<detail>` (status ERROR) for `error.report_hold` s, then the node stows and returns to IDLE (only a failed stow, `FAILED:arm_stow`, or exhausted startup undocking hold for an operator); the fleet server decides when to charge (the old 50 % → ERROR is gone; `battery.critical_threshold` 10 % is a hard floor, `FAILED:battery`), a charging task carries `charge_to`, a new charging task preempts a move, e-stop latches `EMERGENCY_STOP`; the launch reads the docks from `/tmp/<ns>_nav2_map.yaml` (what Nav2 runs with), takes `use_sim_time` / `dock_for_charging` / `namespace` (default robot.yaml's) and respawns the node.
+
 ## Table of Contents
 
 - [Overview](#overview)
