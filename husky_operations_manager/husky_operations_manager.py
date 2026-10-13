@@ -2575,9 +2575,12 @@ def main():
             executor.shutdown()
         if node is not None:
             node.destroy_node()
-        # Guarded: on Ctrl-C rclpy's signal handler has already shut the context down.
-        if rclpy.ok():
-            rclpy.shutdown()
+        # try_shutdown, not `if rclpy.ok(): rclpy.shutdown()`: after SIGTERM/SIGINT rclpy's own handler shuts the
+        # context down concurrently and the second shutdown raised (exit code 1). Guarded for a failed init().
+        try:
+            rclpy.try_shutdown()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == '__main__':
