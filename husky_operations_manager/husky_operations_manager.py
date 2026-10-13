@@ -479,10 +479,11 @@ class HuskyOperationsManager(Node):
         """
         # The operator's STOP (status_server stop_robot: task_id -1, description STOP, no job_schedule): whatever
         # runs is cancelled and the task given up (FAILED:stopped, which the server treats as released, not as an
-        # attempt); nothing starts until a task with a real id arrives. Ignored while already idle.
+        # attempt); nothing starts until a task with a real id arrives. Ignored while idle with no task, and while
+        # in ERROR: the server republishes STOP every tick, and failing again there cancelled the recovery's stow.
         if msg.task_id < 0 and msg.description == 'STOP' and not msg.job_schedule:
-            if self.current_status not in (RobotStatusEnum.IDLE, RobotStatusEnum.ERROR, RobotStatusEnum.EMERGENCY_STOP) \
-                    or self.current_task is not None:
+            if self.current_status not in (RobotStatusEnum.ERROR, RobotStatusEnum.EMERGENCY_STOP) and (
+                    self.current_status != RobotStatusEnum.IDLE or self.current_task is not None):
                 self.get_logger().warning('STOP from the operator: cancelling the current task')
                 self._fail_current_task('stopped', 'by the operator')
             return
