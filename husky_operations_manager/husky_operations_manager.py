@@ -1183,6 +1183,9 @@ class HuskyOperationsManager(Node):
             self.get_logger().info('Navigation canceled')
             self.navigation.reset()
             self.navigation_retry_count = 0
+            # Nav2 is still winding the cancelled goal down: the next goal waits navigation.retry_delay (a new
+            # follow_path in the same tick left the a200's MPPI controller failing every cycle, 2026-10-13)
+            self._wait_ready('post_cancel', self.navigation_retry_delay)
             self._transition_status(RobotStatusEnum.IDLE)
 
     def _handle_navigation_retry(self):
@@ -1929,6 +1932,9 @@ class HuskyOperationsManager(Node):
             self._transition_status(RobotStatusEnum.START_MOVING)
 
         elif self.current_status == RobotStatusEnum.START_MOVING:
+            # after a cancelled navigation, give Nav2 a moment before the next goal
+            if 'post_cancel' in self._dwell_deadlines and not self._wait_ready('post_cancel', self.navigation_retry_delay):
+                return
             # Arm safety gate — hold here until the arm is confirmed STOW
             if not self._arm_stow_gate():
                 return
