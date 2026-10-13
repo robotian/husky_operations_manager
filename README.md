@@ -2,7 +2,7 @@
 
 ROS2 package that manages the full operational lifecycle of a Clearpath Husky A300 robot performing lavender harvesting operations. The node drives a 27-state state machine that coordinates navigation, docking, undocking, arm control, loading, unloading, and charging — dispatching work to five underlying action clients and recovering from failures automatically.
 
-> **2026-10 (multirobot_sim):** the harvest stroke is real (`START HARVEST` → `arm_task_server` → `cut_stem`; the README below partly describes the old 10 s stub), arm goals have per-command timeouts (`arm.stow_timeout` / `ready_timeout` / `harvest_timeout`) and rejected / untaken goals are re-sent (`arm.send_retries`); a failed task is reported as `RobotStatus.task = FAILED:<kind>:<task_id>:<detail>` (status ERROR) for `error.report_hold` s, then the node stows and returns to IDLE (only a failed stow, `FAILED:arm_stow`, or exhausted startup undocking hold for an operator); the fleet server decides when to charge (the old 50 % → ERROR is gone; `battery.critical_threshold` 10 % is a hard floor, `FAILED:battery`), a charging task carries `charge_to`, a new charging task preempts a move, e-stop latches `EMERGENCY_STOP`; the launch reads the docks from `/tmp/<ns>_nav2_map.yaml` (what Nav2 runs with), takes `use_sim_time` / `dock_for_charging` / `namespace` (default robot.yaml's) and respawns the node.
+> **2026-10 (multirobot_sim):** the harvest stroke is real (`START HARVEST` → `arm_task_server` → `cut_stem`; the README below partly describes the old 10 s stub), arm goals have per-command timeouts (`arm.stow_timeout` / `ready_timeout` / `harvest_timeout`) and rejected / untaken goals are re-sent (`arm.send_retries`); a failed task is reported as `RobotStatus.task = FAILED:<kind>:<task_id>:<detail>` (status ERROR) for `error.report_hold` s, then the node stows and returns to IDLE (only a failed stow, `FAILED:arm_stow`, or exhausted startup undocking hold for an operator); the fleet server decides when to charge (the old 50 % → ERROR is gone; `battery.critical_threshold` 10 % is a hard floor, `FAILED:battery`), a charging task carries `charge_to`, a new charging task preempts a move, e-stop latches `EMERGENCY_STOP`; the launch reads the docks from `/tmp/<ns>_nav2_map.yaml` (what Nav2 runs with), takes `use_sim_time` / `dock_for_charging` / `namespace` (default robot.yaml's) and respawns the node. Until the startup check ran (it waits for a stable map pose) the node reports `INITIALIZING` (92), not IDLE, so the server assigns it nothing; after a dock in this process the undock goal carries an empty `dock_type` (the docking server undocks from its own last dock, whatever plugin type the task names); `JOB_DONE` is held while the server keeps republishing the finished task and for `timing.job_done_hold` s after its last republish (a one-tick JOB_DONE was missed now and then, which left the task open and the robot idle for good); the reverse-drive fallback times out on the node clock.
 
 ## Table of Contents
 
@@ -88,7 +88,7 @@ IDLE
       │
       └─► JOB_DONE ──► IDLE (on next task arrival)
 
-Special states: ERROR (94), PAUSED (95), MAINTENANCE (96),
+Special states: INITIALIZING (92, until the startup check ran), ERROR (94), PAUSED (95), MAINTENANCE (96),
                 OFFLINE (97), EMERGENCY_STOP (98), ABNORMAL (99)
 ```
 

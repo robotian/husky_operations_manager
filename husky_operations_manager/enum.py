@@ -88,6 +88,7 @@ class RobotStatusEnum(Enum):
     CHARGING = 22
     DONE_CHARGING = 23
 
+    INITIALIZING = 92  # the startup check has not run yet (no stable map pose): the server assigns nothing
     ERROR = 94
     PAUSED = 95
     MAINTENANCE = 96

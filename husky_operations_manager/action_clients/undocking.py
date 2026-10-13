@@ -52,8 +52,12 @@ class UndockingActionClient:
     # Core Interface Methods
     # ------------------------------------------------------------------
 
-    def send_undocking_goal(self, subtask: SubTask | None) -> bool:
-        """Send an undocking goal using the given SubTask."""
+    def send_undocking_goal(self, subtask: SubTask | None, dock_type: str | None = None) -> bool:
+        """Send an undocking goal using the given SubTask.
+
+        dock_type replaces the SubTask's when given: '' lets the docking server undock from the dock it last
+        docked the robot at (its own record), whatever plugin type the task names.
+        """
         if not subtask or not isinstance(subtask, SubTask):
             self.logger.error("Invalid SubTask provided for undocking goal.")
             return False
@@ -66,11 +70,11 @@ class UndockingActionClient:
             return False
 
         undock_goal_msg = UndockRobot.Goal()
-        undock_goal_msg.dock_type = self._undocking_data.dock_type
+        undock_goal_msg.dock_type = self._undocking_data.dock_type if dock_type is None else dock_type
         undock_goal_msg.max_undocking_time = self._undocking_data.max_undocking_time
 
         self.logger.info(
-            f"Sending undocking goal: dock_type={undock_goal_msg.dock_type}, "
+            f"Sending undocking goal: dock_type={undock_goal_msg.dock_type or '(the server last docked at)'}, "
             f"max_time={undock_goal_msg.max_undocking_time}s"
         )
 

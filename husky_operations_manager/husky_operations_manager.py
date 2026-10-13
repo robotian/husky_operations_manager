@@ -188,6 +188,7 @@ class HuskyOperationsManager(Node):
         self.declare_parameter('loading.increment', 20.0)
         self.declare_parameter('timing.timer_period', 1.0)
         self.declare_parameter('timing.initial_position_check_delay', 2.0)
+        self.declare_parameter('timing.job_done_hold', 5.0)
         self.declare_parameter('server.action_server_timeout', 5.0)
 
         # Startup "am I docked?" check. The robot map pose is projected into each
@@ -251,6 +252,8 @@ class HuskyOperationsManager(Node):
         self.loading_increment = self._p_float('loading.increment')
         self.timing_timer_period = self._p_float('timing.timer_period')
         self.timing_initial_position_check_delay = self._p_float('timing.initial_position_check_delay')
+        self.timing_job_done_hold = self._p_float('timing.job_done_hold')
+        self._last_task_msg_ns: int | None = None  # node clock of the last Task message (any task)
         self.server_action_server_timeout = self._p_float('server.action_server_timeout')
 
         self.startup_dock_x_tol = self._p_float('startup.dock_x_tol')
@@ -556,6 +559,7 @@ class HuskyOperationsManager(Node):
             self.get_logger().info(f'Load seeded from task: {self.current_load_status:.1f}')
 
         self.task = msg
+        self._last_task_msg_ns = self.get_clock().now().nanoseconds
 
     def timer_callback(self):
         """
@@ -612,8 +616,13 @@ class HuskyOperationsManager(Node):
         else:
             self._handle_task_execution(robot_status)
 
-        # Write final state into the outgoing message
-        robot_status.status = self.current_status.value
+        # Write final state into the outgoing message. Until the startup check ran (it waits for a stable map pose)
+        # the robot reports INITIALIZING, not IDLE: the server assigns it nothing and the web UI shows why.
+        if not self.is_initialized and self.current_status == RobotStatusEnum.IDLE:
+            robot_status.status = RobotStatusEnum.INITIALIZING.value
+            robot_status.task = 'INITIALIZING: waiting for the map pose' if not self._pose_received else 'INITIALIZING'
+        else:
+            robot_status.status = self.current_status.value
         robot_status.current_node_id = self.current_node_id
         robot_status.load_status = self.current_load_status
         self.robot_state_pub.publish(robot_status)
@@ -1104,8 +1113,15 @@ class HuskyOperationsManager(Node):
             self._transition_status(RobotStatusEnum.JOB_START)
 
         elif self.current_status == RobotStatusEnum.JOB_DONE:
+            # The server republishes the task every tick until it has seen JOB_DONE; both loops run at 1 Hz, so a
+            # JOB_DONE held for a single tick was missed now and then and the task never closed (the robot then
+            # sat IDLE ignoring republishes of it). Hold JOB_DONE while republishes keep coming: IDLE once they
+            # stopped for timing.job_done_hold s (the server saw it) or a new task arrived (above).
+            if self._last_task_msg_ns is not None and \
+                    (self.get_clock().now().nanoseconds - self._last_task_msg_ns) * 1e-9 < self.timing_job_done_hold:
+                return
             self.get_logger().debug(
-                f'JOB_DONE — same task still publishing | task_id={self.current_task.task_id} — transitioning to IDLE'
+                f'JOB_DONE — task {self.current_task.task_id} no longer published — transitioning to IDLE'
             )
             self._transition_status(RobotStatusEnum.IDLE)
             self.current_task = None
@@ -2070,7 +2086,10 @@ class HuskyOperationsManager(Node):
                 f"dock_type='{dock_type}'"
             )
 
-            if self.undocking_action_client.send_undocking_goal(undock_subtask):
+            # Docked in this process: the docking server remembers that dock and its plugin type, so an empty
+            # dock_type undocks from it; the type the task names is only needed for the startup undock.
+            dock_type_override = '' if self._last_docked_id else None
+            if self.undocking_action_client.send_undocking_goal(undock_subtask, dock_type=dock_type_override):
                 self._transition_status(RobotStatusEnum.UNDOCKING)
             else:
                 self.get_logger().error(

@@ -26,6 +26,7 @@
     timing:
       timer_period: 1.0  # seconds - main loop frequency
       initial_position_check_delay: 2.0  # seconds - also the pose-stability sample period
+      job_done_hold: 5.0  # seconds JOB_DONE is held after the server's last republish of the finished task
 
     # Server timeout
     server:

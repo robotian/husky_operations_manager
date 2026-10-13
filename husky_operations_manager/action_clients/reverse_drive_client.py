@@ -1,5 +1,4 @@
 import math
-import time
 import warnings
 
 import tf2_geometry_msgs
@@ -55,9 +54,10 @@ class ReverseDriveClient:
         self._slowdown_radius = 0.5
         self._min_speed_frac  = 0.25
 
-        # Timeout: abs(staging_x_offset) / v_linear_min * 1.25
+        # Timeout (node-clock seconds: the sim runs slower than wall time): the distance at full speed, doubled
+        # for the slowdown near the line (speed falls to _min_speed_frac within _slowdown_radius), plus 5 s.
         # max() guards against a zero v_linear_min in config.
-        self._timeout = (abs(config.staging_x_offset) / max(config.v_linear_min, 0.01)) * 1.25
+        self._timeout = (abs(config.staging_x_offset) / max(config.v_linear_min, 0.01)) * 2.0 + 5.0
 
         # TF
         self._tf_buffer   = tf2_ros.Buffer()
@@ -169,6 +169,10 @@ class ReverseDriveClient:
     # Control loop
     # ------------------------------------------------------------------
 
+    def _now(self) -> float:
+        """Node clock in seconds (sim time under use_sim_time), never the wall clock."""
+        return self.node.get_clock().now().nanoseconds * 1e-9
+
     def _control_loop(self) -> None:
         if self._status != ReverseDriveStatus.REVERSING or self._staging_pose is None:
             return
@@ -181,19 +185,19 @@ class ReverseDriveClient:
             return
 
         if self._start_time is None:
-            self._start_time = time.monotonic()
+            self._start_time = self._now()
             self.logger.info(
                 f"TF ready | start: ({robot_pose.pose.position.x:.3f}, "
                 f"{robot_pose.pose.position.y:.3f})"
             )
 
-        if time.monotonic() - self._start_time >= self._timeout:
+        if self._now() - self._start_time >= self._timeout:
             self._shutdown(success=False, msg=f"Timeout after {self._timeout:.1f}s")
             return
 
         cmd = Twist()
         if self._compute_command(cmd, self._staging_pose, robot_pose):
-            elapsed = time.monotonic() - self._start_time
+            elapsed = self._now() - self._start_time
             self._shutdown(success=True, msg=f"Staging pose reached in {elapsed:.2f}s")
             return
 
