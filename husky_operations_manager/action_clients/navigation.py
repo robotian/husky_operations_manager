@@ -4,7 +4,6 @@ Navigation Action Client using NavigateThroughPoses for robot navigation.
 This module provides a client interface for sending navigation goals to Nav2's
 NavigateThroughPoses action server and tracking navigation status.
 """
-import math
 from transforms3d import euler
 
 import action_msgs.srv
@@ -361,9 +360,8 @@ class NavigationActionClient:
         """
         Generate list of PoseStamped messages for navigation.
 
-        The first pose uses the robot's current position. Subsequent poses
-        are oriented towards the next waypoint. The final pose uses its
-        specified theta orientation.
+        The first pose uses the robot's current position. Every pose keeps
+        its waypoint's theta.
 
         Args:
             waypoint_list: List of waypoints to navigate through
@@ -417,38 +415,13 @@ class NavigationActionClient:
                 pose.pose.position.y = float(current_wp.y)
                 pose.pose.position.z = 0.0
 
-                # Calculate orientation
-                next_wp = (
-                    waypoint_list[index + 1] if index + 1 < waypoint_count else None
-                )
-
-                if next_wp:
-                    # Point towards next waypoint
-                    dx = next_wp.x - current_wp.x
-                    dy = next_wp.y - current_wp.y
-
-                    if abs(dx) > 0.01 or abs(dy) > 0.01:
-                        # Calculate angle to next waypoint
-                        angle = math.atan2(dy, dx)
-                        self.logger.debug(
-                            f"Waypoint {current_wp.node_id} → angle: {angle:.3f}"
-                        )
-                        pose.pose.orientation.z = math.sin(angle / 2)
-                        pose.pose.orientation.w = math.cos(angle / 2)
-                        pose.pose.orientation.x = 0.0
-                        pose.pose.orientation.y = 0.0
-                    else:
-                        # Waypoints too close, use specified orientation
-                        pose.pose.orientation.x = float(x)
-                        pose.pose.orientation.y = float(y)
-                        pose.pose.orientation.z = float(z)
-                        pose.pose.orientation.w = float(w)
-                else:
-                    # Last waypoint: use specified theta
-                    pose.pose.orientation.x = float(x)
-                    pose.pose.orientation.y = float(y)
-                    pose.pose.orientation.z = float(z)
-                    pose.pose.orientation.w = float(w)
+                # The coordinator's heading, also between waypoints: a lane exit faces out of the lane, not at the
+                # next waypoint (pointing it there made Nav2 turn the robot around between two crop rows)
+                pose.pose.orientation.x = float(x)
+                pose.pose.orientation.y = float(y)
+                pose.pose.orientation.z = float(z)
+                pose.pose.orientation.w = float(w)
+                if index == waypoint_count - 1:
                     self.logger.info(
                         f"Final waypoint {current_wp.node_id} at "
                         f"({current_wp.x:.3f}, {current_wp.y:.3f}) "
