@@ -48,6 +48,8 @@ class NavigationActionClient:
         # Goal management
         self.goal_handle: ClientGoalHandle | None = None
         self.navigation_status: NavigationStatus = NavigationStatus.IDLE
+        # The goal request still awaiting the server's answer; None once it was cancelled or reset
+        self._send_future: Future | None = None
 
         # Waypoint tracking
         self.last_waypoint_index: int = 0
@@ -210,6 +212,7 @@ class NavigationActionClient:
 
         # Send goal
         future = self.client.send_goal_async(goal_msg, self._feedback_callback)
+        self._send_future = future
         future.add_done_callback(self._goal_response_callback)
 
         return True
@@ -233,6 +236,7 @@ class NavigationActionClient:
             return True
         else:
             self.logger.warning("No goal handle available to cancel")
+            self._send_future = None  # the server's late answer cancels the goal (_goal_response_callback)
             self.navigation_status = NavigationStatus.CANCELED
             return False
 
@@ -240,6 +244,7 @@ class NavigationActionClient:
         """Reset navigation client to idle state."""
         self.navigation_status = NavigationStatus.IDLE
         self.goal_handle = None
+        self._send_future = None
         self.last_waypoint_index = 0
         self.task = None
         self.sub_task = None
@@ -267,6 +272,15 @@ class NavigationActionClient:
 
     def _goal_response_callback(self, future: Future) -> None:
         """Handle goal acceptance/rejection from action server."""
+        if future is not self._send_future:
+            # Cancelled or reset before the server answered (a charging task preempting a goal sent while Nav2 was
+            # restarting): accepted late, it took the client over and drove the old task's path, 2026-10-21.
+            stale = future.result()
+            if stale is not None and stale.accepted:
+                self.logger.warning("Goal accepted after it was cancelled: cancelling it on the server")
+                stale.cancel_goal_async()
+            return
+        self._send_future = None
         self.goal_handle = future.result()
 
         if self.goal_handle is None:
@@ -311,6 +325,10 @@ class NavigationActionClient:
             self.logger.warning(
                 f"Navigation goal was aborted at waypoint {self._get_current_node_id()}"
             )
+            self.navigation_status = NavigationStatus.ABORTED
+
+        else:  # UNKNOWN (0) etc.: the server lost the goal (a Nav2 lifecycle reset); waiting on it hung the robot
+            self.logger.warning(f"Navigation ended with status {status}: treating it as aborted")
             self.navigation_status = NavigationStatus.ABORTED
 
     def _feedback_callback(

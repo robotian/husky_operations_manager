@@ -27,6 +27,15 @@ from husky_operations_manager.enum import (
 )
 
 
+def is_no_move(task: Task | None) -> bool:
+    """A charging/unloading task whose move sub-task (the first) only names the start node: nothing to drive."""
+    if task is None or task.task_type not in (Task.CHARGING_TASK, Task.UNLOADING_TASK) or not task.sub_tasks:
+        return False
+    move = task.sub_tasks[0]
+    nodes = {wp.node_id for wp in move.data} if move.type == SubTask.MOVING else set()
+    return len(nodes) == 1
+
+
 class HuskyOperationsManager(Node):
     """
     ROS2 node that manages the full operational lifecycle of a Clearpath Husky robot.
@@ -1971,6 +1980,13 @@ class HuskyOperationsManager(Node):
                 return
             # Arm safety gate — hold here until the arm is confirmed STOW
             if not self._arm_stow_gate():
+                return
+            if is_no_move(self.current_task):
+                # A dock task's move outside a lane is the start node twice (status_server _build_dock_task): the
+                # docking server drives to its own staging pose. Navigating to that node's exact pose can mean a
+                # goal a few cm behind the robot, which a forward-only MPPI can't reach: it turned on the spot.
+                self.get_logger().info('No move: the docking server drives to its staging pose')
+                self._transition_status(RobotStatusEnum.DESTINATION_REACHED)
                 return
             # Guard: do not send a second goal if the previous one is still being accepted
             if self.navigation.is_navigation_active():
