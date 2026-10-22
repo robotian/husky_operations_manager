@@ -13,6 +13,10 @@ from status_interfaces.action import ManipulatorTask
 from status_interfaces.action._manipulator_task import (
     ManipulatorTask_FeedbackMessage,
 )
+try:
+    from moveit_msgs.action import MoveGroup
+except ImportError:  # a robot without MoveIt: no move_group to wait for
+    MoveGroup = None
 from status_interfaces.msg import SubTask
 from husky_operations_manager.dataclass import ManipulatorTaskFeedback
 from husky_operations_manager.enum import RobotStatusEnum, ManipulatorStatus
@@ -71,6 +75,8 @@ class ManipulatorTaskActionClient:
             ManipulatorTask,
             f'{self.namespace}/manipulator_action_server'
         )
+        # Only to see whether move_group (which the manipulator server drives) is up; never sent a goal.
+        self.move_group = ActionClient(self.node, MoveGroup, f'{self.namespace}/move_action') if MoveGroup else None
 
         self.logger.info(
             f"Manipulator Task action client initialized for {self.namespace}"
@@ -172,6 +178,10 @@ class ManipulatorTaskActionClient:
         )
         future.add_done_callback(self._goal_response_callback)
         return True
+
+    def move_group_ready(self) -> bool:
+        """move_group's move_action server is up (non-blocking); True without moveit_msgs."""
+        return self.move_group is None or self.move_group.server_is_ready()
 
     def cancel_goal(self) -> bool:
         """Cancel the current Manipulator Task goal."""

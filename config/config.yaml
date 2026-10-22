@@ -54,6 +54,7 @@
       harvest_timeout: 900.0  # seconds - START HARVEST (cut_stem: minutes)
       send_retries: 3         # re-sends of a goal the server rejected (busy) or couldn't take (not up)
       send_retry_delay: 5.0   # seconds between them
+      move_group_wait: 180.0  # seconds - arm goals wait this long for move_group's move_action server, then go out
 
     # Failure report: RobotStatus.task = FAILED:<kind>:<task_id>:<detail> with status ERROR, held this long
     # (the fleet server polls at 1 Hz) before the node stows and returns to IDLE.

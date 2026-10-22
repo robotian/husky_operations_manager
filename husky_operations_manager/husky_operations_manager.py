@@ -227,6 +227,7 @@ class HuskyOperationsManager(Node):
         self.declare_parameter('arm.harvest_timeout', 900.0)
         self.declare_parameter('arm.send_retries', 3)
         self.declare_parameter('arm.send_retry_delay', 5.0)
+        self.declare_parameter('arm.move_group_wait', 180.0)
         # How long a failed task is reported (RobotStatus.task = FAILED:<kind>:<task_id>:<detail>, status ERROR)
         # before the node goes back to IDLE: the fleet server polls at 1 Hz.
         self.declare_parameter('error.report_hold', 5.0)
@@ -277,6 +278,7 @@ class HuskyOperationsManager(Node):
         self.arm_harvest_timeout = self._p_float('arm.harvest_timeout')
         self.arm_send_retries = self._p_int('arm.send_retries')
         self.arm_send_retry_delay = self._p_float('arm.send_retry_delay')
+        self.arm_move_group_wait = self._p_float('arm.move_group_wait')
         self.error_report_hold = self._p_float('error.report_hold')
         self.startup_check_dock = self._p_bool('startup.check_dock')
 
@@ -415,6 +417,8 @@ class HuskyOperationsManager(Node):
         self._failure_hold: bool = False
         # Arm goal sends that were rejected (busy) / not taken (server down), re-sent up to arm.send_retries
         self._arm_send_attempts: int = 0
+        # When arm goals started waiting for move_group (None = not waiting), see _move_group_ready
+        self._move_group_wait_since = None
         # The dock the robot last docked at (DockGoal.dock_id): the one it undocks from after charging
         self._last_docked_id: str | None = None
         self._arm_goal_timeout_current: float = 0.0
@@ -1573,10 +1577,37 @@ class HuskyOperationsManager(Node):
             self._dwell_deadlines.pop('arm_goal', None)
 
     def _arm_send_ready(self) -> bool:
-        """False while a re-send of a rejected / untaken arm goal still waits for arm.send_retry_delay."""
+        """False while move_group isn't up yet (_move_group_ready), or a re-send of a rejected / untaken arm goal
+        still waits for arm.send_retry_delay."""
+        if not self._move_group_ready():
+            return False
         if 'arm_send_retry' not in self._dwell_deadlines:
             return True
         return self._wait_ready('arm_send_retry', self.arm_send_retry_delay)
+
+    def _move_group_ready(self) -> bool:
+        """
+        False while move_group's move_action server isn't up, for at most arm.move_group_wait s (node clock) per
+        wait; then True, so the goal goes out and fails the usual way. move_group comes up 15-30 s after the stack:
+        a STOW sent earlier failed, its re-send met another goal at move_group's start and move_group segfaulted,
+        so every later arm goal failed 'unavailable' (j100_0921, 2026-10-21).
+        """
+        if self.manipulator_client.move_group_ready():
+            if self._move_group_wait_since is not None:
+                self.get_logger().info('move_group is up — arm goals go out')
+                self._move_group_wait_since = None
+            return True
+        now = self.get_clock().now()
+        if self._move_group_wait_since is None:
+            self._move_group_wait_since = now
+            self.get_logger().warning(
+                f'move_group not up — holding arm goals (up to {self.arm_move_group_wait:.0f} s)')
+            return False
+        if now - self._move_group_wait_since < Duration(seconds=self.arm_move_group_wait):
+            return False
+        self.get_logger().error(f'move_group still not up after {self.arm_move_group_wait:.0f} s — sending anyway')
+        self._move_group_wait_since = None
+        return True
 
     def _arm_send_failed(self, what: str):
         """An arm goal could not be sent, or was rejected / not taken: re-send it later (the state handler sends
