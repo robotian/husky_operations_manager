@@ -50,6 +50,10 @@ class NavigationActionClient:
         self.navigation_status: NavigationStatus = NavigationStatus.IDLE
         # The goal request still awaiting the server's answer; None once it was cancelled or reset
         self._send_future: Future | None = None
+        # The first waypoint Nav2 had not passed yet (feedback number_of_poses_remaining), per (task, sub-task): a
+        # retry resumes there. Resending the whole list made a retry in a lane drive back to its entry, 2026-10-21.
+        self._resume_key: tuple[int, int] | None = None
+        self._next_wp: WayPoint | None = None
 
         # Waypoint tracking
         self.last_waypoint_index: int = 0
@@ -173,6 +177,14 @@ class NavigationActionClient:
             self.logger.error("No waypoints found in sub-task")
             self.navigation_status = NavigationStatus.ERROR
             return False
+
+        key = (task.task_id, self.sub_task.sub_task_id)
+        if key != self._resume_key:
+            self._resume_key, self._next_wp = key, None
+        elif self._next_wp in self.waypoints_list[2:]:
+            i = self.waypoints_list.index(self._next_wp)
+            self.logger.info(f"Retry: resuming at waypoint {i} (node {self._next_wp.node_id}), {i - 1} already passed")
+            self.waypoints_list = self.waypoints_list[:1] + self.waypoints_list[i:]
 
         self.logger.debug(f"Waypoints: {[wp.node_id for wp in self.waypoints_list]}")
 
@@ -346,6 +358,9 @@ class NavigationActionClient:
 
         feedback: NavigateThroughPoses.Feedback = feedback_msg.feedback
         current_pose: Pose = feedback.current_pose.pose
+        remaining = feedback.number_of_poses_remaining
+        if 0 < remaining <= len(self.waypoints_list):
+            self._next_wp = self.waypoints_list[len(self.waypoints_list) - remaining]
 
         # Update waypoint tracking
         new_index = self._get_closest_waypoint_index(current_pose)
@@ -417,15 +432,21 @@ class NavigationActionClient:
                 )
                 pose.pose.position.z = 0.0
 
-                # Use waypoint orientation
-                pose.pose.orientation.x = float(x)
-                pose.pose.orientation.y = float(y)
-                pose.pose.orientation.z = float(z)
-                pose.pose.orientation.w = float(w)
+                # The robot's own heading: waypoint 0's (its start node's) was the dock's on a retry from inside a
+                # lane, so Nav2 had to turn the robot round there first
+                q = self.robot_status.topo_map_orientation
+                if q.x or q.y or q.z or q.w:
+                    pose.pose.orientation = q
+                else:
+                    pose.pose.orientation.x = float(x)
+                    pose.pose.orientation.y = float(y)
+                    pose.pose.orientation.z = float(z)
+                    pose.pose.orientation.w = float(w)
 
+                q = pose.pose.orientation
                 self.logger.info(
                     f"Start pose: ({pose.pose.position.x:.3f}, "
-                    f"{pose.pose.position.y:.3f}) theta: {current_wp.theta:.3f}"
+                    f"{pose.pose.position.y:.3f}) theta: {euler.quat2euler([q.w, q.x, q.y, q.z])[2]:.3f}"
                 )
             else:
                 # Subsequent waypoints
